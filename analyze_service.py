@@ -30,7 +30,6 @@ def fetch_bars(ticker, interval, period="7d"):
     if df is None or df.empty:
         return pd.DataFrame()
 
-    # Flatten MultiIndex
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [c[0].lower() for c in df.columns]
     else:
@@ -72,61 +71,41 @@ def summarize_structure(df_daily, df_1h, df_15m, df_1m):
         logger.error(f"summarize_structure failed: {e}")
     return s
 
-# ===== Heuristic logic =====
-def heuristic_analysis(ticker, capital, summary, df_1m):
-    """
-    Simple heuristic trade suggestion.
-    Capital is assumed in USD.
-    Position size is calculated based on risk-per-trade (e.g., 1% of capital).
-    """
+# ===== Heuristic logic with risk management =====
+def heuristic_analysis(ticker, capital, risk_percent, summary, df_1m):
     entries = []
-    last_price = float(df_1m['close'].iloc[-1]) if not df_1m.empty else None
-    atr = summary.get('1m_atr') or (float(df_1m['close'].pct_change().std()) * last_price if last_price else None)
-
-    if last_price is None or atr is None:
-        return {
-            'entries': [],
-            'explanation': 'Insufficient data for heuristic analysis.',
-            'position_size': 0
-        }
+    last = float(df_1m['close'].iloc[-1]) if not df_1m.empty else None
+    atr = summary.get('1m_atr') or (float(df_1m['close'].pct_change().std()) * last if last else None)
+    
+    if last is None or atr is None:
+        return {'entries': [], 'explanation': 'Insufficient data for heuristic analysis.'}
 
     daily_trend = summary.get('daily_trend', 'n/a')
     macd_hist = summary.get('15m_macd_hist') or 0
 
-    # Risk management: 1% of capital per trade
-    risk_per_trade = 0.01 * capital
-
     if daily_trend in ['up','n/a'] and macd_hist >= -0.1:
-        stop_loss_price = round(last_price - 2*atr, 4)
-        tgt1 = round(last_price + 2*atr, 4)
-        tgt2 = round(last_price + 4*atr, 4)
-        # number of shares/contracts to risk ~1% of capital
-        qty = int(max(1, risk_per_trade / max(0.01, last_price - stop_loss_price)))
+        stop = round(last - (2 * atr), 4)
+        tgt1 = round(last + (2 * atr), 4)
+        tgt2 = round(last + (4 * atr), 4)
+
+        # Risk in USD
+        risk_per_trade_usd = (risk_percent / 100) * capital
+        qty = int(risk_per_trade_usd / (last - stop)) if (last - stop) > 0 else 0
 
         entries.append({
-            'type': 'long',
-            'entry_price': last_price,
-            'stop_loss': stop_loss_price,
+            'type':'long',
+            'entry_price': last,
+            'stop_loss': stop,
             'target_1': tgt1,
             'target_2': tgt2,
             'confidence': 'medium',
-            'rationale': f'Daily trend {daily_trend} + 15m MACD hist {macd_hist:.4f}; ATR-based stops.',
-            'capital_risk_usd': round(risk_per_trade, 2),
-            'position_size': qty
-        })
-
-        return {
-            'entries': entries,
+            'rationale': f'Daily trend {daily_trend} + 15m MACD histogram {macd_hist:.4f}; ATR-based stops.',
             'position_size': qty,
-            'explanation': f'1% of capital (${risk_per_trade:.2f}) risked per trade.',
-        }
+            'capital_at_risk_usd': round(risk_per_trade_usd, 2)
+        })
+        return {'entries': entries, 'position_size': qty, 'explanation': f'Heuristic suggestion with {risk_percent}% risk per trade.'}
     else:
-        return {
-            'entries': [],
-            'position_size': 0,
-            'explanation': 'No clear heuristic setup detected.'
-        }
-
+        return {'entries': [], 'explanation': 'No clear heuristic setup detected.'}
 
 # ===== LLM prompt builder =====
 def build_prompt(ticker, capital, summary, recent_samples):
@@ -159,11 +138,9 @@ def call_llm(prompt):
         )
         return resp.choices[0].message.content
     except openai.OpenAIError as e:
-        # Handles API errors (rate limit, quota, invalid request, etc.)
         logger.error(f"OpenAI API error: {e}")
         raise
     except Exception as e:
-        # Handles unexpected issues
         logger.error(f"Unexpected LLM error: {e}")
         raise
 
@@ -173,6 +150,7 @@ def analyze():
     data = request.json
     ticker = data.get("ticker")
     capital = float(data.get("capital", 1000))
+    risk_percent = float(data.get("risk_percent", 1))
 
     df_daily = compute_indicators(fetch_bars(ticker, "1d", "1y"))
     df_1h = compute_indicators(fetch_bars(ticker, "60m", "60d"))
@@ -195,7 +173,6 @@ def analyze():
             try:
                 parsed = json.loads(llm_out)
             except Exception:
-                # fallback: LLM returned non-JSON
                 return jsonify({
                     'entries': [],
                     'explanation': llm_out,
@@ -203,26 +180,35 @@ def analyze():
                     'trade_id': trade_id,
                     'source': 'LLM'
                 })
+
+            # Risk augmentation if missing
+            for e in parsed.get('entries', []):
+                if 'position_size' not in e and 'stop_loss' in e and 'entry_price' in e:
+                    risk_usd = (risk_percent / 100) * capital
+                    qty = int(risk_usd / (e['entry_price'] - e['stop_loss'])) if (e['entry_price'] - e['stop_loss']) > 0 else 0
+                    e['position_size'] = qty
+                    e['capital_at_risk_usd'] = round(risk_usd, 2)
+
             parsed['trade_id'] = parsed.get('trade_id') or trade_id
             parsed['source'] = 'LLM'
             return jsonify(parsed)
+
         except openai.OpenAIError as e:
-            # Return heuristic if OpenAI API fails
-            result = heuristic_analysis(ticker, capital, summary, df_1m)
+            result = heuristic_analysis(ticker, capital, risk_percent, summary, df_1m)
             result['trade_id'] = trade_id
             result['source'] = f"Heuristic (LLM failed: {str(e)})"
             return jsonify(result), 200
         except Exception as e:
-            result = heuristic_analysis(ticker, capital, summary, df_1m)
+            result = heuristic_analysis(ticker, capital, risk_percent, summary, df_1m)
             result['trade_id'] = trade_id
             result['source'] = f"Heuristic (unexpected LLM error: {str(e)})"
             return jsonify(result), 200
+
     else:
-        # No API key, fallback to heuristic
-        result = heuristic_analysis(ticker, capital, summary, df_1m)
+        result = heuristic_analysis(ticker, capital, risk_percent, summary, df_1m)
         result['trade_id'] = trade_id
         result['source'] = 'Heuristic'
         return jsonify(result)
 
-if __name__=="__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT",5000)))
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
