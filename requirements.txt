@@ -5,3 +5,4 @@ yfinance
 ta
 openai
 python-dotenv
+gunicorn
