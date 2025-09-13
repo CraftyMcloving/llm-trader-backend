@@ -139,6 +139,7 @@ def analyze():
     ticker = data.get("ticker")
     capital = float(data.get("capital",1000))
 
+    # Fetch & compute
     df_daily = compute_indicators(fetch_bars(ticker,"1d","1y"))
     df_1h = compute_indicators(fetch_bars(ticker,"60m","60d"))
     df_15m = compute_indicators(fetch_bars(ticker,"15m","60d"))
@@ -151,24 +152,36 @@ def analyze():
         '15m_last_close': float(df_15m['close'].iloc[-1]) if not df_15m.empty else None
     }
 
+    result = None
+
     if OPENAI_KEY:
         prompt = build_prompt(ticker, capital, summary, recent_samples)
         try:
             llm_out = call_llm(prompt)
             try:
                 parsed = json.loads(llm_out)
+                parsed['trade_id'] = parsed.get('trade_id') or f"{ticker}-{int(time.time())}"
+                parsed['source'] = 'LLM'
+                result = parsed
             except Exception:
-                return jsonify({'entries':[], 'explanation': llm_out, 'raw': llm_out, 'source':'LLM'})
-            parsed['trade_id'] = parsed.get('trade_id') or f"{ticker}-{int(time.time())}"
-            parsed['source'] = 'LLM'
-            return jsonify(parsed)
+                # JSON parse failed, fallback
+                logger.warning(f"LLM output not JSON: {llm_out}")
+                result = heuristic_analysis(ticker, capital, summary, df_1m)
+                result['trade_id'] = f"{ticker}-{int(time.time())}"
+                result['source'] = 'Heuristic (LLM invalid output)'
         except Exception as e:
-            return jsonify({'error':'LLM call failed','details':str(e),'source':'LLM'}),500
+            # LLM call failed, fallback
+            logger.error(f"LLM call failed: {e}")
+            result = heuristic_analysis(ticker, capital, summary, df_1m)
+            result['trade_id'] = f"{ticker}-{int(time.time())}"
+            result['source'] = f"Heuristic (LLM failed: {e})"
     else:
+        # No key, use heuristic
         result = heuristic_analysis(ticker, capital, summary, df_1m)
         result['trade_id'] = f"{ticker}-{int(time.time())}"
-        result['source'] = 'Heuristic'
-        return jsonify(result)
+        result['source'] = 'Heuristic (no LLM key)'
+
+    return jsonify(result)
 
 if __name__=="__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT",5000)))
