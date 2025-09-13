@@ -92,3 +92,22 @@ def analyze():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
+
+if OPENAI_KEY:
+    prompt = build_prompt(ticker, capital, summary, recent_samples)
+    try:
+        llm_out = call_llm(prompt)
+        try:
+            parsed = json.loads(llm_out)
+        except Exception:
+            return jsonify({'entries': [], 'explanation': llm_out, 'raw': llm_out, 'source':'LLM'})
+        parsed['trade_id'] = parsed.get('trade_id') or f"{ticker}-{int(time.time())}"
+        parsed['source'] = 'LLM'
+        return jsonify(parsed)
+    except Exception as e:
+        return jsonify({'error':'LLM call failed', 'details': str(e), 'source':'LLM'}), 500
+else:
+    result = heuristic_analysis(ticker, capital, summary, df_1m)
+    result['trade_id'] = f"{ticker}-{int(time.time())}"
+    result['source'] = 'Heuristic'
+    return jsonify(result)
