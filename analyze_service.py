@@ -117,20 +117,41 @@ Constraints:
 Return strictly JSON with keys: entries (list), position_size (number), explanation (string), trade_id (unique id).
 """
 
-# ===== LLM call =====
-def call_llm(prompt):
+# ===== LLM call with fallback =====
+def call_llm(prompt, model_preferred=None):
     if not OPENAI_KEY:
         raise RuntimeError("OPENAI_API_KEY not configured")
-    resp = openai.chat.completions.create(
-        model=os.environ.get("OPENAI_MODEL","gpt-4o"),
-        messages=[
-            {"role":"system","content":"You are a trading assistant."},
-            {"role":"user","content":prompt}
-        ],
-        temperature=0.2,
-        max_tokens=700
-    )
-    return resp.choices[0].message.content
+    
+    model_preferred = model_preferred or os.environ.get("OPENAI_MODEL", "gpt-4o")
+    fallback_model = "gpt-3.5-turbo"
+
+    try:
+        resp = openai.chat.completions.create(
+            model=model_preferred,
+            messages=[
+                {"role":"system","content":"You are a trading assistant."},
+                {"role":"user","content":prompt}
+            ],
+            temperature=0.2,
+            max_tokens=700
+        )
+        return resp.choices[0].message.content
+    except openai.error.RateLimitError as e:
+        logger.warning(f"Preferred model {model_preferred} failed: {e}, falling back to {fallback_model}")
+        resp = openai.chat.completions.create(
+            model=fallback_model,
+            messages=[
+                {"role":"system","content":"You are a trading assistant."},
+                {"role":"user","content":prompt}
+            ],
+            temperature=0.2,
+            max_tokens=700
+        )
+        return resp.choices[0].message.content
+    except openai.error.OpenAIError as e:
+        logger.error(f"LLM call failed: {e}")
+        raise
+
 
 # ===== Flask endpoints =====
 @app.route("/analyze", methods=["POST"])
