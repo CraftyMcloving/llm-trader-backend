@@ -74,33 +74,59 @@ def summarize_structure(df_daily, df_1h, df_15m, df_1m):
 
 # ===== Heuristic logic =====
 def heuristic_analysis(ticker, capital, summary, df_1m):
+    """
+    Simple heuristic trade suggestion.
+    Capital is assumed in USD.
+    Position size is calculated based on risk-per-trade (e.g., 1% of capital).
+    """
     entries = []
-    last = float(df_1m['close'].iloc[-1]) if not df_1m.empty else None
-    atr = summary.get('1m_atr') or (float(df_1m['close'].pct_change().std()) * last if last else None)
-    if last is None or atr is None:
-        return {'entries': [], 'explanation': 'Insufficient data for heuristic analysis.'}
+    last_price = float(df_1m['close'].iloc[-1]) if not df_1m.empty else None
+    atr = summary.get('1m_atr') or (float(df_1m['close'].pct_change().std()) * last_price if last_price else None)
+
+    if last_price is None or atr is None:
+        return {
+            'entries': [],
+            'explanation': 'Insufficient data for heuristic analysis.',
+            'position_size': 0
+        }
 
     daily_trend = summary.get('daily_trend', 'n/a')
     macd_hist = summary.get('15m_macd_hist') or 0
 
+    # Risk management: 1% of capital per trade
+    risk_per_trade = 0.01 * capital
+
     if daily_trend in ['up','n/a'] and macd_hist >= -0.1:
-        stop = round(last - (2 * atr), 4)
-        tgt1 = round(last + (2 * atr), 4)
-        tgt2 = round(last + (4 * atr), 4)
-        risk_per_trade = 0.01 * capital
-        qty = int(max(1, risk_per_trade / (last - stop))) if last - stop > 0 else 0
+        stop_loss_price = round(last_price - 2*atr, 4)
+        tgt1 = round(last_price + 2*atr, 4)
+        tgt2 = round(last_price + 4*atr, 4)
+        # number of shares/contracts to risk ~1% of capital
+        qty = int(max(1, risk_per_trade / max(0.01, last_price - stop_loss_price)))
+
         entries.append({
-            'type':'long',
-            'entry_price': last,
-            'stop_loss': stop,
+            'type': 'long',
+            'entry_price': last_price,
+            'stop_loss': stop_loss_price,
             'target_1': tgt1,
             'target_2': tgt2,
             'confidence': 'medium',
-            'rationale': f'Daily trend {daily_trend} + 15m MACD histogram {macd_hist:.4f}; ATR-based stops.'
+            'rationale': f'Daily trend {daily_trend} + 15m MACD hist {macd_hist:.4f}; ATR-based stops.',
+            'capital_risk_usd': round(risk_per_trade, 2),
+            'position_size': qty
         })
-        return {'entries': entries, 'position_size': qty, 'explanation': 'Flexible heuristic suggestion (no LLM key provided).'}
+
+        return {
+            'entries': entries,
+            'position_size': qty,
+            'explanation': f'1% of capital (${risk_per_trade:.2f}) risked per trade.',
+        }
     else:
-        return {'entries': [], 'explanation': 'No clear heuristic setup detected.'}
+        return {
+            'entries': [],
+            'position_size': 0,
+            'explanation': 'No clear heuristic setup detected.'
+        }
+
 
 # ===== LLM prompt builder =====
 def build_prompt(ticker, capital, summary, recent_samples):
