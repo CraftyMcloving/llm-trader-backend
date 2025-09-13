@@ -117,54 +117,41 @@ Constraints:
 Return strictly JSON with keys: entries (list), position_size (number), explanation (string), trade_id (unique id).
 """
 
-# ===== LLM call with fallback =====
-def call_llm(prompt, model_preferred=None):
+# ===== LLM call =====
+def call_llm(prompt):
     if not OPENAI_KEY:
         raise RuntimeError("OPENAI_API_KEY not configured")
-    
-    model_preferred = model_preferred or os.environ.get("OPENAI_MODEL", "gpt-4o")
-    fallback_model = "gpt-3.5-turbo"
-
     try:
         resp = openai.chat.completions.create(
-            model=model_preferred,
+            model=os.environ.get("OPENAI_MODEL", "gpt-4o"),
             messages=[
-                {"role":"system","content":"You are a trading assistant."},
-                {"role":"user","content":prompt}
+                {"role": "system", "content": "You are a trading assistant."},
+                {"role": "user", "content": prompt}
             ],
             temperature=0.2,
             max_tokens=700
         )
         return resp.choices[0].message.content
-    except openai.error.RateLimitError as e:
-        logger.warning(f"Preferred model {model_preferred} failed: {e}, falling back to {fallback_model}")
-        resp = openai.chat.completions.create(
-            model=fallback_model,
-            messages=[
-                {"role":"system","content":"You are a trading assistant."},
-                {"role":"user","content":prompt}
-            ],
-            temperature=0.2,
-            max_tokens=700
-        )
-        return resp.choices[0].message.content
-    except openai.error.OpenAIError as e:
-        logger.error(f"LLM call failed: {e}")
+    except openai.OpenAIError as e:
+        # Handles API errors (rate limit, quota, invalid request, etc.)
+        logger.error(f"OpenAI API error: {e}")
+        raise
+    except Exception as e:
+        # Handles unexpected issues
+        logger.error(f"Unexpected LLM error: {e}")
         raise
 
-
-# ===== Flask endpoints =====
+# ===== Flask endpoint =====
 @app.route("/analyze", methods=["POST"])
 def analyze():
     data = request.json
     ticker = data.get("ticker")
-    capital = float(data.get("capital",1000))
+    capital = float(data.get("capital", 1000))
 
-    # Fetch & compute
-    df_daily = compute_indicators(fetch_bars(ticker,"1d","1y"))
-    df_1h = compute_indicators(fetch_bars(ticker,"60m","60d"))
-    df_15m = compute_indicators(fetch_bars(ticker,"15m","60d"))
-    df_1m = compute_indicators(fetch_bars(ticker,"1m","7d"))
+    df_daily = compute_indicators(fetch_bars(ticker, "1d", "1y"))
+    df_1h = compute_indicators(fetch_bars(ticker, "60m", "60d"))
+    df_15m = compute_indicators(fetch_bars(ticker, "15m", "60d"))
+    df_1m = compute_indicators(fetch_bars(ticker, "1m", "7d"))
 
     summary = summarize_structure(df_daily, df_1h, df_15m, df_1m)
     recent_samples = {
@@ -173,7 +160,7 @@ def analyze():
         '15m_last_close': float(df_15m['close'].iloc[-1]) if not df_15m.empty else None
     }
 
-    result = None
+    trade_id = f"{ticker}-{int(time.time())}"
 
     if OPENAI_KEY:
         prompt = build_prompt(ticker, capital, summary, recent_samples)
@@ -181,28 +168,35 @@ def analyze():
             llm_out = call_llm(prompt)
             try:
                 parsed = json.loads(llm_out)
-                parsed['trade_id'] = parsed.get('trade_id') or f"{ticker}-{int(time.time())}"
-                parsed['source'] = 'LLM'
-                result = parsed
             except Exception:
-                # JSON parse failed, fallback
-                logger.warning(f"LLM output not JSON: {llm_out}")
-                result = heuristic_analysis(ticker, capital, summary, df_1m)
-                result['trade_id'] = f"{ticker}-{int(time.time())}"
-                result['source'] = 'Heuristic (LLM invalid output)'
-        except Exception as e:
-            # LLM call failed, fallback
-            logger.error(f"LLM call failed: {e}")
+                # fallback: LLM returned non-JSON
+                return jsonify({
+                    'entries': [],
+                    'explanation': llm_out,
+                    'raw': llm_out,
+                    'trade_id': trade_id,
+                    'source': 'LLM'
+                })
+            parsed['trade_id'] = parsed.get('trade_id') or trade_id
+            parsed['source'] = 'LLM'
+            return jsonify(parsed)
+        except openai.OpenAIError as e:
+            # Return heuristic if OpenAI API fails
             result = heuristic_analysis(ticker, capital, summary, df_1m)
-            result['trade_id'] = f"{ticker}-{int(time.time())}"
-            result['source'] = f"Heuristic (LLM failed: {e})"
+            result['trade_id'] = trade_id
+            result['source'] = f"Heuristic (LLM failed: {str(e)})"
+            return jsonify(result), 200
+        except Exception as e:
+            result = heuristic_analysis(ticker, capital, summary, df_1m)
+            result['trade_id'] = trade_id
+            result['source'] = f"Heuristic (unexpected LLM error: {str(e)})"
+            return jsonify(result), 200
     else:
-        # No key, use heuristic
+        # No API key, fallback to heuristic
         result = heuristic_analysis(ticker, capital, summary, df_1m)
-        result['trade_id'] = f"{ticker}-{int(time.time())}"
-        result['source'] = 'Heuristic (no LLM key)'
-
-    return jsonify(result)
+        result['trade_id'] = trade_id
+        result['source'] = 'Heuristic'
+        return jsonify(result)
 
 if __name__=="__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT",5000)))
