@@ -190,3 +190,25 @@ def feedback():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+
+app = Flask(__name__)
+CORS(app, origins=["https://craftyalpha.com"])  # allow your WordPress site
+
+@app.route("/analyze", methods=["POST"])
+def analyze():
+    data = request.json
+    ticker = data.get("ticker")
+    balance = data.get("balance")
+    
+    # Your existing analysis logic here
+    result = {
+        "entry": 145.2,
+        "stop": 142.0,
+        "exit": 148.5
+    }
+    return jsonify(result)
+
+if __name__ == "__main__":
+    app.run(debug=True)
