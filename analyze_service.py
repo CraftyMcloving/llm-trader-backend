@@ -147,16 +147,16 @@ def call_llm(prompt):
 # ----------------------
 # Routes
 # ----------------------
-@app.route("/analyze", methods=["POST"])
+@app.route('/analyze', methods=['POST'])
 def analyze():
     data = request.json
-    ticker = data.get("ticker")
-    capital = float(data.get("capital", 1000))
+    ticker = data.get('ticker')
+    capital = float(data.get('capital', 1000))
 
     if not ticker:
-        return jsonify({"error": "Ticker required"}), 400
+        return jsonify({'error':'ticker required'}), 400
 
-    # Fetch and compute indicators
+    # Fetch data
     df_daily = compute_indicators(fetch_bars(ticker, "1d", "1y"))
     df_1h = compute_indicators(fetch_bars(ticker, "60m", "60d"))
     df_15m = compute_indicators(fetch_bars(ticker, "15m", "60d"))
@@ -165,30 +165,39 @@ def analyze():
     summary = summarize_structure(df_daily, df_1h, df_15m, df_1m)
 
     recent_samples = {
-        "daily_last_close": float(df_daily["close"].iloc[-1]) if not df_daily.empty else None,
-        "1h_last_close": float(df_1h["close"].iloc[-1]) if not df_1h.empty else None,
-        "15m_last_close": float(df_15m["close"].iloc[-1]) if not df_15m.empty else None,
+        'daily_last_close': float(df_daily['close'].iloc[-1]) if not df_daily.empty else None,
+        '1h_last_close': float(df_1h['close'].iloc[-1]) if not df_1h.empty else None,
+        '15m_last_close': float(df_15m['close'].iloc[-1]) if not df_15m.empty else None,
     }
 
-    # Use LLM if key exists, otherwise heuristic
+    # Try OpenAI LLM if API key exists
     if OPENAI_KEY:
-        prompt = build_prompt(ticker, capital, summary, recent_samples)
         try:
+            prompt = build_prompt(ticker, capital, summary, recent_samples)
             llm_out = call_llm(prompt)
             try:
                 parsed = json.loads(llm_out)
+                parsed['trade_id'] = parsed.get('trade_id') or f"{ticker}-{int(time.time())}"
+                parsed['source'] = 'LLM'
+                return jsonify(parsed)
             except Exception:
-                return jsonify({"entries": [], "explanation": llm_out, "raw": llm_out, "source": "LLM"})
-            parsed["trade_id"] = parsed.get("trade_id") or f"{ticker}-{int(time.time())}"
-            parsed["source"] = "LLM"
-            return jsonify(parsed)
+                # Failed to parse LLM output; fall back
+                heuristic_result = heuristic_analysis(ticker, capital, summary, df_1m)
+                heuristic_result['trade_id'] = f"{ticker}-{int(time.time())}"
+                heuristic_result['source'] = 'Heuristic (LLM parse failed)'
+                return jsonify(heuristic_result)
         except Exception as e:
-            return jsonify({"error": "LLM call failed", "details": str(e), "source": "LLM"}), 500
+            # LLM call failed; fall back
+            heuristic_result = heuristic_analysis(ticker, capital, summary, df_1m)
+            heuristic_result['trade_id'] = f"{ticker}-{int(time.time())}"
+            heuristic_result['source'] = f"Heuristic (LLM call failed: {str(e)})"
+            return jsonify(heuristic_result)
     else:
-        result = heuristic_analysis(ticker, capital, summary, df_1m)
-        result["trade_id"] = f"{ticker}-{int(time.time())}"
-        result["source"] = "Heuristic"
-        return jsonify(result)
+        # No API key, use heuristic
+        heuristic_result = heuristic_analysis(ticker, capital, summary, df_1m)
+        heuristic_result['trade_id'] = f"{ticker}-{int(time.time())}"
+        heuristic_result['source'] = 'Heuristic (no LLM key)'
+        return jsonify(heuristic_result)
 
 
 @app.route("/feedback", methods=["POST"])
