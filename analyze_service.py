@@ -89,10 +89,6 @@ def analyze():
 
     return jsonify({"ticker": ticker, "summary": summary})
 
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
-
 if OPENAI_KEY:
     prompt = build_prompt(ticker, capital, summary, recent_samples)
     try:
@@ -111,3 +107,6 @@ else:
     result['trade_id'] = f"{ticker}-{int(time.time())}"
     result['source'] = 'Heuristic'
     return jsonify(result)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
