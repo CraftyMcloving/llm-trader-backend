@@ -75,7 +75,12 @@ def heuristic_analysis(ticker, capital, summary, df_1m):
     atr = summary.get('1m_atr') or (float(df_1m['close'].pct_change().std()) * last if last else None)
     if last is None or atr is None:
         return {'entries': [], 'explanation': 'Insufficient data for heuristic analysis.'}
-    if summary.get('daily_trend') == 'up' and (summary.get('15m_macd_hist') is not None and summary.get('15m_macd_hist') > 0):
+
+    daily_trend = summary.get('daily_trend', 'n/a')
+    macd_hist = summary.get('15m_macd_hist') or 0
+
+    # Flexible heuristic: allow slightly bullish or slightly bearish
+    if daily_trend in ['up', 'n/a'] and macd_hist >= -0.1:
         stop = round(last - (2 * atr), 4)
         tgt1 = round(last + (2 * atr), 4)
         tgt2 = round(last + (4 * atr), 4)
@@ -88,9 +93,9 @@ def heuristic_analysis(ticker, capital, summary, df_1m):
             'target_1': tgt1,
             'target_2': tgt2,
             'confidence': 'medium',
-            'rationale': 'Daily uptrend + positive 15m MACD histogram; ATR-based stops.'
+            'rationale': f'Daily trend {daily_trend} + 15m MACD histogram {macd_hist:.4f}; ATR-based stops.'
         })
-        return {'entries': entries, 'position_size': qty, 'explanation': 'Heuristic suggestion (no LLM key provided).'}
+        return {'entries': entries, 'position_size': qty, 'explanation': 'Flexible heuristic suggestion (no LLM key provided).'}
     else:
         return {'entries': [], 'explanation': 'No clear heuristic setup detected.'}
 
