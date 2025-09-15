@@ -199,7 +199,7 @@ def analyze():
         
 @app.route("/top5", methods=["GET"])
 def top5():
-    tickers = ["AAPL", "MSFT", "TSLA", "AMZN", "NVDA", "META", "BTC-USD", "ETH-USD"]  # you can expand this
+    tickers = ["AAPL", "MSFT", "TSLA", "AMZN", "NVDA", "META", "BTC-USD", "ETH-USD"]
     capital = float(request.args.get("capital", 1000))
     risk_percent = float(request.args.get("risk_percent", 1))
 
@@ -215,8 +215,7 @@ def top5():
             trade = heuristic_analysis(ticker, capital, risk_percent, summary, df_1m)
 
             if trade["entries"]:
-                e = trade["entries"][0]  # take first suggested entry
-                # simple risk score = (entry - stop) / entry
+                e = trade["entries"][0]  # first suggested entry
                 risk_score = abs((e["entry_price"] - e["stop_loss"]) / e["entry_price"]) if e["stop_loss"] else 1
                 e["ticker"] = ticker
                 e["risk_score"] = round(risk_score, 4)
@@ -224,21 +223,60 @@ def top5():
         except Exception as ex:
             logger.error(f"Top5 error for {ticker}: {ex}")
 
-    # sort by risk score
-    results_sorted = sorted(results, key=lambda x: x["risk_score"])
-    top5 = results_sorted[:5]
+    if not results:
+        return jsonify({"trades": []})
 
-    # map risk_score to label
-    for t in top5:
-        if t["risk_score"] < 0.01:
-            t["risk_level"] = "low"
-        elif t["risk_score"] < 0.03:
-            t["risk_level"] = "medium"
-        else:
-            t["risk_level"] = "high"
+    # === Use GPT-5 to refine ranking ===
+    try:
+        from openai import OpenAI
+        client = OpenAI()
 
-    return jsonify({"trades": top5})
+        # Prepare a condensed trade list for GPT
+        trade_summaries = [
+            f"{t['ticker']} | {t['type'].upper()} | Entry: {t['entry_price']} | SL: {t['stop_loss']} | "
+            f"T1: {t['target_1']} | Risk Score: {t['risk_score']}"
+            for t in results
+        ]
+        prompt = (
+            "You are a professional trader assistant. Given these candidate trades:\n\n"
+            + "\n".join(trade_summaries)
+            + "\n\nRank the best 5 trades from safest (lowest risk) to most speculative. "
+              "Add a one-sentence rationale for each. Respond in JSON with this format:\n\n"
+              "{ \"trades\": [ { \"ticker\": ..., \"rank\": 1, \"risk_level\": ..., \"reason\": ... }, ... ] }"
+        )
 
+        resp = client.chat.completions.create(
+            model="gpt-5",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3
+        )
+        ranked_json = json.loads(resp.choices[0].message.content)
+
+        # Merge GPT output with trade details
+        ranked_trades = []
+        for item in ranked_json.get("trades", []):
+            match = next((t for t in results if t["ticker"] == item["ticker"]), None)
+            if match:
+                match["rank"] = item.get("rank")
+                match["risk_level"] = item.get("risk_level", "unknown")
+                match["llm_reason"] = item.get("reason", "")
+                ranked_trades.append(match)
+
+        return jsonify({"trades": sorted(ranked_trades, key=lambda x: x["rank"])[:5]})
+
+    except Exception as e:
+        logger.error(f"GPT ranking failed: {e}")
+        # fallback = numeric sort
+        fallback_sorted = sorted(results, key=lambda x: x["risk_score"])[:5]
+        for t in fallback_sorted:
+            if t["risk_score"] < 0.01:
+                t["risk_level"] = "low"
+            elif t["risk_score"] < 0.03:
+                t["risk_level"] = "medium"
+            else:
+                t["risk_level"] = "high"
+            t["llm_reason"] = "Ranked heuristically by risk score (LLM unavailable)."
+        return jsonify({"trades": fallback_sorted})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
