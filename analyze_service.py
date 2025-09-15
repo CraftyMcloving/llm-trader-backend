@@ -179,7 +179,7 @@ def analyze():
 
     trade_id = f"{ticker}-{int(time.time())}"
 
-    if OPENAI_KEY or MISTRAL_API:
+   if OPENAI_KEY or MISTRAL_API:
     prompt = build_prompt(ticker, capital, summary, recent_samples, top_n=5)
     llm_out, used_model = call_llm_with_fallback(prompt)
 
@@ -201,16 +201,17 @@ def analyze():
         parsed['source'] = f"LLM ({used_model})"
         return jsonify(parsed)
 
-        else:
-            result = heuristic_analysis(ticker, capital, risk_percent, summary, df_1m)
-            result['trade_id'] = trade_id
-            result['source'] = 'Heuristic (LLM + fallback failed)'
-            return jsonify(result)
     else:
         result = heuristic_analysis(ticker, capital, risk_percent, summary, df_1m)
         result['trade_id'] = trade_id
-        result['source'] = 'Heuristic'
+        result['source'] = 'Heuristic (LLM + fallback failed)'
         return jsonify(result)
+
+else:
+    result = heuristic_analysis(ticker, capital, risk_percent, summary, df_1m)
+    result['trade_id'] = trade_id
+    result['source'] = 'Heuristic'
+    return jsonify(result)
         
 @app.route("/top5", methods=["GET"])
 def top5():
