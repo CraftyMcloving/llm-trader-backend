@@ -9,16 +9,19 @@ import ta
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import openai
+import requests
 
 # ===== Config =====
 app = Flask(__name__)
-CORS(app, origins=["https://craftyalpha.com"])  # update your frontend origin
+CORS(app, origins=["https://craftyalpha.com"])
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 OPENAI_KEY = os.environ.get("OPENAI_API_KEY")
 if OPENAI_KEY:
     openai.api_key = OPENAI_KEY
+
+MISTRAL_API = os.environ.get("MISTRAL_API")  # Optional fallback API
 
 # ===== Data fetching =====
 def fetch_bars(ticker, interval, period="7d"):
@@ -29,16 +32,13 @@ def fetch_bars(ticker, interval, period="7d"):
         return pd.DataFrame()
     if df is None or df.empty:
         return pd.DataFrame()
-
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [c[0].lower() for c in df.columns]
     else:
         df.columns = [c.lower() for c in df.columns]
-
     for col in ["open", "high", "low", "close", "volume"]:
         if col not in df.columns:
             df[col] = np.nan
-
     return df
 
 # ===== Indicators =====
@@ -71,12 +71,11 @@ def summarize_structure(df_daily, df_1h, df_15m, df_1m):
         logger.error(f"summarize_structure failed: {e}")
     return s
 
-# ===== Heuristic logic with risk management =====
+# ===== Heuristic analysis =====
 def heuristic_analysis(ticker, capital, risk_percent, summary, df_1m):
     entries = []
     last = float(df_1m['close'].iloc[-1]) if not df_1m.empty else None
     atr = summary.get('1m_atr') or (float(df_1m['close'].pct_change().std()) * last if last else None)
-    
     if last is None or atr is None:
         return {'entries': [], 'explanation': 'Insufficient data for heuristic analysis.'}
 
@@ -87,8 +86,6 @@ def heuristic_analysis(ticker, capital, risk_percent, summary, df_1m):
         stop = round(last - (2 * atr), 4)
         tgt1 = round(last + (2 * atr), 4)
         tgt2 = round(last + (4 * atr), 4)
-
-        # Risk in USD
         risk_per_trade_usd = (risk_percent / 100) * capital
         qty = int(risk_per_trade_usd / (last - stop)) if (last - stop) > 0 else 0
 
@@ -103,46 +100,48 @@ def heuristic_analysis(ticker, capital, risk_percent, summary, df_1m):
             'position_size': qty,
             'capital_at_risk_usd': round(risk_per_trade_usd, 2)
         })
-        return {'entries': entries, 'position_size': qty, 'explanation': f'Heuristic suggestion with {risk_percent}% risk per trade.'}
-    else:
-        return {'entries': [], 'explanation': 'No clear heuristic setup detected.'}
+    return {'entries': entries, 'position_size': qty if entries else 0, 'explanation': f'Heuristic suggestion with {risk_percent}% risk per trade.'}
 
-# ===== LLM prompt builder =====
-def build_prompt(ticker, capital, summary, recent_samples):
+# ===== Prompt builder for LLM =====
+def build_prompt(ticker, capital, summary, recent_samples, top_n=5):
     return f"""
-You are a professional quantitative day-trading assistant.
+You are a professional quantitative trading assistant.
 Ticker: {ticker}
 Capital: {capital}
 Multi-timeframe summary: {json.dumps(summary)}
 Recent samples: {json.dumps(recent_samples)}
 Constraints:
-- Provide up to 3 candidate trade setups with type, entry price, stop-loss, targets, position size, rationale.
-- Use ATR-based stops when appropriate. Explain confidence.
-- If no good trade, return empty list and short explanation.
-Return strictly JSON with keys: entries (list), position_size (number), explanation (string), trade_id (unique id).
+- Provide up to {top_n} candidate trades sorted by risk (least to most).
+- Include type, entry price, stop-loss, targets, position size, rationale.
+- Use ATR-based stops and explain confidence.
+- Return strictly JSON with keys: entries (list), explanation (string).
 """
 
-# ===== LLM call =====
-def call_llm(prompt):
-    if not OPENAI_KEY:
-        raise RuntimeError("OPENAI_API_KEY not configured")
+# ===== Call LLM with fallback =====
+def call_llm_with_fallback(prompt):
+    trade_json = None
     try:
         resp = openai.chat.completions.create(
-            model=os.environ.get("OPENAI_MODEL", "gpt-4o"),
+            model=os.environ.get("OPENAI_MODEL", "gpt-5"),
             messages=[
                 {"role": "system", "content": "You are a trading assistant."},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.2,
-            max_tokens=700
+            max_tokens=1000
         )
-        return resp.choices[0].message.content
-    except openai.OpenAIError as e:
-        logger.error(f"OpenAI API error: {e}")
-        raise
+        trade_json = resp.choices[0].message.content
     except Exception as e:
-        logger.error(f"Unexpected LLM error: {e}")
-        raise
+        logger.warning(f"GPT-5 failed: {e}, trying Mistral fallback...")
+        if MISTRAL_API:
+            try:
+                r = requests.post(MISTRAL_API, json={"prompt": prompt})
+                if r.status_code == 200:
+                    trade_json = r.text
+            except Exception as ex:
+                logger.error(f"Mistral fallback failed: {ex}")
+
+    return trade_json
 
 # ===== Flask endpoint =====
 @app.route("/analyze", methods=["POST"])
@@ -167,21 +166,15 @@ def analyze():
     trade_id = f"{ticker}-{int(time.time())}"
 
     if OPENAI_KEY:
-        prompt = build_prompt(ticker, capital, summary, recent_samples)
-        try:
-            llm_out = call_llm(prompt)
+        prompt = build_prompt(ticker, capital, summary, recent_samples, top_n=5)
+        llm_out = call_llm_with_fallback(prompt)
+        if llm_out:
             try:
                 parsed = json.loads(llm_out)
             except Exception:
-                return jsonify({
-                    'entries': [],
-                    'explanation': llm_out,
-                    'raw': llm_out,
-                    'trade_id': trade_id,
-                    'source': 'LLM'
-                })
+                parsed = {'entries': [], 'explanation': llm_out}
 
-            # Risk augmentation if missing
+            # Ensure risk info is included
             for e in parsed.get('entries', []):
                 if 'position_size' not in e and 'stop_loss' in e and 'entry_price' in e:
                     risk_usd = (risk_percent / 100) * capital
@@ -189,21 +182,15 @@ def analyze():
                     e['position_size'] = qty
                     e['capital_at_risk_usd'] = round(risk_usd, 2)
 
-            parsed['trade_id'] = parsed.get('trade_id') or trade_id
-            parsed['source'] = 'LLM'
+            parsed['trade_id'] = trade_id
+            parsed['source'] = 'LLM (with fallback)'
             return jsonify(parsed)
 
-        except openai.OpenAIError as e:
+        else:
             result = heuristic_analysis(ticker, capital, risk_percent, summary, df_1m)
             result['trade_id'] = trade_id
-            result['source'] = f"Heuristic (LLM failed: {str(e)})"
-            return jsonify(result), 200
-        except Exception as e:
-            result = heuristic_analysis(ticker, capital, risk_percent, summary, df_1m)
-            result['trade_id'] = trade_id
-            result['source'] = f"Heuristic (unexpected LLM error: {str(e)})"
-            return jsonify(result), 200
-
+            result['source'] = 'Heuristic (LLM + fallback failed)'
+            return jsonify(result)
     else:
         result = heuristic_analysis(ticker, capital, risk_percent, summary, df_1m)
         result['trade_id'] = trade_id
