@@ -196,6 +196,49 @@ def analyze():
         result['trade_id'] = trade_id
         result['source'] = 'Heuristic'
         return jsonify(result)
+        
+@app.route("/top5", methods=["GET"])
+def top5():
+    tickers = ["AAPL", "MSFT", "TSLA", "AMZN", "NVDA", "META", "BTC-USD", "ETH-USD"]  # you can expand this
+    capital = float(request.args.get("capital", 1000))
+    risk_percent = float(request.args.get("risk_percent", 1))
+
+    results = []
+    for ticker in tickers:
+        try:
+            df_daily = compute_indicators(fetch_bars(ticker, "1d", "1y"))
+            df_1h = compute_indicators(fetch_bars(ticker, "60m", "60d"))
+            df_15m = compute_indicators(fetch_bars(ticker, "15m", "60d"))
+            df_1m = compute_indicators(fetch_bars(ticker, "1m", "7d"))
+
+            summary = summarize_structure(df_daily, df_1h, df_15m, df_1m)
+            trade = heuristic_analysis(ticker, capital, risk_percent, summary, df_1m)
+
+            if trade["entries"]:
+                e = trade["entries"][0]  # take first suggested entry
+                # simple risk score = (entry - stop) / entry
+                risk_score = abs((e["entry_price"] - e["stop_loss"]) / e["entry_price"]) if e["stop_loss"] else 1
+                e["ticker"] = ticker
+                e["risk_score"] = round(risk_score, 4)
+                results.append(e)
+        except Exception as ex:
+            logger.error(f"Top5 error for {ticker}: {ex}")
+
+    # sort by risk score
+    results_sorted = sorted(results, key=lambda x: x["risk_score"])
+    top5 = results_sorted[:5]
+
+    # map risk_score to label
+    for t in top5:
+        if t["risk_score"] < 0.01:
+            t["risk_level"] = "low"
+        elif t["risk_score"] < 0.03:
+            t["risk_level"] = "medium"
+        else:
+            t["risk_level"] = "high"
+
+    return jsonify({"trades": top5})
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
