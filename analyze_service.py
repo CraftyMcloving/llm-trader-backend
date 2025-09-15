@@ -8,6 +8,7 @@ import yfinance as yf
 import ta
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from openai import OpenAI
 import openai
 import requests
 
@@ -120,28 +121,41 @@ Constraints:
 # ===== Call LLM with fallback =====
 def call_llm_with_fallback(prompt):
     trade_json = None
-    try:
-        resp = openai.chat.completions.create(
-            model=os.environ.get("OPENAI_MODEL", "gpt-5"),
-            messages=[
-                {"role": "system", "content": "You are a trading assistant."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.2,
-            max_tokens=1000
-        )
-        trade_json = resp.choices[0].message.content
-    except Exception as e:
-        logger.warning(f"GPT-5 failed: {e}, trying Mistral fallback...")
-        if MISTRAL_API:
-            try:
-                r = requests.post(MISTRAL_API, json={"prompt": prompt})
-                if r.status_code == 200:
-                    trade_json = r.text
-            except Exception as ex:
-                logger.error(f"Mistral fallback failed: {ex}")
+    used_model = None
+    openai_models = ["gpt-5", "gpt-4.1", "gpt-4", "gpt-3.5-turbo"]
 
-    return trade_json
+    for model in openai_models:
+        if not OPENAI_KEY:
+            break
+        try:
+            resp = openai.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": "You are a trading assistant."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.2,
+                max_tokens=1000
+            )
+            trade_json = resp.choices[0].message.content
+            used_model = model
+            logger.info(f"LLM succeeded with model {model}")
+            break
+        except Exception as e:
+            logger.warning(f"Model {model} failed: {e}")
+
+    if not trade_json and MISTRAL_API:
+        try:
+            r = requests.post(MISTRAL_API, json={"prompt": prompt})
+            if r.status_code == 200:
+                trade_json = r.text
+                used_model = "Mistral-7B"
+                logger.info("LLM succeeded with Mistral fallback")
+        except Exception as ex:
+            logger.error(f"Mistral fallback failed: {ex}")
+
+    return trade_json, used_model
+
 
 # ===== Flask endpoint =====
 @app.route("/analyze", methods=["POST"])
@@ -165,26 +179,27 @@ def analyze():
 
     trade_id = f"{ticker}-{int(time.time())}"
 
-    if OPENAI_KEY:
-        prompt = build_prompt(ticker, capital, summary, recent_samples, top_n=5)
-        llm_out = call_llm_with_fallback(prompt)
-        if llm_out:
-            try:
-                parsed = json.loads(llm_out)
-            except Exception:
-                parsed = {'entries': [], 'explanation': llm_out}
+    if OPENAI_KEY or MISTRAL_API:
+    prompt = build_prompt(ticker, capital, summary, recent_samples, top_n=5)
+    llm_out, used_model = call_llm_with_fallback(prompt)
 
-            # Ensure risk info is included
-            for e in parsed.get('entries', []):
-                if 'position_size' not in e and 'stop_loss' in e and 'entry_price' in e:
-                    risk_usd = (risk_percent / 100) * capital
-                    qty = int(risk_usd / (e['entry_price'] - e['stop_loss'])) if (e['entry_price'] - e['stop_loss']) > 0 else 0
-                    e['position_size'] = qty
-                    e['capital_at_risk_usd'] = round(risk_usd, 2)
+    if llm_out:
+        try:
+            parsed = json.loads(llm_out)
+        except Exception:
+            parsed = {'entries': [], 'explanation': llm_out}
 
-            parsed['trade_id'] = trade_id
-            parsed['source'] = 'LLM (with fallback)'
-            return jsonify(parsed)
+        # Ensure risk info is included
+        for e in parsed.get('entries', []):
+            if 'position_size' not in e and 'stop_loss' in e and 'entry_price' in e:
+                risk_usd = (risk_percent / 100) * capital
+                qty = int(risk_usd / (e['entry_price'] - e['stop_loss'])) if (e['entry_price'] - e['stop_loss']) > 0 else 0
+                e['position_size'] = qty
+                e['capital_at_risk_usd'] = round(risk_usd, 2)
+
+        parsed['trade_id'] = trade_id
+        parsed['source'] = f"LLM ({used_model})"
+        return jsonify(parsed)
 
         else:
             result = heuristic_analysis(ticker, capital, risk_percent, summary, df_1m)
@@ -215,7 +230,7 @@ def top5():
             trade = heuristic_analysis(ticker, capital, risk_percent, summary, df_1m)
 
             if trade["entries"]:
-                e = trade["entries"][0]  # first suggested entry
+                e = trade["entries"][0]
                 risk_score = abs((e["entry_price"] - e["stop_loss"]) / e["entry_price"]) if e["stop_loss"] else 1
                 e["ticker"] = ticker
                 e["risk_score"] = round(risk_score, 4)
@@ -226,47 +241,52 @@ def top5():
     if not results:
         return jsonify({"trades": []})
 
-    # === Use GPT-5 to refine ranking ===
-    try:
-        from openai import OpenAI
-        client = OpenAI()
+    # Prepare condensed trade list for LLM
+    trade_summaries = [
+        f"{t['ticker']} | {t['type'].upper()} | Entry: {t['entry_price']} | SL: {t['stop_loss']} | "
+        f"T1: {t['target_1']} | Risk Score: {t['risk_score']}"
+        for t in results
+    ]
+    prompt = (
+        "You are a professional trader assistant. Given these candidate trades:\n\n"
+        + "\n".join(trade_summaries)
+        + "\n\nRank the best 5 trades from safest (lowest risk) to most speculative. "
+          "Add a one-sentence rationale for each. Respond in JSON with this format:\n\n"
+          "{ \"trades\": [ { \"ticker\": ..., \"rank\": 1, \"risk_level\": ..., \"reason\": ... }, ... ] }"
+    )
 
-        # Prepare a condensed trade list for GPT
-        trade_summaries = [
-            f"{t['ticker']} | {t['type'].upper()} | Entry: {t['entry_price']} | SL: {t['stop_loss']} | "
-            f"T1: {t['target_1']} | Risk Score: {t['risk_score']}"
-            for t in results
-        ]
-        prompt = (
-            "You are a professional trader assistant. Given these candidate trades:\n\n"
-            + "\n".join(trade_summaries)
-            + "\n\nRank the best 5 trades from safest (lowest risk) to most speculative. "
-              "Add a one-sentence rationale for each. Respond in JSON with this format:\n\n"
-              "{ \"trades\": [ { \"ticker\": ..., \"rank\": 1, \"risk_level\": ..., \"reason\": ... }, ... ] }"
-        )
+    # ===== Call LLM with fallback =====
+    ranked_json = None
+    used_model = None
+    openai_models = ["gpt-5", "gpt-4.1", "gpt-4", "gpt-3.5-turbo"]
 
-        resp = client.chat.completions.create(
-            model="gpt-5",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.3
-        )
-        ranked_json = json.loads(resp.choices[0].message.content)
+    for model in openai_models:
+        if OPENAI_KEY:
+            try:
+                resp = openai.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.3
+                )
+                ranked_json = json.loads(resp.choices[0].message.content)
+                used_model = model
+                logger.info(f"Top5 ranking succeeded with model {model}")
+                break
+            except Exception as e:
+                logger.warning(f"Model {model} failed for Top5: {e}")
 
-        # Merge GPT output with trade details
-        ranked_trades = []
-        for item in ranked_json.get("trades", []):
-            match = next((t for t in results if t["ticker"] == item["ticker"]), None)
-            if match:
-                match["rank"] = item.get("rank")
-                match["risk_level"] = item.get("risk_level", "unknown")
-                match["llm_reason"] = item.get("reason", "")
-                ranked_trades.append(match)
+    if not ranked_json and MISTRAL_API:
+        try:
+            r = requests.post(MISTRAL_API, json={"prompt": prompt})
+            if r.status_code == 200:
+                ranked_json = json.loads(r.text)
+                used_model = "Mistral-7B"
+                logger.info("Top5 ranking succeeded with Mistral fallback")
+        except Exception as ex:
+            logger.error(f"Mistral Top5 fallback failed: {ex}")
 
-        return jsonify({"trades": sorted(ranked_trades, key=lambda x: x["rank"])[:5]})
-
-    except Exception as e:
-        logger.error(f"GPT ranking failed: {e}")
-        # fallback = numeric sort
+    # Fallback: sort by risk score numerically
+    if not ranked_json:
         fallback_sorted = sorted(results, key=lambda x: x["risk_score"])[:5]
         for t in fallback_sorted:
             if t["risk_score"] < 0.01:
@@ -277,6 +297,18 @@ def top5():
                 t["risk_level"] = "high"
             t["llm_reason"] = "Ranked heuristically by risk score (LLM unavailable)."
         return jsonify({"trades": fallback_sorted})
+
+    # Merge GPT/Mistral output with trade details
+    ranked_trades = []
+    for item in ranked_json.get("trades", []):
+        match = next((t for t in results if t["ticker"] == item["ticker"]), None)
+        if match:
+            match["rank"] = item.get("rank")
+            match["risk_level"] = item.get("risk_level", "unknown")
+            match["llm_reason"] = item.get("reason", "")
+            ranked_trades.append(match)
+
+    return jsonify({"trades": sorted(ranked_trades, key=lambda x: x["rank"])[:5], "source": used_model})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
