@@ -8,7 +8,6 @@ import yfinance as yf
 import ta
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from openai import OpenAI
 import openai
 import requests
 
@@ -21,8 +20,6 @@ logger = logging.getLogger(__name__)
 OPENAI_KEY = os.environ.get("OPENAI_API_KEY")
 if OPENAI_KEY:
     openai.api_key = OPENAI_KEY
-
-MISTRAL_API = os.environ.get("MISTRAL_API")  # Optional fallback API
 
 # ===== Data fetching =====
 def fetch_bars(ticker, interval, period="7d"):
@@ -118,7 +115,7 @@ Constraints:
 - Return strictly JSON with keys: entries (list), explanation (string).
 """
 
-# ===== Call LLM with fallback =====
+# ===== Call OpenAI LLM with fallback through multiple models =====
 def call_llm_with_fallback(prompt):
     trade_json = None
     used_model = None
@@ -144,20 +141,9 @@ def call_llm_with_fallback(prompt):
         except Exception as e:
             logger.warning(f"Model {model} failed: {e}")
 
-    if not trade_json and MISTRAL_API:
-        try:
-            r = requests.post(MISTRAL_API, json={"prompt": prompt})
-            if r.status_code == 200:
-                trade_json = r.text
-                used_model = "Mistral-7B"
-                logger.info("LLM succeeded with Mistral fallback")
-        except Exception as ex:
-            logger.error(f"Mistral fallback failed: {ex}")
-
     return trade_json, used_model
 
-
-# ===== Flask endpoint =====
+# ===== Flask endpoint: /analyze =====
 @app.route("/analyze", methods=["POST"])
 def analyze():
     data = request.json
@@ -179,40 +165,40 @@ def analyze():
 
     trade_id = f"{ticker}-{int(time.time())}"
 
-   if OPENAI_KEY or MISTRAL_API:
-    prompt = build_prompt(ticker, capital, summary, recent_samples, top_n=5)
-    llm_out, used_model = call_llm_with_fallback(prompt)
+    if OPENAI_KEY:
+        prompt = build_prompt(ticker, capital, summary, recent_samples, top_n=5)
+        llm_out, used_model = call_llm_with_fallback(prompt)
 
-    if llm_out:
-        try:
-            parsed = json.loads(llm_out)
-        except Exception:
-            parsed = {'entries': [], 'explanation': llm_out}
+        if llm_out:
+            try:
+                parsed = json.loads(llm_out)
+            except Exception:
+                parsed = {'entries': [], 'explanation': llm_out}
 
-        # Ensure risk info is included
-        for e in parsed.get('entries', []):
-            if 'position_size' not in e and 'stop_loss' in e and 'entry_price' in e:
-                risk_usd = (risk_percent / 100) * capital
-                qty = int(risk_usd / (e['entry_price'] - e['stop_loss'])) if (e['entry_price'] - e['stop_loss']) > 0 else 0
-                e['position_size'] = qty
-                e['capital_at_risk_usd'] = round(risk_usd, 2)
+            for e in parsed.get('entries', []):
+                if 'position_size' not in e and 'stop_loss' in e and 'entry_price' in e:
+                    risk_usd = (risk_percent / 100) * capital
+                    qty = int(risk_usd / (e['entry_price'] - e['stop_loss'])) if (e['entry_price'] - e['stop_loss']) > 0 else 0
+                    e['position_size'] = qty
+                    e['capital_at_risk_usd'] = round(risk_usd, 2)
 
-        parsed['trade_id'] = trade_id
-        parsed['source'] = f"LLM ({used_model})"
-        return jsonify(parsed)
+            parsed['trade_id'] = trade_id
+            parsed['source'] = f"LLM ({used_model})"
+            return jsonify(parsed)
+
+        else:
+            result = heuristic_analysis(ticker, capital, risk_percent, summary, df_1m)
+            result['trade_id'] = trade_id
+            result['source'] = 'Heuristic (LLM failed)'
+            return jsonify(result)
 
     else:
         result = heuristic_analysis(ticker, capital, risk_percent, summary, df_1m)
         result['trade_id'] = trade_id
-        result['source'] = 'Heuristic (LLM + fallback failed)'
+        result['source'] = 'Heuristic'
         return jsonify(result)
 
-else:
-    result = heuristic_analysis(ticker, capital, risk_percent, summary, df_1m)
-    result['trade_id'] = trade_id
-    result['source'] = 'Heuristic'
-    return jsonify(result)
-        
+# ===== Flask endpoint: /top5 =====
 @app.route("/top5", methods=["GET"])
 def top5():
     tickers = ["AAPL", "MSFT", "TSLA", "AMZN", "NVDA", "META", "BTC-USD", "ETH-USD"]
@@ -242,7 +228,6 @@ def top5():
     if not results:
         return jsonify({"trades": []})
 
-    # Prepare condensed trade list for LLM
     trade_summaries = [
         f"{t['ticker']} | {t['type'].upper()} | Entry: {t['entry_price']} | SL: {t['stop_loss']} | "
         f"T1: {t['target_1']} | Risk Score: {t['risk_score']}"
@@ -256,7 +241,6 @@ def top5():
           "{ \"trades\": [ { \"ticker\": ..., \"rank\": 1, \"risk_level\": ..., \"reason\": ... }, ... ] }"
     )
 
-    # ===== Call LLM with fallback =====
     ranked_json = None
     used_model = None
     openai_models = ["gpt-5", "gpt-4.1", "gpt-4", "gpt-3.5-turbo"]
@@ -276,17 +260,6 @@ def top5():
             except Exception as e:
                 logger.warning(f"Model {model} failed for Top5: {e}")
 
-    if not ranked_json and MISTRAL_API:
-        try:
-            r = requests.post(MISTRAL_API, json={"prompt": prompt})
-            if r.status_code == 200:
-                ranked_json = json.loads(r.text)
-                used_model = "Mistral-7B"
-                logger.info("Top5 ranking succeeded with Mistral fallback")
-        except Exception as ex:
-            logger.error(f"Mistral Top5 fallback failed: {ex}")
-
-    # Fallback: sort by risk score numerically
     if not ranked_json:
         fallback_sorted = sorted(results, key=lambda x: x["risk_score"])[:5]
         for t in fallback_sorted:
@@ -299,7 +272,6 @@ def top5():
             t["llm_reason"] = "Ranked heuristically by risk score (LLM unavailable)."
         return jsonify({"trades": fallback_sorted})
 
-    # Merge GPT/Mistral output with trade details
     ranked_trades = []
     for item in ranked_json.get("trades", []):
         match = next((t for t in results if t["ticker"] == item["ticker"]), None)
