@@ -288,3 +288,13 @@ def summary(_: None = Depends(require_key)):
         except Exception:
             board.append({"symbol": inst["symbol"], "signal": "Neutral", "confidence": 0.0})
     return {"universe": uni, "leaderboard": board}
+
+@app.post("/admin/refresh")
+def refresh(_: None = Depends(require_key)):
+    STATE["universe"] = []
+    STATE["universe_fetched_at"] = 0
+    STATE["ohlcv_cache"].clear()
+    STATE["signal_cache"].clear()
+    # trigger fetch once so the next call is fast
+    uni = get_universe()
+    return {"ok": True, "universe": len(uni)}
