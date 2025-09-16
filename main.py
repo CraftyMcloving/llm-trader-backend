@@ -6,12 +6,27 @@ import pandas_ta as ta
 import ccxt
 import requests
 from typing import List, Optional, Dict
+# --- helpers for resilient indicator access ---
+from typing import Optional
 
-SECRET = os.getenv("AI_TRADE_SECRET", "XxUjb7DilVuqcnmeLXmUCURndUzC4Vmf")
-DEFAULT_TF = "4h"
+def _first_col_startswith(df: pd.DataFrame, prefix: str) -> Optional[str]:
+    if isinstance(df, pd.DataFrame):
+        for c in df.columns:
+            if str(c).startswith(prefix):
+                return c
+    return None
 
-app = FastAPI(title="AI Trade Advisor Backend")
-
+def _bollinger_mid(close: pd.Series, length: int = 20, std: int = 2) -> pd.Series:
+    """Return BB midline robustly; fall back to SMA(length) if not present yet."""
+    bb = ta.bbands(close, length=length, std=std)
+    if isinstance(bb, pd.DataFrame) and not bb.empty:
+        # pandas-ta usually names midline like 'BBM_20_2.0' or similar
+        mid = _first_col_startswith(bb, "BBM_") or _first_col_startswith(bb, "BBM")
+        if mid and mid in bb:
+            return bb[mid]
+    # Fallback if bb not fully populated or columns renamed
+    return ta.sma(close, length=length)
+    
 class AnalyzeRequest(BaseModel):
     symbol: str
     asset_type: str  # "crypto" or "fx"
@@ -21,6 +36,11 @@ class AnalyzeRequest(BaseModel):
 
 class AnalyzeBatchRequest(BaseModel):
     items: List[AnalyzeRequest]
+
+SECRET = os.getenv("AI_TRADE_SECRET", "XxUjb7DilVuqcnmeLXmUCURndUzC4Vmf")
+DEFAULT_TF = "4h"
+
+app = FastAPI(title="AI Trade Advisor Backend")
     
 def first_col_like(df: pd.DataFrame, startswith: str) -> Optional[str]:
     for c in df.columns:
