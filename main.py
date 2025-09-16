@@ -103,32 +103,65 @@ def rule_inference(df: pd.DataFrame) -> Dict[str, Any]:
 
 # ---------------- Data sources ----------------
 def coingecko_top_n(n: int) -> List[Dict[str, Any]]:
-    r = requests().get(
-        "https://api.coingecko.com/api/v3/coins/markets",
-        params=dict(vs_currency="usd", order="market_cap_desc", per_page=n, page=1),
-        timeout=20
-    )
-    r.raise_for_status()
-    out = []
-    for c in r.json():
-        sym = (c.get("symbol") or "").upper()
-        name = c.get("name") or sym
-        out.append({"symbol": f"{sym}/{QUOTE}", "name": name, "market": EXCHANGE, "tf_supported": ["1h","1d"]})
-    return out
+    sess = requests().Session()
+    sess.headers.update({"User-Agent": "AI-Trade-Advisor/1.0 (contact: site-owner)"})
+    url = "https://api.coingecko.com/api/v3/coins/markets"
+    params = dict(vs_currency="usd", order="market_cap_desc", per_page=n, page=1)
+    last_err = None
+    for _ in range(3):  # up to 3 retries
+        try:
+            r = sess.get(url, params=params, timeout=20)
+            if r.status_code == 429:
+                time.sleep(2)  # gentle backoff
+                continue
+            r.raise_for_status()
+            coins = r.json()
+            out = []
+            for c in coins:
+                sym = (c.get("symbol") or "").upper()
+                name = c.get("name") or sym
+                out.append({"base": sym, "name": name})
+            return out
+        except Exception as e:
+            last_err = e
+            time.sleep(1)
+    # if we’re here, all retries failed
+    raise HTTPException(status_code=502, detail=f"CoinGecko error: {last_err}")
 
 def get_universe() -> List[Dict[str, Any]]:
     now = time.time()
     if STATE["universe"] and now - STATE["universe_fetched_at"] < CACHE_TTL_SEC:
         return STATE["universe"]
+
     try:
-        uni = coingecko_top_n(TOP_N)
-        STATE["universe"] = uni
+        # 1) fetch top list from CoinGecko
+        top = coingecko_top_n(TOP_N)  # list of {"base","name"}
+        # 2) load exchange markets and keep only supported pairs
+        ex = get_exchange()
+        markets = ex.load_markets()
+        wanted = set(f"{t['base']}/{QUOTE}" for t in top)
+        supported = []
+        for sym, m in markets.items():
+            if sym in wanted and m.get("spot", True) and not m.get("contract"):
+                base = m.get("base") or sym.split("/")[0]
+                name = next((t["name"] for t in top if t["base"] == base), base)
+                supported.append({"symbol": sym, "name": name, "market": EXCHANGE, "tf_supported": ["1h","1d"]})
+        # If some are missing, we still return whatever is supported (could be < TOP_N)
+        # If *none* matched (e.g., QUOTE not offered), fallback to the safe trio
+        if not supported:
+            supported = [
+                {"symbol": f"BTC/{QUOTE}", "name": "Bitcoin", "market": EXCHANGE, "tf_supported": ["1h","1d"]},
+                {"symbol": f"ETH/{QUOTE}", "name": "Ethereum", "market": EXCHANGE, "tf_supported": ["1h","1d"]},
+                {"symbol": f"SOL/{QUOTE}", "name": "Solana", "market": EXCHANGE, "tf_supported": ["1h","1d"]},
+            ]
+        STATE["universe"] = supported
         STATE["universe_fetched_at"] = now
-        return uni
-    except Exception as e:
-        if STATE["universe"]:   # serve stale if available
+        return supported
+    except HTTPException:
+        # propagate API error; if we have stale, serve it
+        if STATE["universe"]:
             return STATE["universe"]
-        # safe fallback (tiny universe)
+        # final safety fallback
         return [
             {"symbol": f"BTC/{QUOTE}", "name": "Bitcoin", "market": EXCHANGE, "tf_supported": ["1h","1d"]},
             {"symbol": f"ETH/{QUOTE}", "name": "Ethereum","market": EXCHANGE, "tf_supported": ["1h","1d"]},
