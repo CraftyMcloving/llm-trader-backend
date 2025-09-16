@@ -6,27 +6,19 @@ import pandas_ta as ta
 import ccxt
 import requests
 from typing import List, Optional, Dict
-# --- helpers for resilient indicator access ---
-from typing import Optional
 
-def _first_col_startswith(df: pd.DataFrame, prefix: str) -> Optional[str]:
-    if isinstance(df, pd.DataFrame):
-        for c in df.columns:
-            if str(c).startswith(prefix):
-                return c
-    return None
+# ---------------------------
+# Config / constants
+# ---------------------------
+SECRET = os.getenv("AI_TRADE_SECRET", "XxUjb7DilVuqcnmeLXmUCURndUzC4Vmf")
+DEFAULT_TF = "4h"
+ALPHA_VANTAGE_KEY = os.getenv("ALPHA_VANTAGE_KEY")  # ✅ correct env var name
 
-def _bollinger_mid(close: pd.Series, length: int = 20, std: int = 2) -> pd.Series:
-    """Return BB midline robustly; fall back to SMA(length) if not present yet."""
-    bb = ta.bbands(close, length=length, std=std)
-    if isinstance(bb, pd.DataFrame) and not bb.empty:
-        # pandas-ta usually names midline like 'BBM_20_2.0' or similar
-        mid = _first_col_startswith(bb, "BBM_") or _first_col_startswith(bb, "BBM")
-        if mid and mid in bb:
-            return bb[mid]
-    # Fallback if bb not fully populated or columns renamed
-    return ta.sma(close, length=length)
-    
+app = FastAPI(title="AI Trade Advisor Backend")
+
+# ---------------------------
+# Models
+# ---------------------------
 class AnalyzeRequest(BaseModel):
     symbol: str
     asset_type: str  # "crypto" or "fx"
@@ -37,34 +29,64 @@ class AnalyzeRequest(BaseModel):
 class AnalyzeBatchRequest(BaseModel):
     items: List[AnalyzeRequest]
 
-SECRET = os.getenv("AI_TRADE_SECRET", "XxUjb7DilVuqcnmeLXmUCURndUzC4Vmf")
-DEFAULT_TF = "4h"
-
-app = FastAPI(title="AI Trade Advisor Backend")
-    
-def first_col_like(df: pd.DataFrame, startswith: str) -> Optional[str]:
-    for c in df.columns:
-        if c.startswith(startswith):
-            return c
-    return None
-
-def bollinger_mid(close: pd.Series, length: int = 20, std: int = 2) -> pd.Series:
-    bb = ta.bbands(close, length=length, std=std)
-    if isinstance(bb, pd.DataFrame) and not bb.empty:
-        mid = first_col_like(bb, "BBM_")
-        if mid and mid in bb:
-            return bb[mid]
-    # Fallback if pandas-ta naming changed or BB not available yet
-    return ta.sma(close, length=length)
-
-
+# ---------------------------
+# Auth
+# ---------------------------
 def require_auth(auth: Optional[str]):
     if not auth or not auth.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing auth")
-    token = auth.split(" ",1)[1]
+    token = auth.split(" ", 1)[1]
     if token != SECRET:
         raise HTTPException(status_code=403, detail="Invalid token")
 
+# ---------------------------
+# Utility helpers (version-proof indicators)
+# ---------------------------
+def _first_col_startswith(df: pd.DataFrame, prefix: str) -> Optional[str]:
+    if isinstance(df, pd.DataFrame):
+        for c in df.columns:
+            if str(c).startswith(prefix):
+                return c
+    return None
+
+def _bollinger_mid(close: pd.Series, length: int = 20, std: int = 2) -> pd.Series:
+    """
+    Robust BB midline across pandas-ta versions.
+    Falls back to (upper+lower)/2 or SMA(length) if needed.
+    """
+    bb = ta.bbands(close, length=length, std=std)
+    if isinstance(bb, pd.DataFrame) and not bb.empty:
+        # Common names: 'BBM_20_2.0', 'BBM_20_2', 'BBM'
+        mid = _first_col_startswith(bb, "BBM_") or ("BBM" if "BBM" in bb.columns else None)
+        if mid and mid in bb:
+            return bb[mid]
+        up = _first_col_startswith(bb, "BBU_") or ("BBU" if "BBU" in bb.columns else None)
+        lo = _first_col_startswith(bb, "BBL_") or ("BBL" if "BBL" in bb.columns else None)
+        if (up in bb) and (lo in bb):
+            return (bb[up] + bb[lo]) / 2.0
+    # Last resort: SMA
+    return ta.sma(close, length=length)
+
+def _macd_hist(close: pd.Series, fast=12, slow=26, signal=9) -> pd.Series:
+    """
+    Get MACD histogram robustly across pandas-ta versions.
+    """
+    macd = ta.macd(close, fast=fast, slow=slow, signal=signal)
+    if isinstance(macd, pd.DataFrame) and not macd.empty:
+        # Common names: 'MACDh_12_26_9', 'MACD_Hist', etc.
+        hist_col = _first_col_startswith(macd, "MACDh_") or _first_col_startswith(macd, "MACD_Hist")
+        if hist_col and hist_col in macd:
+            return macd[hist_col]
+        macd_line = _first_col_startswith(macd, "MACD_")
+        sig_line  = _first_col_startswith(macd, "MACDs_") or _first_col_startswith(macd, "MACD_Signal")
+        if (macd_line in macd) and (sig_line in macd):
+            return macd[macd_line] - macd[sig_line]
+    # No MACD available yet -> empty Series with index
+    return pd.Series(index=close.index, dtype=float)
+
+# ---------------------------
+# Endpoints (health + instruments)
+# ---------------------------
 @app.get("/health")
 def health():
     return {"ok": True, "ts": int(time.time())}
@@ -88,19 +110,20 @@ def instruments():
         ]
     }
 
-
+# ---------------------------
+# Data fetchers
+# ---------------------------
 def fetch_ohlcv_crypto(symbol: str, timeframe: str) -> pd.DataFrame:
     ex = ccxt.binance({"enableRateLimit": True})
-    # Convert symbol like BTC/USDT
     ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=400)
     df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"]).set_index("ts")
     df.index = pd.to_datetime(df.index, unit="ms", utc=True)
     return df
 
-# Placeholder for FX - replace with your provider
-ALPHA_VANTAGE_KEY = os.getenv("4N0D0EY6X6W42UJV")
-
 def fetch_ohlcv_fx(pair: str, timeframe: str) -> pd.DataFrame:
+    """
+    Alpha Vantage FX (free). For 4h we resample from 60min.
+    """
     base, quote = pair.split("/")
     if not ALPHA_VANTAGE_KEY:
         raise HTTPException(500, "ALPHA_VANTAGE_KEY not set")
@@ -125,18 +148,19 @@ def fetch_ohlcv_fx(pair: str, timeframe: str) -> pd.DataFrame:
 
     ts = data.get(key, {})
     if not ts:
-        raise HTTPException(502, f"FX data unavailable for {pair}")
+        # Often returns {"Note": "..."} when rate limited
+        detail = data.get("Note") or data.get("Error Message") or f"FX data unavailable for {pair}"
+        raise HTTPException(502, detail)
 
     df = (
         pd.DataFrame.from_dict(ts, orient="index")
-          .rename(columns={"1. open":"open","2. high":"high","3. low":"low","4. close":"close"})
-          .astype(float)
+        .rename(columns={"1. open":"open","2. high":"high","3. low":"low","4. close":"close"})
+        .astype(float)
     )
     df.index = pd.to_datetime(df.index, utc=True)
     df = df.sort_index()
     df["volume"] = 0.0
 
-    # Resample if 4h requested
     if timeframe == "4h":
         df = (
             df.resample("4H")
@@ -146,7 +170,9 @@ def fetch_ohlcv_fx(pair: str, timeframe: str) -> pd.DataFrame:
 
     return df.tail(1000)
 
-
+# ---------------------------
+# Signal engine
+# ---------------------------
 def compute_signals(df: pd.DataFrame) -> Dict:
     df = df.copy()
 
@@ -154,15 +180,7 @@ def compute_signals(df: pd.DataFrame) -> Dict:
     df["ema20"]  = ta.ema(df["close"], length=20)
     df["ema50"]  = ta.ema(df["close"], length=50)
     df["ema200"] = ta.ema(df["close"], length=200)
-
-    macd = ta.macd(df["close"], fast=12, slow=26, signal=9)
-    if isinstance(macd, pd.DataFrame) and not macd.empty:
-        # Histogram can be 'MACDh_12_26_9' or 'MACD_Hist…' depending on version
-        hist_col = _first_col_startswith(macd, "MACDh_") or _first_col_startswith(macd, "MACD_Hist")
-        df["macd_hist"] = macd[hist_col] if hist_col else pd.Series(index=df.index, dtype=float)
-    else:
-        df["macd_hist"] = pd.Series(index=df.index, dtype=float)
-
+    df["macd_hist"] = _macd_hist(df["close"], fast=12, slow=26, signal=9)
     df["rsi"]    = ta.rsi(df["close"], length=14)
     df["bb_mid"] = _bollinger_mid(df["close"], length=20, std=2)
     df["atr"]    = ta.atr(df["high"], df["low"], df["close"], length=14)
@@ -171,7 +189,6 @@ def compute_signals(df: pd.DataFrame) -> Dict:
     ready_cols = ["ema20","ema50","ema200","macd_hist","rsi","bb_mid","atr","close"]
     df_ready = df.dropna(subset=ready_cols)
     if df_ready.empty:
-        # Not enough ready candles yet (e.g., newly listed symbol / short history)
         raise HTTPException(503, "Indicators not ready; need more history")
 
     latest = df_ready.iloc[-1]
@@ -258,7 +275,9 @@ def compute_signals(df: pd.DataFrame) -> Dict:
         },
     }
 
-
+# ---------------------------
+# Risk / sizing
+# ---------------------------
 def position_size(entry: float, stop: float, equity: float, risk_pct: float) -> float:
     risk_amt = equity * (risk_pct/100.0)
     risk_per_unit = abs(entry - stop)
@@ -266,22 +285,30 @@ def position_size(entry: float, stop: float, equity: float, risk_pct: float) -> 
         return 0.0
     return round(risk_amt / risk_per_unit, 6)
 
-
+# ---------------------------
+# API routes
+# ---------------------------
 @app.get("/analyze")
-def analyze(symbol: str, asset_type: str, tf: str = DEFAULT_TF, equity: float = 10000.0, risk_pct: float = 0.8, Authorization: Optional[str] = Header(None)):
+def analyze(
+    symbol: str,
+    asset_type: str,
+    tf: str = DEFAULT_TF,
+    equity: float = 10000.0,
+    risk_pct: float = 0.8,
+    Authorization: Optional[str] = Header(None)
+):
     require_auth(Authorization)
+
     if asset_type == "crypto":
         df = fetch_ohlcv_crypto(symbol, tf)
     elif asset_type == "fx":
-        df = fetch_ohlcv_fx(symbol.replace(" ","/"), tf)
+        df = fetch_ohlcv_fx(symbol.replace(" ", "/"), tf)
     else:
         raise HTTPException(400, "asset_type must be crypto or fx")
 
-    # Need enough history for EMA200; resampled FX can be tighter in practice.
-    # before computing signals in /analyze
+    # Need enough history for EMA200 etc.
     if len(df.dropna()) < 150:
         raise HTTPException(503, "Not enough data for indicators")
-
 
     sig = compute_signals(df)
     size_units = position_size(sig["entry"], sig["stop"], equity, risk_pct)
@@ -302,7 +329,14 @@ def batch(req: AnalyzeBatchRequest, Authorization: Optional[str] = Header(None))
     results = []
     for item in req.items:
         try:
-            r = analyze(item.symbol, item.asset_type, item.timeframe, item.equity, item.risk_pct, Authorization=f"Bearer {SECRET}")
+            r = analyze(
+                item.symbol,
+                item.asset_type,
+                item.timeframe,
+                item.equity,
+                item.risk_pct,
+                Authorization=f"Bearer {SECRET}"
+            )
             results.append(r)
         except Exception as e:
             results.append({"symbol": item.symbol, "error": str(e)})
