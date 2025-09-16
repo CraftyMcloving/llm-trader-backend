@@ -1,9 +1,7 @@
- fastapi==0.111.0
- uvicorn[standard]==0.30.3
- pydantic==2.8.2
- pandas>=2.3.2,<2.5
- numpy>=2.2.6,<3
- pandas-ta==0.4.71b0
- ccxt==4.3.98
- requests==2.32.3
- python-dateutil==2.9.0.post0
+fastapi==0.111.0
+uvicorn==0.30.3
+pydantic==2.8.2
+pandas==2.2.3
+numpy==2.2.6
+requests==2.32.3
+ccxt==4.3.98

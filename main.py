@@ -3,7 +3,7 @@ from pydantic import BaseModel
 from typing import List, Optional, Dict, Tuple
 import os, time, threading
 import pandas as pd
-import pandas_ta as ta
+import numpy as np
 import ccxt
 import requests
 
@@ -13,17 +13,17 @@ SECRET = os.getenv("AI_TRADE_SECRET", "XxUjb7DilVuqcnmeLXmUCURndUzC4Vmf")
 DEFAULT_TF = "4h"
 
 ALPHA_VANTAGE_KEY = os.getenv("ALPHA_VANTAGE_KEY")  # required for FX
-FX_INTRADAY_INTERVAL = "60min"                      # we resample to 4H
-FX_INTRADAY_OUTPUTSIZE = os.getenv("FX_INTRADAY_OUTPUTSIZE", "full")  # need 'full' for enough 4h history
-HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT_SECONDS", "15"))
-
-# Cache controls
-CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "120"))  # 2 minutes default
+HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT_SECONDS", "12"))   # keep small
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "150"))  # ~2.5 minutes
 BATCH_LIMIT_SUCCESS = int(os.getenv("BATCH_LIMIT_SUCCESS", "6"))
+CRYPTO_LIMIT = int(os.getenv("CRYPTO_CANDLES_LIMIT", "300"))  # enough for EMA200 on 4h
+
+# Force single worker (set this in Render start cmd env, too)
+# uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
 
 # ------------------------------ FastAPI -------------------------------
 
-app = FastAPI(title="AI Trade Advisor Backend")
+app = FastAPI(title="AI Trade Advisor Backend (lean)")
 
 class AnalyzeRequest(BaseModel):
     symbol: str
@@ -35,7 +35,15 @@ class AnalyzeRequest(BaseModel):
 class AnalyzeBatchRequest(BaseModel):
     items: List[AnalyzeRequest]
 
-# ---------------------------- Small TTL cache -------------------------
+# ----------------------------- Utilities ------------------------------
+
+def _downcast_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Downcast to float32 to save memory."""
+    for c in ("open","high","low","close","volume"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce", downcast="float")
+            df[c] = df[c].astype("float32")
+    return df
 
 class TTLCache:
     def __init__(self, ttl_seconds: int):
@@ -46,12 +54,13 @@ class TTLCache:
     def get(self, key: Tuple[str, str, str]) -> Optional[pd.DataFrame]:
         now = time.time()
         with self._lock:
-            if key in self._d:
-                ts, df = self._d[key]
-                if now - ts <= self.ttl:
-                    return df.copy()
-                else:
-                    del self._d[key]
+            it = self._d.get(key)
+            if not it:
+                return None
+            ts, df = it
+            if now - ts <= self.ttl:
+                return df.copy()
+            self._d.pop(key, None)
         return None
 
     def set(self, key: Tuple[str, str, str], df: pd.DataFrame):
@@ -59,6 +68,14 @@ class TTLCache:
             self._d[key] = (time.time(), df.copy())
 
 CACHE = TTLCache(CACHE_TTL_SECONDS)
+
+# Reuse a single CCXT client to avoid overhead/memory churn
+_EXCHANGE = None
+def get_exchange():
+    global _EXCHANGE
+    if _EXCHANGE is None:
+        _EXCHANGE = ccxt.binance({"enableRateLimit": True, "timeout": HTTP_TIMEOUT * 1000})
+    return _EXCHANGE
 
 # ------------------------- Auth / Health / List -----------------------
 
@@ -92,25 +109,6 @@ def instruments():
         ]
     }
 
-# -------------------------- Helpers: indicators -----------------------
-
-def _first_col_startswith(df: pd.DataFrame, prefix: str) -> Optional[str]:
-    if isinstance(df, pd.DataFrame):
-        for c in df.columns:
-            if str(c).startswith(prefix):
-                return c
-    return None
-
-def _bollinger_mid(close: pd.Series, length: int = 20, std: int = 2) -> pd.Series:
-    """Return BB midline robustly; fall back to SMA(length) if not present yet."""
-    bb = ta.bbands(close, length=length, std=std)
-    if isinstance(bb, pd.DataFrame) and not bb.empty:
-        # names like 'BBM_20_2.0' or 'BBM_20_2' etc.
-        mid = _first_col_startswith(bb, "BBM_") or _first_col_startswith(bb, "BBM")
-        if mid and mid in bb:
-            return bb[mid]
-    return ta.sma(close, length=length)
-
 # ----------------------------- Data fetchers --------------------------
 
 def fetch_ohlcv_crypto(symbol: str, timeframe: str) -> pd.DataFrame:
@@ -119,21 +117,17 @@ def fetch_ohlcv_crypto(symbol: str, timeframe: str) -> pd.DataFrame:
     if cached is not None:
         return cached
 
-    ex = ccxt.binance({
-        "enableRateLimit": True,
-        "timeout": HTTP_TIMEOUT * 1000
-    })
-    # limit=300 is plenty for our indicators and smaller payloads
-    ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=300)
+    ex = get_exchange()
+    ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=CRYPTO_LIMIT)
     df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"]).set_index("ts")
     df.index = pd.to_datetime(df.index, unit="ms", utc=True)
+    df = _downcast_df(df)
     CACHE.set(key, df)
     return df
 
 def fetch_ohlcv_fx(pair: str, timeframe: str) -> pd.DataFrame:
     if not ALPHA_VANTAGE_KEY:
         raise HTTPException(500, "ALPHA_VANTAGE_KEY not set")
-
     key = ("fx", pair, timeframe)
     cached = CACHE.get(key)
     if cached is not None:
@@ -142,17 +136,15 @@ def fetch_ohlcv_fx(pair: str, timeframe: str) -> pd.DataFrame:
     base, quote = pair.split("/")
     try:
         if timeframe in ("1h", "4h"):
-            # Need enough history → outputsize=full (Alpha Vantage free has 5/min rate limit)
+            # 60-min then resample → 4H
             url = (
                 "https://www.alphavantage.co/query"
                 f"?function=FX_INTRADAY&from_symbol={base}&to_symbol={quote}"
-                f"&interval={FX_INTRADAY_INTERVAL}&outputsize={FX_INTRADAY_OUTPUTSIZE}"
-                f"&apikey={ALPHA_VANTAGE_KEY}"
+                f"&interval=60min&outputsize=full&apikey={ALPHA_VANTAGE_KEY}"
             )
             data = requests.get(url, timeout=HTTP_TIMEOUT).json()
-            key_ts = f"Time Series FX ({FX_INTRADAY_INTERVAL})"
+            key_ts = "Time Series FX (60min)"
         else:
-            # Daily can be compact (smaller)
             url = (
                 "https://www.alphavantage.co/query"
                 f"?function=FX_DAILY&from_symbol={base}&to_symbol={quote}"
@@ -163,18 +155,18 @@ def fetch_ohlcv_fx(pair: str, timeframe: str) -> pd.DataFrame:
 
         ts = data.get(key_ts, {})
         if not ts:
-            # Alpha Vantage error payloads have "Note" or "Error Message"
             detail = data.get("Note") or data.get("Error Message") or "FX data unavailable"
             raise HTTPException(502, f"{detail}")
 
         df = (
             pd.DataFrame.from_dict(ts, orient="index")
             .rename(columns={"1. open":"open","2. high":"high","3. low":"low","4. close":"close"})
-            .astype(float)
         )
         df.index = pd.to_datetime(df.index, utc=True)
-        df = df.sort_index()
+        for c in ["open","high","low","close"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
         df["volume"] = 0.0
+        df = df.sort_index()
 
         if timeframe == "4h":
             df = (
@@ -183,11 +175,10 @@ def fetch_ohlcv_fx(pair: str, timeframe: str) -> pd.DataFrame:
                   .dropna()
             )
 
-        # Keep last 1000 rows max
         df = df.tail(1000)
+        df = _downcast_df(df)
         CACHE.set(key, df)
         return df
-
     except requests.Timeout:
         raise HTTPException(504, f"FX provider timeout for {pair}")
     except HTTPException:
@@ -195,28 +186,58 @@ def fetch_ohlcv_fx(pair: str, timeframe: str) -> pd.DataFrame:
     except Exception as e:
         raise HTTPException(502, f"FX fetch error for {pair}: {e}")
 
+# ---------------------------- Indicators (lean) -----------------------
+
+def ema(series: pd.Series, length: int) -> pd.Series:
+    return series.ewm(span=length, adjust=False, min_periods=length).mean()
+
+def sma(series: pd.Series, length: int) -> pd.Series:
+    return series.rolling(length, min_periods=length).mean()
+
+def rsi(series: pd.Series, length: int = 14) -> pd.Series:
+    delta = series.diff()
+    up = np.where(delta > 0, delta, 0.0)
+    down = np.where(delta < 0, -delta, 0.0)
+    roll_up = pd.Series(up, index=series.index).ewm(alpha=1/length, adjust=False).mean()
+    roll_down = pd.Series(down, index=series.index).ewm(alpha=1/length, adjust=False).mean()
+    rs = roll_up / (roll_down.replace(0, np.nan))
+    out = 100 - (100 / (1 + rs))
+    return out.astype("float32")
+
+def macd(series: pd.Series, fast=12, slow=26, signal=9):
+    ema_fast = ema(series, fast)
+    ema_slow = ema(series, slow)
+    macd_line = ema_fast - ema_slow
+    signal_line = ema(macd_line, signal)
+    hist = macd_line - signal_line
+    return macd_line.astype("float32"), signal_line.astype("float32"), hist.astype("float32")
+
+def atr(high: pd.Series, low: pd.Series, close: pd.Series, length: int = 14) -> pd.Series:
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        (high - low).abs(),
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
+    return tr.rolling(length, min_periods=length).mean().astype("float32")
+
+def bb_mid(series: pd.Series, length: int = 20) -> pd.Series:
+    return sma(series, length).astype("float32")
+
 # --------------------------- Signal engine ----------------------------
 
 def compute_signals(df: pd.DataFrame) -> Dict:
     df = df.copy()
 
-    # Core indicators
-    df["ema20"]  = ta.ema(df["close"], length=20)
-    df["ema50"]  = ta.ema(df["close"], length=50)
-    df["ema200"] = ta.ema(df["close"], length=200)
+    df["ema20"]  = ema(df["close"], 20)
+    df["ema50"]  = ema(df["close"], 50)
+    df["ema200"] = ema(df["close"], 200)
+    _, _, macd_hist = macd(df["close"], 12, 26, 9)
+    df["macd_hist"] = macd_hist
+    df["rsi"]    = rsi(df["close"], 14)
+    df["bb_mid"] = bb_mid(df["close"], 20)
+    df["atr"]    = atr(df["high"], df["low"], df["close"], 14)
 
-    macd = ta.macd(df["close"], fast=12, slow=26, signal=9)
-    if isinstance(macd, pd.DataFrame) and not macd.empty:
-        hist_col = _first_col_startswith(macd, "MACDh_") or _first_col_startswith(macd, "MACD_Hist")
-        df["macd_hist"] = macd[hist_col] if hist_col else pd.Series(index=df.index, dtype=float)
-    else:
-        df["macd_hist"] = pd.Series(index=df.index, dtype=float)
-
-    df["rsi"]    = ta.rsi(df["close"], length=14)
-    df["bb_mid"] = _bollinger_mid(df["close"], length=20, std=2)
-    df["atr"]    = ta.atr(df["high"], df["low"], df["close"], length=14)
-
-    # Require all inputs present
     ready_cols = ["ema20","ema50","ema200","macd_hist","rsi","bb_mid","atr","close"]
     df_ready = df.dropna(subset=ready_cols)
     if df_ready.shape[0] < 5:
@@ -225,16 +246,16 @@ def compute_signals(df: pd.DataFrame) -> Dict:
     latest = df_ready.iloc[-1]
 
     # Trend filter
-    trend_long  = latest.close > latest.ema200 and latest.ema50 > latest.ema200
-    trend_short = latest.close < latest.ema200 and latest.ema50 < latest.ema200
+    trend_long  = bool(latest.close > latest.ema200 and latest.ema50 > latest.ema200)
+    trend_short = bool(latest.close < latest.ema200 and latest.ema50 < latest.ema200)
 
     # Momentum
-    mom_long  = (latest.rsi > 55) and (latest.macd_hist > 0) and (latest.close > latest.bb_mid)
-    mom_short = (latest.rsi < 45) and (latest.macd_hist < 0) and (latest.close < latest.bb_mid)
+    mom_long  = bool(latest.rsi > 55 and latest.macd_hist > 0 and latest.close > latest.bb_mid)
+    mom_short = bool(latest.rsi < 45 and latest.macd_hist < 0 and latest.close < latest.bb_mid)
 
     # Pullback context
-    pullback_long  = latest.close > latest.ema20 > latest.ema50 if trend_long else False
-    pullback_short = latest.close < latest.ema20 < latest.ema50 if trend_short else False
+    pullback_long  = bool(latest.close > latest.ema20 > latest.ema50) if trend_long else False
+    pullback_short = bool(latest.close < latest.ema20 < latest.ema50) if trend_short else False
 
     # Direction
     direction = "flat"
@@ -244,14 +265,14 @@ def compute_signals(df: pd.DataFrame) -> Dict:
         direction = "short"
 
     # Levels
-    atr   = float(latest.atr)
+    atr_v = float(latest.atr)
     entry = float(latest.close)
     if direction == "long":
-        stop = entry - max(1.5*atr, entry*0.004)
+        stop = entry - max(1.5*atr_v, entry*0.004)
         tp1  = entry + (entry - stop)
         tp2  = entry + 2*(entry - stop)
     elif direction == "short":
-        stop = entry + max(1.5*atr, entry*0.004)
+        stop = entry + max(1.5*atr_v, entry*0.004)
         tp1  = entry - (stop - entry)
         tp2  = entry - 2*(stop - entry)
     else:
@@ -269,11 +290,10 @@ def compute_signals(df: pd.DataFrame) -> Dict:
         if rr >= 2.0:
             conf += 15
 
-    atr_pct = (atr / entry * 100) if entry else 0
+    atr_pct = (atr_v / entry * 100) if entry else 0
     if 0.5 <= atr_pct <= 5:
         conf += 10
 
-    # Rationale
     rationale = []
     if direction == "long":
         rationale += [
@@ -302,7 +322,7 @@ def compute_signals(df: pd.DataFrame) -> Dict:
             "ema200": round(float(latest.ema200), 5),
             "rsi": round(float(latest.rsi), 2),
             "macd_hist": round(float(latest.macd_hist), 4),
-            "atr": round(float(atr), 5),
+            "atr": round(float(atr_v), 5),
         },
     }
 
@@ -333,7 +353,6 @@ def analyze(
     else:
         raise HTTPException(400, "asset_type must be crypto or fx")
 
-    # Basic sanity: need enough for EMA200; compute_signals will also check readiness
     if df.shape[0] < 220:
         raise HTTPException(503, "Not enough data for indicators")
 
@@ -376,9 +395,7 @@ def batch(
             results.append(r)
             success_count += 1
         except HTTPException as e:
-            # return structured error but keep going
             results.append({"symbol": item.symbol, "error": e.detail})
         except Exception as e:
             results.append({"symbol": item.symbol, "error": str(e)})
-
     return {"results": results}
