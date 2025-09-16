@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Header, Query
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Tuple
-import os, time, threading
+import os, time, threading, collections, datetime as dt
 import pandas as pd
 import numpy as np
 import ccxt
@@ -13,13 +13,15 @@ SECRET = os.getenv("AI_TRADE_SECRET", "XxUjb7DilVuqcnmeLXmUCURndUzC4Vmf")
 DEFAULT_TF = "4h"
 
 ALPHA_VANTAGE_KEY = os.getenv("ALPHA_VANTAGE_KEY")  # required for FX
-HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT_SECONDS", "12"))   # keep small
-CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "150"))  # ~2.5 minutes
+HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT_SECONDS", "12"))     # keep small
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "150"))  # ~2.5 min
 BATCH_LIMIT_SUCCESS = int(os.getenv("BATCH_LIMIT_SUCCESS", "6"))
-CRYPTO_LIMIT = int(os.getenv("CRYPTO_CANDLES_LIMIT", "300"))  # enough for EMA200 on 4h
+CRYPTO_LIMIT = int(os.getenv("CRYPTO_CANDLES_LIMIT", "300"))    # enough for EMA200 4h
+FX_RATE_PER_MIN = int(os.getenv("FX_RATE_PER_MIN", "5"))        # AV free ~5/min
+FX_WINDOW_SEC = int(os.getenv("FX_WINDOW_SEC", "60"))
 
-# Force single worker (set this in Render start cmd env, too)
-# uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
+# Tip: run single worker on Render
+# Start: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
 
 # ------------------------------ FastAPI -------------------------------
 
@@ -41,8 +43,7 @@ def _downcast_df(df: pd.DataFrame) -> pd.DataFrame:
     """Downcast to float32 to save memory."""
     for c in ("open","high","low","close","volume"):
         if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce", downcast="float")
-            df[c] = df[c].astype("float32")
+            df[c] = pd.to_numeric(df[c], errors="coerce", downcast="float").astype("float32")
     return df
 
 class TTLCache:
@@ -50,19 +51,16 @@ class TTLCache:
         self.ttl = ttl_seconds
         self._d: Dict[Tuple[str, str, str], Tuple[float, pd.DataFrame]] = {}
         self._lock = threading.Lock()
-
     def get(self, key: Tuple[str, str, str]) -> Optional[pd.DataFrame]:
         now = time.time()
         with self._lock:
             it = self._d.get(key)
-            if not it:
-                return None
+            if not it: return None
             ts, df = it
             if now - ts <= self.ttl:
                 return df.copy()
             self._d.pop(key, None)
         return None
-
     def set(self, key: Tuple[str, str, str], df: pd.DataFrame):
         with self._lock:
             self._d[key] = (time.time(), df.copy())
@@ -76,6 +74,22 @@ def get_exchange():
     if _EXCHANGE is None:
         _EXCHANGE = ccxt.binance({"enableRateLimit": True, "timeout": HTTP_TIMEOUT * 1000})
     return _EXCHANGE
+
+# Simple FX token bucket to avoid AV 5/min throttle
+_fx_hits = collections.deque()  # timestamps (epoch seconds)
+_fx_lock = threading.Lock()
+def _fx_allow() -> bool:
+    now = time.time()
+    with _fx_lock:
+        while _fx_hits and (now - _fx_hits[0] > FX_WINDOW_SEC):
+            _fx_hits.popleft()
+        if len(_fx_hits) >= FX_RATE_PER_MIN:
+            return False
+        _fx_hits.append(now)
+        return True
+
+def _utc_now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 # ------------------------- Auth / Health / List -----------------------
 
@@ -116,11 +130,13 @@ def fetch_ohlcv_crypto(symbol: str, timeframe: str) -> pd.DataFrame:
     cached = CACHE.get(key)
     if cached is not None:
         return cached
-
-    ex = get_exchange()
-    ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=CRYPTO_LIMIT)
-    df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"]).set_index("ts")
-    df.index = pd.to_datetime(df.index, unit="ms", utc=True)
+    try:
+        ex = get_exchange()
+        ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=CRYPTO_LIMIT)
+        df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"]).set_index("ts")
+        df.index = pd.to_datetime(df.index, unit="ms", utc=True)
+    except Exception as e:
+        raise HTTPException(502, f"Crypto fetch error for {symbol}: {e}")
     df = _downcast_df(df)
     CACHE.set(key, df)
     return df
@@ -128,6 +144,10 @@ def fetch_ohlcv_crypto(symbol: str, timeframe: str) -> pd.DataFrame:
 def fetch_ohlcv_fx(pair: str, timeframe: str) -> pd.DataFrame:
     if not ALPHA_VANTAGE_KEY:
         raise HTTPException(500, "ALPHA_VANTAGE_KEY not set")
+    if not _fx_allow():
+        # quick fail so frontend can fill with crypto instead of waiting 20s
+        raise HTTPException(429, "FX rate limit reached; try again shortly")
+
     key = ("fx", pair, timeframe)
     cached = CACHE.get(key)
     if cached is not None:
@@ -136,27 +156,34 @@ def fetch_ohlcv_fx(pair: str, timeframe: str) -> pd.DataFrame:
     base, quote = pair.split("/")
     try:
         if timeframe in ("1h", "4h"):
-            # 60-min then resample → 4H
+            # Need many 60min bars to build 4H EMA200; use full (heavy but cached)
             url = (
                 "https://www.alphavantage.co/query"
                 f"?function=FX_INTRADAY&from_symbol={base}&to_symbol={quote}"
                 f"&interval=60min&outputsize=full&apikey={ALPHA_VANTAGE_KEY}"
             )
-            data = requests.get(url, timeout=HTTP_TIMEOUT).json()
+            resp = requests.get(url, timeout=HTTP_TIMEOUT)
+            data = resp.json()
             key_ts = "Time Series FX (60min)"
         else:
             url = (
                 "https://www.alphavantage.co/query"
                 f"?function=FX_DAILY&from_symbol={base}&to_symbol={quote}"
-                f"&outputsize=compact&apikey={ALPHA_VANTAGE_KEY}"
+                f"&outputsize=full&apikey={ALPHA_VANTAGE_KEY}"
             )
-            data = requests.get(url, timeout=HTTP_TIMEOUT).json()
+            resp = requests.get(url, timeout=HTTP_TIMEOUT)
+            data = resp.json()
             key_ts = "Time Series FX (Daily)"
+
+        # Provider throttle / errors come back in these fields
+        note = data.get("Note")
+        err  = data.get("Error Message")
+        if note or err:
+            raise HTTPException(429 if note else 502, note or err)
 
         ts = data.get(key_ts, {})
         if not ts:
-            detail = data.get("Note") or data.get("Error Message") or "FX data unavailable"
-            raise HTTPException(502, f"{detail}")
+            raise HTTPException(502, f"FX data unavailable for {pair}")
 
         df = (
             pd.DataFrame.from_dict(ts, orient="index")
@@ -179,6 +206,7 @@ def fetch_ohlcv_fx(pair: str, timeframe: str) -> pd.DataFrame:
         df = _downcast_df(df)
         CACHE.set(key, df)
         return df
+
     except requests.Timeout:
         raise HTTPException(504, f"FX provider timeout for {pair}")
     except HTTPException:
@@ -221,41 +249,55 @@ def atr(high: pd.Series, low: pd.Series, close: pd.Series, length: int = 14) -> 
     ], axis=1).max(axis=1)
     return tr.rolling(length, min_periods=length).mean().astype("float32")
 
-def bb_mid(series: pd.Series, length: int = 20) -> pd.Series:
-    return sma(series, length).astype("float32")
-
 # --------------------------- Signal engine ----------------------------
+# Memory-lean: compute series → take LAST VALID values only (no wide temp df).
 
 def compute_signals(df: pd.DataFrame) -> Dict:
-    df = df.copy()
+    if not {"open","high","low","close"}.issubset(df.columns):
+        raise HTTPException(500, "OHLCV data incomplete")
 
-    df["ema20"]  = ema(df["close"], 20)
-    df["ema50"]  = ema(df["close"], 50)
-    df["ema200"] = ema(df["close"], 200)
-    _, _, macd_hist = macd(df["close"], 12, 26, 9)
-    df["macd_hist"] = macd_hist
-    df["rsi"]    = rsi(df["close"], 14)
-    df["bb_mid"] = bb_mid(df["close"], 20)
-    df["atr"]    = atr(df["high"], df["low"], df["close"], 14)
+    close = df["close"]
+    high  = df["high"]
+    low   = df["low"]
 
-    ready_cols = ["ema20","ema50","ema200","macd_hist","rsi","bb_mid","atr","close"]
-    df_ready = df.dropna(subset=ready_cols)
-    if df_ready.shape[0] < 5:
+    ema20  = ema(close, 20)
+    ema50  = ema(close, 50)
+    ema200 = ema(close, 200)
+    _, _, macd_hist = macd(close, 12, 26, 9)
+    rsi14  = rsi(close, 14)
+    bbmid  = sma(close, 20)
+    atr14  = atr(high, low, close, 14)
+
+    # Find rows where all are ready
+    ready_mask = (~ema20.isna() & ~ema50.isna() & ~ema200.isna() &
+                  ~macd_hist.isna() & ~rsi14.isna() & ~bbmid.isna() &
+                  ~atr14.isna() & ~close.isna())
+    if not ready_mask.any():
         raise HTTPException(503, "Indicators not ready; need more history")
+    idx_last = ready_mask[ready_mask].index[-1]
 
-    latest = df_ready.iloc[-1]
+    latest = {
+        "close": float(close.loc[idx_last]),
+        "ema20": float(ema20.loc[idx_last]),
+        "ema50": float(ema50.loc[idx_last]),
+        "ema200": float(ema200.loc[idx_last]),
+        "macd_hist": float(macd_hist.loc[idx_last]),
+        "rsi": float(rsi14.loc[idx_last]),
+        "bb_mid": float(bbmid.loc[idx_last]),
+        "atr": float(atr14.loc[idx_last]),
+    }
 
     # Trend filter
-    trend_long  = bool(latest.close > latest.ema200 and latest.ema50 > latest.ema200)
-    trend_short = bool(latest.close < latest.ema200 and latest.ema50 < latest.ema200)
+    trend_long  = latest["close"] > latest["ema200"] and latest["ema50"] > latest["ema200"]
+    trend_short = latest["close"] < latest["ema200"] and latest["ema50"] < latest["ema200"]
 
     # Momentum
-    mom_long  = bool(latest.rsi > 55 and latest.macd_hist > 0 and latest.close > latest.bb_mid)
-    mom_short = bool(latest.rsi < 45 and latest.macd_hist < 0 and latest.close < latest.bb_mid)
+    mom_long  = latest["rsi"] > 55 and latest["macd_hist"] > 0 and latest["close"] > latest["bb_mid"]
+    mom_short = latest["rsi"] < 45 and latest["macd_hist"] < 0 and latest["close"] < latest["bb_mid"]
 
     # Pullback context
-    pullback_long  = bool(latest.close > latest.ema20 > latest.ema50) if trend_long else False
-    pullback_short = bool(latest.close < latest.ema20 < latest.ema50) if trend_short else False
+    pullback_long  = (latest["close"] > latest["ema20"] > latest["ema50"]) if trend_long else False
+    pullback_short = (latest["close"] < latest["ema20"] < latest["ema50"]) if trend_short else False
 
     # Direction
     direction = "flat"
@@ -265,8 +307,8 @@ def compute_signals(df: pd.DataFrame) -> Dict:
         direction = "short"
 
     # Levels
-    atr_v = float(latest.atr)
-    entry = float(latest.close)
+    atr_v = latest["atr"]
+    entry = latest["close"]
     if direction == "long":
         stop = entry - max(1.5*atr_v, entry*0.004)
         tp1  = entry + (entry - stop)
@@ -319,10 +361,10 @@ def compute_signals(df: pd.DataFrame) -> Dict:
         "confidence": conf,
         "rationale": rationale,
         "indicators": {
-            "ema200": round(float(latest.ema200), 5),
-            "rsi": round(float(latest.rsi), 2),
-            "macd_hist": round(float(latest.macd_hist), 4),
-            "atr": round(float(atr_v), 5),
+            "ema200": round(latest["ema200"], 5),
+            "rsi": round(latest["rsi"], 2),
+            "macd_hist": round(latest["macd_hist"], 4),
+            "atr": round(atr_v, 5),
         },
     }
 
@@ -353,6 +395,7 @@ def analyze(
     else:
         raise HTTPException(400, "asset_type must be crypto or fx")
 
+    # Need enough history for EMA200 etc.
     if df.shape[0] < 220:
         raise HTTPException(503, "Not enough data for indicators")
 
@@ -362,7 +405,7 @@ def analyze(
         "symbol": symbol,
         "asset_type": asset_type,
         "timeframe": tf,
-        "updated_at": pd.Timestamp.utcnow().isoformat(),
+        "updated_at": _utc_now_iso(),
         **sig,
         "suggested_risk_pct": risk_pct,
         "position_size_units": size_units,
@@ -376,7 +419,7 @@ def batch(
     Authorization: Optional[str] = Header(None)
 ):
     require_auth(Authorization)
-    max_success = limit_success or BATCH_LIMIT_SUCCESS
+    max_success = int(limit_success or BATCH_LIMIT_SUCCESS)
 
     results = []
     success_count = 0
@@ -395,6 +438,7 @@ def batch(
             results.append(r)
             success_count += 1
         except HTTPException as e:
+            # Pass along a compact error (frontend knows to skip)
             results.append({"symbol": item.symbol, "error": e.detail})
         except Exception as e:
             results.append({"symbol": item.symbol, "error": str(e)})
