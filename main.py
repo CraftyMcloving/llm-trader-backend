@@ -1,18 +1,25 @@
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
-import time, os
+import time, os, math
 import pandas as pd
 import pandas_ta as ta
 import ccxt
 import requests
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple
 
 # ---------------------------
 # Config / constants
 # ---------------------------
-SECRET = os.getenv("AI_TRADE_SECRET", "XxUjb7DilVuqcnmeLXmUCURndUzC4Vmf")
+SECRET = os.getenv("AI_TRADE_SECRET", "")
 DEFAULT_TF = "4h"
-ALPHA_VANTAGE_KEY = os.getenv("ALPHA_VANTAGE_KEY")  # ✅ correct env var name
+
+# FX providers
+ALPHA_VANTAGE_KEY = os.getenv("ALPHA_VANTAGE_KEY")  # primary
+TWELVE_DATA_KEY   = os.getenv("TWELVE_DATA_KEY")    # optional fallback
+
+# Caching (in-memory)
+FX_CACHE_TTL_SEC = int(os.getenv("FX_CACHE_TTL_SEC", "300"))  # 5 minutes
+CRYPTO_CACHE_TTL_SEC = int(os.getenv("CRYPTO_CACHE_TTL_SEC", "60"))  # 1 minute
 
 app = FastAPI(title="AI Trade Advisor Backend")
 
@@ -40,7 +47,7 @@ def require_auth(auth: Optional[str]):
         raise HTTPException(status_code=403, detail="Invalid token")
 
 # ---------------------------
-# Utility helpers (version-proof indicators)
+# Utilities
 # ---------------------------
 def _first_col_startswith(df: pd.DataFrame, prefix: str) -> Optional[str]:
     if isinstance(df, pd.DataFrame):
@@ -50,13 +57,8 @@ def _first_col_startswith(df: pd.DataFrame, prefix: str) -> Optional[str]:
     return None
 
 def _bollinger_mid(close: pd.Series, length: int = 20, std: int = 2) -> pd.Series:
-    """
-    Robust BB midline across pandas-ta versions.
-    Falls back to (upper+lower)/2 or SMA(length) if needed.
-    """
     bb = ta.bbands(close, length=length, std=std)
     if isinstance(bb, pd.DataFrame) and not bb.empty:
-        # Common names: 'BBM_20_2.0', 'BBM_20_2', 'BBM'
         mid = _first_col_startswith(bb, "BBM_") or ("BBM" if "BBM" in bb.columns else None)
         if mid and mid in bb:
             return bb[mid]
@@ -64,16 +66,11 @@ def _bollinger_mid(close: pd.Series, length: int = 20, std: int = 2) -> pd.Serie
         lo = _first_col_startswith(bb, "BBL_") or ("BBL" if "BBL" in bb.columns else None)
         if (up in bb) and (lo in bb):
             return (bb[up] + bb[lo]) / 2.0
-    # Last resort: SMA
     return ta.sma(close, length=length)
 
 def _macd_hist(close: pd.Series, fast=12, slow=26, signal=9) -> pd.Series:
-    """
-    Get MACD histogram robustly across pandas-ta versions.
-    """
     macd = ta.macd(close, fast=fast, slow=slow, signal=signal)
     if isinstance(macd, pd.DataFrame) and not macd.empty:
-        # Common names: 'MACDh_12_26_9', 'MACD_Hist', etc.
         hist_col = _first_col_startswith(macd, "MACDh_") or _first_col_startswith(macd, "MACD_Hist")
         if hist_col and hist_col in macd:
             return macd[hist_col]
@@ -81,11 +78,43 @@ def _macd_hist(close: pd.Series, fast=12, slow=26, signal=9) -> pd.Series:
         sig_line  = _first_col_startswith(macd, "MACDs_") or _first_col_startswith(macd, "MACD_Signal")
         if (macd_line in macd) and (sig_line in macd):
             return macd[macd_line] - macd[sig_line]
-    # No MACD available yet -> empty Series with index
     return pd.Series(index=close.index, dtype=float)
 
+def _resample(df: pd.DataFrame, tf: str) -> pd.DataFrame:
+    if tf.lower() in ("4h", "4hr", "240m"):
+        rule = "4H"
+    elif tf.lower() in ("1h", "1hr", "60m"):
+        rule = "1H"
+    elif tf.lower() in ("1d", "d", "day"):
+        rule = "1D"
+    else:
+        return df  # return raw if unknown; callers supply correct interval upstream
+    return (
+        df.resample(rule)
+          .agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"})
+          .dropna()
+    )
+
+def _now() -> float:
+    return time.time()
+
+def _http_get_json(url: str, timeout: int = 30, retries: int = 2, backoff_sec: float = 0.8) -> dict:
+    last_err = None
+    for i in range(retries + 1):
+        try:
+            r = requests.get(url, timeout=timeout, headers={"User-Agent":"ai-trade-advisor/1.0"})
+            if r.status_code >= 500:
+                last_err = f"HTTP {r.status_code}"
+            else:
+                return r.json()
+        except Exception as e:
+            last_err = str(e)
+        if i < retries:
+            time.sleep(backoff_sec * (2 ** i))
+    raise RuntimeError(f"GET failed: {last_err or 'unknown error'}")
+
 # ---------------------------
-# Endpoints (health + instruments)
+# Health / instruments
 # ---------------------------
 @app.get("/health")
 def health():
@@ -111,71 +140,184 @@ def instruments():
     }
 
 # ---------------------------
+# Caches
+# ---------------------------
+_CRYPTO_CACHE: Dict[Tuple[str,str], Tuple[float, pd.DataFrame]] = {}
+_FX_CACHE: Dict[Tuple[str,str,str], Tuple[float, pd.DataFrame]] = {}
+# keys: (provider, pair, timeframe)
+
+def _get_cache(cache: dict, key: tuple, ttl: int) -> Optional[pd.DataFrame]:
+    hit = cache.get(key)
+    if not hit: return None
+    ts, df = hit
+    if _now() - ts <= ttl:
+        return df.copy()
+    return None
+
+def _set_cache(cache: dict, key: tuple, df: pd.DataFrame):
+    cache[key] = (_now(), df.copy())
+
+# ---------------------------
 # Data fetchers
 # ---------------------------
 def fetch_ohlcv_crypto(symbol: str, timeframe: str) -> pd.DataFrame:
+    cache_key = (symbol, timeframe)
+    cached = _get_cache(_CRYPTO_CACHE, cache_key, CRYPTO_CACHE_TTL_SEC)
+    if cached is not None:
+        return cached
+
     ex = ccxt.binance({"enableRateLimit": True})
-    ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=400)
+    # Map common tf strings
+    tf_map = {"4h":"4h","1h":"1h","1d":"1d","d":"1d"}
+    tf = tf_map.get(timeframe.lower(), timeframe)
+    ohlcv = ex.fetch_ohlcv(symbol, timeframe=tf, limit=400)
     df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"]).set_index("ts")
     df.index = pd.to_datetime(df.index, unit="ms", utc=True)
+    _set_cache(_CRYPTO_CACHE, cache_key, df)
     return df
 
-def fetch_ohlcv_fx(pair: str, timeframe: str) -> pd.DataFrame:
-    """
-    Alpha Vantage FX (free). For 4h we resample from 60min.
-    """
-    base, quote = pair.split("/")
+def _alpha_vantage_fx(pair: str, timeframe: str) -> pd.DataFrame:
     if not ALPHA_VANTAGE_KEY:
         raise HTTPException(500, "ALPHA_VANTAGE_KEY not set")
-
-    if timeframe in ("1h", "4h"):
-        interval = "60min"
+    base, quote = pair.split("/")
+    if timeframe.lower() in ("1h","4h"):
+        interval = "60min"  # request 60min and resample for 4h
         url = (
             "https://www.alphavantage.co/query"
             f"?function=FX_INTRADAY&from_symbol={base}&to_symbol={quote}"
-            f"&interval={interval}&apikey={ALPHA_VANTAGE_KEY}&outputsize=full"
+            f"&interval={interval}&apikey={ALPHA_VANTAGE_KEY}&outputsize=compact"
         )
-        data = requests.get(url, timeout=30).json()
+        data = _http_get_json(url)
+        if "Note" in data:
+            # Rate limited
+            raise HTTPException(429, data["Note"])
+        if "Error Message" in data:
+            raise HTTPException(502, data["Error Message"])
         key = f"Time Series FX ({interval})"
     else:
         url = (
             "https://www.alphavantage.co/query"
             f"?function=FX_DAILY&from_symbol={base}&to_symbol={quote}"
-            f"&apikey={ALPHA_VANTAGE_KEY}&outputsize=full"
+            f"&apikey={ALPHA_VANTAGE_KEY}&outputsize=compact"
         )
-        data = requests.get(url, timeout=30).json()
+        data = _http_get_json(url)
+        if "Note" in data:
+            raise HTTPException(429, data["Note"])
+        if "Error Message" in data:
+            raise HTTPException(502, data["Error Message"])
         key = "Time Series FX (Daily)"
 
     ts = data.get(key, {})
     if not ts:
-        # Often returns {"Note": "..."} when rate limited
-        detail = data.get("Note") or data.get("Error Message") or f"FX data unavailable for {pair}"
-        raise HTTPException(502, detail)
+        raise HTTPException(502, f"Alpha Vantage returned no '{key}' data for {pair}")
 
     df = (
         pd.DataFrame.from_dict(ts, orient="index")
-        .rename(columns={"1. open":"open","2. high":"high","3. low":"low","4. close":"close"})
-        .astype(float)
+          .rename(columns={"1. open":"open","2. high":"high","3. low":"low","4. close":"close"})
+          .astype(float)
     )
     df.index = pd.to_datetime(df.index, utc=True)
     df = df.sort_index()
     df["volume"] = 0.0
-
-    if timeframe == "4h":
-        df = (
-            df.resample("4H")
-              .agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"})
-              .dropna()
-        )
-
+    if timeframe.lower() == "4h":
+        df = _resample(df, "4h")
     return df.tail(1000)
+
+def _twelve_data_fx(pair: str, timeframe: str) -> pd.DataFrame:
+    if not TWELVE_DATA_KEY:
+        raise HTTPException(502, "Twelve Data fallback not configured")
+    # Twelve Data symbols look like "EUR/USD"
+    interval = "60min" if timeframe.lower() in ("1h","4h") else "1day"
+    # Big outputsize for intraday; TD caps free tier but still ok
+    url = (
+        "https://api.twelvedata.com/time_series"
+        f"?symbol={pair}&interval={interval}&outputsize=5000&apikey={TWELVE_DATA_KEY}&format=JSON"
+    )
+    data = _http_get_json(url)
+    if "status" in data and data["status"] == "error":
+        raise HTTPException(502, f"Twelve Data error: {data.get('message','unknown')}")
+    values = data.get("values")
+    if not values:
+        raise HTTPException(502, "Twelve Data returned no values")
+
+    # values is list of dicts newest-first; normalize to OHLC
+    df = pd.DataFrame(values)
+    # Expected keys: datetime, open, high, low, close, volume (volume may be None for FX)
+    for col in ["open","high","low","close"]:
+        df[col] = df[col].astype(float)
+    df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
+    df = df.set_index("datetime").sort_index()
+    if "volume" not in df.columns:
+        df["volume"] = 0.0
+    else:
+        # Some FX volumes are empty strings
+        with pd.option_context("mode.use_inf_as_na", True):
+            df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0)
+
+    if timeframe.lower() == "4h" and interval == "60min":
+        df = _resample(df, "4h")
+    return df.tail(1000)
+
+def fetch_ohlcv_fx(pair: str, timeframe: str) -> pd.DataFrame:
+    """
+    FX fetcher with cache + fallback:
+    1) Alpha Vantage (if configured)
+    2) Twelve Data (if configured)
+    Serve cached data when provider is rate-limited.
+    """
+    # Cache key includes provider so we can hold both
+    cache_key_av = ("alpha_vantage", pair, timeframe)
+    cache_key_td = ("twelve_data", pair, timeframe)
+
+    # Serve fresh cache first (any provider)
+    cached = _get_cache(_FX_CACHE, cache_key_av, FX_CACHE_TTL_SEC) or _get_cache(_FX_CACHE, cache_key_td, FX_CACHE_TTL_SEC)
+    if cached is not None:
+        return cached
+
+    # Try Alpha Vantage
+    if ALPHA_VANTAGE_KEY:
+        try:
+            df = _alpha_vantage_fx(pair, timeframe)
+            _set_cache(_FX_CACHE, cache_key_av, df)
+            return df
+        except HTTPException as e:
+            # If rate-limited, try fallback (if available) or serve stale-if-present
+            if e.status_code == 429 and TWELVE_DATA_KEY:
+                try:
+                    df = _twelve_data_fx(pair, timeframe)
+                    _set_cache(_FX_CACHE, cache_key_td, df)
+                    return df
+                except HTTPException:
+                    pass
+            # Stale-if-error: serve any stale cache if present
+            stale_av = _FX_CACHE.get(cache_key_av)
+            if stale_av:
+                return stale_av[1].copy()
+            stale_td = _FX_CACHE.get(cache_key_td)
+            if stale_td:
+                return stale_td[1].copy()
+            raise  # no cache to fall back to: bubble up
+
+    # No AV or it failed, try Twelve Data if configured
+    if TWELVE_DATA_KEY:
+        try:
+            df = _twelve_data_fx(pair, timeframe)
+            _set_cache(_FX_CACHE, cache_key_td, df)
+            return df
+        except HTTPException:
+            stale_td = _FX_CACHE.get(cache_key_td)
+            if stale_td:
+                return stale_td[1].copy()
+            raise
+
+    # No provider available
+    raise HTTPException(502, "No FX provider configured or providers unavailable")
 
 # ---------------------------
 # Signal engine
 # ---------------------------
 def compute_signals(df: pd.DataFrame) -> Dict:
     df = df.copy()
-
     # Core indicators
     df["ema20"]  = ta.ema(df["close"], length=20)
     df["ema50"]  = ta.ema(df["close"], length=50)
@@ -185,7 +327,6 @@ def compute_signals(df: pd.DataFrame) -> Dict:
     df["bb_mid"] = _bollinger_mid(df["close"], length=20, std=2)
     df["atr"]    = ta.atr(df["high"], df["low"], df["close"], length=14)
 
-    # Use only rows where everything is ready
     ready_cols = ["ema20","ema50","ema200","macd_hist","rsi","bb_mid","atr","close"]
     df_ready = df.dropna(subset=ready_cols)
     if df_ready.empty:
@@ -338,6 +479,8 @@ def batch(req: AnalyzeBatchRequest, Authorization: Optional[str] = Header(None))
                 Authorization=f"Bearer {SECRET}"
             )
             results.append(r)
+        except HTTPException as e:
+            results.append({"symbol": item.symbol, "status": e.status_code, "error": e.detail})
         except Exception as e:
-            results.append({"symbol": item.symbol, "error": str(e)})
+            results.append({"symbol": item.symbol, "status": 500, "error": str(e)})
     return {"results": results}
