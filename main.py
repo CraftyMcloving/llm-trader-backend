@@ -101,10 +101,12 @@ def fetch_ohlcv_crypto(symbol: str, timeframe: str) -> pd.DataFrame:
 ALPHA_VANTAGE_KEY = os.getenv("4N0D0EY6X6W42UJV")
 
 def fetch_ohlcv_fx(pair: str, timeframe: str) -> pd.DataFrame:
-    # Minimal demo using Alpha Vantage FX_INTRADAY/FX_DAILY
     base, quote = pair.split("/")
-    if timeframe in ("1h","4h"):
-        interval = "60min"  # 60m → resample later for 4h
+    if not ALPHA_VANTAGE_KEY:
+        raise HTTPException(500, "ALPHA_VANTAGE_KEY not set")
+
+    if timeframe in ("1h", "4h"):
+        interval = "60min"
         url = (
             "https://www.alphavantage.co/query"
             f"?function=FX_INTRADAY&from_symbol={base}&to_symbol={quote}"
@@ -112,101 +114,131 @@ def fetch_ohlcv_fx(pair: str, timeframe: str) -> pd.DataFrame:
         )
         data = requests.get(url, timeout=30).json()
         key = f"Time Series FX ({interval})"
-    else:  # treat everything else as Daily for now
-        url = f"https://www.alphavantage.co/query?function=FX_DAILY&from_symbol={base}&to_symbol={quote}&apikey={ALPHA_VANTAGE_KEY}&outputsize=full"
+    else:
+        url = (
+            "https://www.alphavantage.co/query"
+            f"?function=FX_DAILY&from_symbol={base}&to_symbol={quote}"
+            f"&apikey={ALPHA_VANTAGE_KEY}&outputsize=full"
+        )
         data = requests.get(url, timeout=30).json()
         key = "Time Series FX (Daily)"
+
     ts = data.get(key, {})
-    df = pd.DataFrame.from_dict(ts, orient="index").rename(columns={
-        "1. open":"open","2. high":"high","3. low":"low","4. close":"close"
-    }).astype(float)
+    if not ts:
+        raise HTTPException(502, f"FX data unavailable for {pair}")
+
+    df = (
+        pd.DataFrame.from_dict(ts, orient="index")
+          .rename(columns={"1. open":"open","2. high":"high","3. low":"low","4. close":"close"})
+          .astype(float)
+    )
     df.index = pd.to_datetime(df.index, utc=True)
     df = df.sort_index()
     df["volume"] = 0.0
 
-    # Resample 60m FX to 4H bars if requested
+    # Resample if 4h requested
     if timeframe == "4h":
         df = (
             df.resample("4H")
               .agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"})
               .dropna()
         )
+
     return df.tail(1000)
 
 
 def compute_signals(df: pd.DataFrame) -> Dict:
-    out = {}
     df = df.copy()
+
+    # Core indicators
     df["ema20"]  = ta.ema(df["close"], length=20)
     df["ema50"]  = ta.ema(df["close"], length=50)
     df["ema200"] = ta.ema(df["close"], length=200)
-    
+
     macd = ta.macd(df["close"], fast=12, slow=26, signal=9)
     if isinstance(macd, pd.DataFrame) and not macd.empty:
-        # Prefer the histogram column regardless of suffix formatting
-        hist_col = first_col_like(macd, "MACDh_") or first_col_like(macd, "MACD_Hist")
+        # Histogram can be 'MACDh_12_26_9' or 'MACD_Hist…' depending on version
+        hist_col = _first_col_startswith(macd, "MACDh_") or _first_col_startswith(macd, "MACD_Hist")
         df["macd_hist"] = macd[hist_col] if hist_col else pd.Series(index=df.index, dtype=float)
     else:
         df["macd_hist"] = pd.Series(index=df.index, dtype=float)
 
     df["rsi"]    = ta.rsi(df["close"], length=14)
-    df["bb_mid"] = bollinger_mid(df["close"], length=20, std=2)
+    df["bb_mid"] = _bollinger_mid(df["close"], length=20, std=2)
     df["atr"]    = ta.atr(df["high"], df["low"], df["close"], length=14)
-    latest = df.dropna().iloc[-1]
+
+    # Use only rows where everything is ready
+    ready_cols = ["ema20","ema50","ema200","macd_hist","rsi","bb_mid","atr","close"]
+    df_ready = df.dropna(subset=ready_cols)
+    if df_ready.empty:
+        # Not enough ready candles yet (e.g., newly listed symbol / short history)
+        raise HTTPException(503, "Indicators not ready; need more history")
+
+    latest = df_ready.iloc[-1]
 
     # Trend filter
-    trend_long = latest.close > latest.ema200 and latest.ema50 > latest.ema200
+    trend_long  = latest.close > latest.ema200 and latest.ema50 > latest.ema200
     trend_short = latest.close < latest.ema200 and latest.ema50 < latest.ema200
 
     # Momentum
-    mom_long = latest.rsi > 55 and latest.macd_hist > 0 and latest.close > latest.bb_mid
-    mom_short = latest.rsi < 45 and latest.macd_hist < 0 and latest.close < latest.bb_mid
+    mom_long  = (latest.rsi > 55) and (latest.macd_hist > 0) and (latest.close > latest.bb_mid)
+    mom_short = (latest.rsi < 45) and (latest.macd_hist < 0) and (latest.close < latest.bb_mid)
 
-    # Entry suggestion: pullback to ema20/ema50
-    pullback_long = latest.close > latest.ema20 > latest.ema50 if trend_long else False
+    # Pullback context
+    pullback_long  = latest.close > latest.ema20 > latest.ema50 if trend_long else False
     pullback_short = latest.close < latest.ema20 < latest.ema50 if trend_short else False
 
+    # Direction
     direction = "flat"
     if trend_long and mom_long:
         direction = "long"
     elif trend_short and mom_short:
         direction = "short"
 
-    atr = float(latest.atr)
+    # Levels
+    atr   = float(latest.atr)
     entry = float(latest.close)
     if direction == "long":
         stop = entry - max(1.5*atr, entry*0.004)
-        tp1 = entry + (entry - stop)
-        tp2 = entry + 2*(entry - stop)
+        tp1  = entry + (entry - stop)
+        tp2  = entry + 2*(entry - stop)
     elif direction == "short":
         stop = entry + max(1.5*atr, entry*0.004)
-        tp1 = entry - (stop - entry)
-        tp2 = entry - 2*(stop - entry)
+        tp1  = entry - (stop - entry)
+        tp2  = entry - 2*(stop - entry)
     else:
-        stop, tp1, tp2 = entry, entry, entry
+        stop = tp1 = tp2 = entry
 
-    # Confidence score
+    # Confidence
     conf = 0
     if trend_long or trend_short: conf += 20
-    if mom_long or mom_short: conf += 20
+    if mom_long or mom_short:     conf += 20
     if pullback_long or pullback_short: conf += 15
-    rr = 0.0
-    if direction != "flat":
-        rr = abs((tp2 - entry) / (entry - stop)) if entry != stop else 0.0
-        if rr >= 2.0: conf += 15
-    # Volatility regime
-    atr_pct = atr / entry * 100 if entry else 0
-    if 0.5 <= atr_pct <= 5: conf += 10
 
+    rr = 0.0
+    if direction != "flat" and entry != stop:
+        rr = abs((tp2 - entry) / (entry - stop))
+        if rr >= 2.0:
+            conf += 15
+
+    atr_pct = (atr / entry * 100) if entry else 0
+    if 0.5 <= atr_pct <= 5:
+        conf += 10
+
+    # Rationale
     rationale = []
     if direction == "long":
-        rationale += ["Price above rising 200 EMA" if trend_long else "200 EMA trend not confirmed",
-                      "RSI>55 & MACD>0" if mom_long else "Momentum mixed",
-                      "Pullback structure intact" if pullback_long else "No ideal pullback"]
+        rationale += [
+            "Price above rising 200 EMA" if trend_long else "200 EMA trend not confirmed",
+            "RSI>55 & MACD>0" if mom_long else "Momentum mixed",
+            "Pullback structure intact" if pullback_long else "No ideal pullback",
+        ]
     elif direction == "short":
-        rationale += ["Price below falling 200 EMA" if trend_short else "200 EMA trend not confirmed",
-                      "RSI<45 & MACD<0" if mom_short else "Momentum mixed",
-                      "Pullback structure intact" if pullback_short else "No ideal pullback"]
+        rationale += [
+            "Price below falling 200 EMA" if trend_short else "200 EMA trend not confirmed",
+            "RSI<45 & MACD<0" if mom_short else "Momentum mixed",
+            "Pullback structure intact" if pullback_short else "No ideal pullback",
+        ]
     else:
         rationale.append("No aligned signals; staying flat")
 
@@ -219,11 +251,11 @@ def compute_signals(df: pd.DataFrame) -> Dict:
         "confidence": conf,
         "rationale": rationale,
         "indicators": {
-            "ema200": round(float(latest.ema200),5),
-            "rsi": round(float(latest.rsi),2),
-            "macd_hist": round(float(latest.macd_hist),4),
-            "atr": round(float(atr),5)
-        }
+            "ema200": round(float(latest.ema200), 5),
+            "rsi": round(float(latest.rsi), 2),
+            "macd_hist": round(float(latest.macd_hist), 4),
+            "atr": round(float(atr), 5),
+        },
     }
 
 
@@ -246,8 +278,10 @@ def analyze(symbol: str, asset_type: str, tf: str = DEFAULT_TF, equity: float = 
         raise HTTPException(400, "asset_type must be crypto or fx")
 
     # Need enough history for EMA200; resampled FX can be tighter in practice.
+    # before computing signals in /analyze
     if len(df.dropna()) < 150:
         raise HTTPException(503, "Not enough data for indicators")
+
 
     sig = compute_signals(df)
     size_units = position_size(sig["entry"], sig["stop"], equity, risk_pct)
