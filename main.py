@@ -1,445 +1,166 @@
-from fastapi import FastAPI, HTTPException, Header, Query
+from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional, Dict, Tuple
-import os, time, threading, collections, datetime as dt
+from typing import List, Optional, Dict, Any
+import os, time, math
 import pandas as pd
 import numpy as np
-import ccxt
-import requests
 
-# ------------------------------- Config -------------------------------
+# --- Security ---
+API_KEY = os.getenv("API_KEY", "change-me")
 
-SECRET = os.getenv("AI_TRADE_SECRET", "XxUjb7DilVuqcnmeLXmUCURndUzC4Vmf")
-DEFAULT_TF = "4h"
-
-ALPHA_VANTAGE_KEY = os.getenv("ALPHA_VANTAGE_KEY")  # required for FX
-HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT_SECONDS", "12"))     # keep small
-CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "150"))  # ~2.5 min
-BATCH_LIMIT_SUCCESS = int(os.getenv("BATCH_LIMIT_SUCCESS", "6"))
-CRYPTO_LIMIT = int(os.getenv("CRYPTO_CANDLES_LIMIT", "300"))    # enough for EMA200 4h
-FX_RATE_PER_MIN = int(os.getenv("FX_RATE_PER_MIN", "5"))        # AV free ~5/min
-FX_WINDOW_SEC = int(os.getenv("FX_WINDOW_SEC", "60"))
-
-# Tip: run single worker on Render
-# Start: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
-
-# ------------------------------ FastAPI -------------------------------
-
-app = FastAPI(title="AI Trade Advisor Backend (lean)")
-
-class AnalyzeRequest(BaseModel):
-    symbol: str
-    asset_type: str  # "crypto" or "fx"
-    timeframe: str = DEFAULT_TF
-    equity: float = 10000.0
-    risk_pct: float = 0.8
-
-class AnalyzeBatchRequest(BaseModel):
-    items: List[AnalyzeRequest]
-
-# ----------------------------- Utilities ------------------------------
-
-def _downcast_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Downcast to float32 to save memory."""
-    for c in ("open","high","low","close","volume"):
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce", downcast="float").astype("float32")
-    return df
-
-class TTLCache:
-    def __init__(self, ttl_seconds: int):
-        self.ttl = ttl_seconds
-        self._d: Dict[Tuple[str, str, str], Tuple[float, pd.DataFrame]] = {}
-        self._lock = threading.Lock()
-    def get(self, key: Tuple[str, str, str]) -> Optional[pd.DataFrame]:
-        now = time.time()
-        with self._lock:
-            it = self._d.get(key)
-            if not it: return None
-            ts, df = it
-            if now - ts <= self.ttl:
-                return df.copy()
-            self._d.pop(key, None)
-        return None
-    def set(self, key: Tuple[str, str, str], df: pd.DataFrame):
-        with self._lock:
-            self._d[key] = (time.time(), df.copy())
-
-CACHE = TTLCache(CACHE_TTL_SECONDS)
-
-# Reuse a single CCXT client to avoid overhead/memory churn
-_EXCHANGE = None
-def get_exchange():
-    global _EXCHANGE
-    if _EXCHANGE is None:
-        _EXCHANGE = ccxt.binance({"enableRateLimit": True, "timeout": HTTP_TIMEOUT * 1000})
-    return _EXCHANGE
-
-# Simple FX token bucket to avoid AV 5/min throttle
-_fx_hits = collections.deque()  # timestamps (epoch seconds)
-_fx_lock = threading.Lock()
-def _fx_allow() -> bool:
-    now = time.time()
-    with _fx_lock:
-        while _fx_hits and (now - _fx_hits[0] > FX_WINDOW_SEC):
-            _fx_hits.popleft()
-        if len(_fx_hits) >= FX_RATE_PER_MIN:
-            return False
-        _fx_hits.append(now)
-        return True
-
-def _utc_now_iso() -> str:
-    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-# ------------------------- Auth / Health / List -----------------------
-
-def require_auth(auth: Optional[str]):
-    if not auth or not auth.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing auth")
-    token = auth.split(" ",1)[1]
-    if token != SECRET:
+def require_key(authorization: Optional[str] = Header(None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing token")
+    token = authorization.split(" ", 1)[1].strip()
+    if token != API_KEY:
         raise HTTPException(status_code=403, detail="Invalid token")
 
-@app.get("/health")
-def health():
-    return {"ok": True, "ts": int(time.time())}
+# --- App ---
+app = FastAPI(title="AI Trade Advisor", version="0.1.0")
 
-@app.get("/instruments")
-def instruments():
-    return {
-        "crypto": [
-            "BTC/USDT","ETH/USDT","XRP/USDT","SOL/USDT","BNB/USDT",
-            "ADA/USDT","DOGE/USDT","AVAX/USDT","DOT/USDT","MATIC/USDT",
-            "LTC/USDT","TRX/USDT","LINK/USDT","ATOM/USDT","XLM/USDT",
-            "NEAR/USDT","FIL/USDT","APT/USDT","AAVE/USDT","ETC/USDT",
-            "ICP/USDT","HBAR/USDT","ARB/USDT","OP/USDT","SUI/USDT"
-        ],
-        "fx": [
-            "EUR/USD","GBP/USD","USD/JPY","USD/CHF","AUD/USD",
-            "USD/CAD","NZD/USD","EUR/GBP","EUR/JPY","GBP/JPY",
-            "EUR/AUD","AUD/JPY","CHF/JPY","EUR/CHF","GBP/CHF",
-            "AUD/NZD","CAD/JPY","EUR/CAD","GBP/CAD","NZD/JPY",
-            "USD/SEK","USD/NOK","USD/MXN","USD/TRY","USD/ZAR"
-        ]
-    }
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # tighten to your domain in prod
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# ----------------------------- Data fetchers --------------------------
+# --- In-memory cache (replace with Postgres/Redis in prod) ---
+STATE = {
+    "universe": [],      # list of {symbol, name, market, tf_supported}
+    "signals": {},       # {(symbol, tf): {signal, conf, updated, features...}}
+    "backtests": {},     # {symbol: {metrics}}
+    "last_refresh": 0,
+}
 
-def fetch_ohlcv_crypto(symbol: str, timeframe: str) -> pd.DataFrame:
-    key = ("crypto", symbol, timeframe)
-    cached = CACHE.get(key)
-    if cached is not None:
-        return cached
-    try:
-        ex = get_exchange()
-        ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=CRYPTO_LIMIT)
-        df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"]).set_index("ts")
-        df.index = pd.to_datetime(df.index, unit="ms", utc=True)
-    except Exception as e:
-        raise HTTPException(502, f"Crypto fetch error for {symbol}: {e}")
-    df = _downcast_df(df)
-    CACHE.set(key, df)
+# ---- Models / featurization demo (replace with your ML pipeline) ----
+def compute_features(df: pd.DataFrame) -> pd.DataFrame:
+    # df columns: ["ts","open","high","low","close","volume"]
+    df = df.copy()
+    df["ret1"] = df["close"].pct_change()
+    df["ret5"] = df["close"].pct_change(5)
+    df["vol_mean20"] = df["volume"].rolling(20).mean()
+    df["rsi14"] = rsi(df["close"], 14)
+    df["sma20"] = df["close"].rolling(20).mean()
+    df["sma50"] = df["close"].rolling(50).mean()
+    df["sma20_50_diff"] = (df["sma20"] - df["sma50"]) / df["sma50"]
+    df["bb_up"], df["bb_dn"] = bollinger(df["close"], 20, 2)
+    df["bb_pos"] = (df["close"] - df["bb_dn"]) / (df["bb_up"] - df["bb_dn"])
     return df
 
-def fetch_ohlcv_fx(pair: str, timeframe: str) -> pd.DataFrame:
-    if not ALPHA_VANTAGE_KEY:
-        raise HTTPException(500, "ALPHA_VANTAGE_KEY not set")
-    if not _fx_allow():
-        # quick fail so frontend can fill with crypto instead of waiting 20s
-        raise HTTPException(429, "FX rate limit reached; try again shortly")
-
-    key = ("fx", pair, timeframe)
-    cached = CACHE.get(key)
-    if cached is not None:
-        return cached
-
-    base, quote = pair.split("/")
-    try:
-        if timeframe in ("1h", "4h"):
-            # Need many 60min bars to build 4H EMA200; use full (heavy but cached)
-            url = (
-                "https://www.alphavantage.co/query"
-                f"?function=FX_INTRADAY&from_symbol={base}&to_symbol={quote}"
-                f"&interval=60min&outputsize=full&apikey={ALPHA_VANTAGE_KEY}"
-            )
-            resp = requests.get(url, timeout=HTTP_TIMEOUT)
-            data = resp.json()
-            key_ts = "Time Series FX (60min)"
-        else:
-            url = (
-                "https://www.alphavantage.co/query"
-                f"?function=FX_DAILY&from_symbol={base}&to_symbol={quote}"
-                f"&outputsize=full&apikey={ALPHA_VANTAGE_KEY}"
-            )
-            resp = requests.get(url, timeout=HTTP_TIMEOUT)
-            data = resp.json()
-            key_ts = "Time Series FX (Daily)"
-
-        # Provider throttle / errors come back in these fields
-        note = data.get("Note")
-        err  = data.get("Error Message")
-        if note or err:
-            raise HTTPException(429 if note else 502, note or err)
-
-        ts = data.get(key_ts, {})
-        if not ts:
-            raise HTTPException(502, f"FX data unavailable for {pair}")
-
-        df = (
-            pd.DataFrame.from_dict(ts, orient="index")
-            .rename(columns={"1. open":"open","2. high":"high","3. low":"low","4. close":"close"})
-        )
-        df.index = pd.to_datetime(df.index, utc=True)
-        for c in ["open","high","low","close"]:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        df["volume"] = 0.0
-        df = df.sort_index()
-
-        if timeframe == "4h":
-            df = (
-                df.resample("4H")
-                  .agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"})
-                  .dropna()
-            )
-
-        df = df.tail(1000)
-        df = _downcast_df(df)
-        CACHE.set(key, df)
-        return df
-
-    except requests.Timeout:
-        raise HTTPException(504, f"FX provider timeout for {pair}")
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(502, f"FX fetch error for {pair}: {e}")
-
-# ---------------------------- Indicators (lean) -----------------------
-
-def ema(series: pd.Series, length: int) -> pd.Series:
-    return series.ewm(span=length, adjust=False, min_periods=length).mean()
-
-def sma(series: pd.Series, length: int) -> pd.Series:
-    return series.rolling(length, min_periods=length).mean()
-
-def rsi(series: pd.Series, length: int = 14) -> pd.Series:
+def rsi(series: pd.Series, n: int = 14) -> pd.Series:
     delta = series.diff()
     up = np.where(delta > 0, delta, 0.0)
     down = np.where(delta < 0, -delta, 0.0)
-    roll_up = pd.Series(up, index=series.index).ewm(alpha=1/length, adjust=False).mean()
-    roll_down = pd.Series(down, index=series.index).ewm(alpha=1/length, adjust=False).mean()
-    rs = roll_up / (roll_down.replace(0, np.nan))
-    out = 100 - (100 / (1 + rs))
-    return out.astype("float32")
+    roll_up = pd.Series(up).rolling(n).mean()
+    roll_down = pd.Series(down).rolling(n).mean()
+    rs = roll_up / (roll_down + 1e-12)
+    return 100 - (100 / (1 + rs))
 
-def macd(series: pd.Series, fast=12, slow=26, signal=9):
-    ema_fast = ema(series, fast)
-    ema_slow = ema(series, slow)
-    macd_line = ema_fast - ema_slow
-    signal_line = ema(macd_line, signal)
-    hist = macd_line - signal_line
-    return macd_line.astype("float32"), signal_line.astype("float32"), hist.astype("float32")
+def bollinger(series: pd.Series, n: int, k: float):
+    ma = series.rolling(n).mean()
+    sd = series.rolling(n).std()
+    return ma + k*sd, ma - k*sd
 
-def atr(high: pd.Series, low: pd.Series, close: pd.Series, length: int = 14) -> pd.Series:
-    prev_close = close.shift(1)
-    tr = pd.concat([
-        (high - low).abs(),
-        (high - prev_close).abs(),
-        (low - prev_close).abs()
-    ], axis=1).max(axis=1)
-    return tr.rolling(length, min_periods=length).mean().astype("float32")
+def simple_rule_inference(df: pd.DataFrame) -> Dict[str, Any]:
+    """Placeholder 'AI' signal: combine RSI and MA slope. Swap out with your ML model."""
+    last = df.iloc[-1]
+    slope = df["sma20"].iloc[-1] - df["sma20"].iloc[-5]
+    score = 0.0
+    # RSI contrarian banded logic + trend tilt
+    if last["rsi14"] < 30: score += 0.4
+    if last["rsi14"] > 70: score -= 0.4
+    score += np.tanh(slope / (1e-6 + abs(df["sma20"].iloc[-5]))) * 0.3
+    score += np.clip(last["bb_pos"] - 0.5, -0.5, 0.5) * 0.3
 
-# --------------------------- Signal engine ----------------------------
-# Memory-lean: compute series → take LAST VALID values only (no wide temp df).
+    label = "Bullish" if score > 0.15 else "Bearish" if score < -0.15 else "Neutral"
+    conf = float(np.clip(abs(score), 0, 1))
+    return {"signal": label, "confidence": conf, "score": float(score)}
 
-def compute_signals(df: pd.DataFrame) -> Dict:
-    if not {"open","high","low","close"}.issubset(df.columns):
-        raise HTTPException(500, "OHLCV data incomplete")
+# ---- Demo data: replace with CCXT/CoinGecko ingestion ----
+def demo_prices(symbol: str, n: int = 300) -> pd.DataFrame:
+    # Synthetic walk; swap with real OHLCV
+    rng = pd.date_range(end=pd.Timestamp.utcnow(), periods=n, freq="H")
+    price = 30000 + np.cumsum(np.random.randn(n)) * 50
+    high = price + np.random.rand(n) * 30
+    low = price - np.random.rand(n) * 30
+    open_ = np.concatenate([[price[0]], price[:-1]])
+    vol = 100 + np.random.rand(n) * 50
+    return pd.DataFrame({
+        "ts": rng, "open": open_, "high": high, "low": low, "close": price, "volume": vol
+    })
 
-    close = df["close"]
-    high  = df["high"]
-    low   = df["low"]
-
-    ema20  = ema(close, 20)
-    ema50  = ema(close, 50)
-    ema200 = ema(close, 200)
-    _, _, macd_hist = macd(close, 12, 26, 9)
-    rsi14  = rsi(close, 14)
-    bbmid  = sma(close, 20)
-    atr14  = atr(high, low, close, 14)
-
-    # Find rows where all are ready
-    ready_mask = (~ema20.isna() & ~ema50.isna() & ~ema200.isna() &
-                  ~macd_hist.isna() & ~rsi14.isna() & ~bbmid.isna() &
-                  ~atr14.isna() & ~close.isna())
-    if not ready_mask.any():
-        raise HTTPException(503, "Indicators not ready; need more history")
-    idx_last = ready_mask[ready_mask].index[-1]
-
-    latest = {
-        "close": float(close.loc[idx_last]),
-        "ema20": float(ema20.loc[idx_last]),
-        "ema50": float(ema50.loc[idx_last]),
-        "ema200": float(ema200.loc[idx_last]),
-        "macd_hist": float(macd_hist.loc[idx_last]),
-        "rsi": float(rsi14.loc[idx_last]),
-        "bb_mid": float(bbmid.loc[idx_last]),
-        "atr": float(atr14.loc[idx_last]),
-    }
-
-    # Trend filter
-    trend_long  = latest["close"] > latest["ema200"] and latest["ema50"] > latest["ema200"]
-    trend_short = latest["close"] < latest["ema200"] and latest["ema50"] < latest["ema200"]
-
-    # Momentum
-    mom_long  = latest["rsi"] > 55 and latest["macd_hist"] > 0 and latest["close"] > latest["bb_mid"]
-    mom_short = latest["rsi"] < 45 and latest["macd_hist"] < 0 and latest["close"] < latest["bb_mid"]
-
-    # Pullback context
-    pullback_long  = (latest["close"] > latest["ema20"] > latest["ema50"]) if trend_long else False
-    pullback_short = (latest["close"] < latest["ema20"] < latest["ema50"]) if trend_short else False
-
-    # Direction
-    direction = "flat"
-    if trend_long and mom_long:
-        direction = "long"
-    elif trend_short and mom_short:
-        direction = "short"
-
-    # Levels
-    atr_v = latest["atr"]
-    entry = latest["close"]
-    if direction == "long":
-        stop = entry - max(1.5*atr_v, entry*0.004)
-        tp1  = entry + (entry - stop)
-        tp2  = entry + 2*(entry - stop)
-    elif direction == "short":
-        stop = entry + max(1.5*atr_v, entry*0.004)
-        tp1  = entry - (stop - entry)
-        tp2  = entry - 2*(stop - entry)
-    else:
-        stop = tp1 = tp2 = entry
-
-    # Confidence
-    conf = 0
-    if trend_long or trend_short: conf += 20
-    if mom_long or mom_short:     conf += 20
-    if pullback_long or pullback_short: conf += 15
-
-    rr = 0.0
-    if direction != "flat" and entry != stop:
-        rr = abs((tp2 - entry) / (entry - stop))
-        if rr >= 2.0:
-            conf += 15
-
-    atr_pct = (atr_v / entry * 100) if entry else 0
-    if 0.5 <= atr_pct <= 5:
-        conf += 10
-
-    rationale = []
-    if direction == "long":
-        rationale += [
-            "Price above rising 200 EMA" if trend_long else "200 EMA trend not confirmed",
-            "RSI>55 & MACD>0" if mom_long else "Momentum mixed",
-            "Pullback structure intact" if pullback_long else "No ideal pullback",
+def ensure_state():
+    # populate demo universe once
+    if not STATE["universe"]:
+        STATE["universe"] = [
+            {"symbol": "BTC/USDT", "name": "Bitcoin", "market": "Binance", "tf_supported": ["1h","1d"]},
+            {"symbol": "ETH/USDT", "name": "Ethereum", "market": "Binance", "tf_supported": ["1h","1d"]},
+            {"symbol": "SOL/USDT", "name": "Solana", "market": "Binance", "tf_supported": ["1h","1d"]},
         ]
-    elif direction == "short":
-        rationale += [
-            "Price below falling 200 EMA" if trend_short else "200 EMA trend not confirmed",
-            "RSI<45 & MACD<0" if mom_short else "Momentum mixed",
-            "Pullback structure intact" if pullback_short else "No ideal pullback",
-        ]
-    else:
-        rationale.append("No aligned signals; staying flat")
+    STATE["last_refresh"] = time.time()
 
-    return {
-        "direction": direction,
-        "entry": round(entry, 5),
-        "stop": round(stop, 5),
-        "take_profits": [round(tp1,5), round(tp2,5)],
-        "risk_reward": round(rr, 2),
-        "confidence": conf,
-        "rationale": rationale,
-        "indicators": {
-            "ema200": round(latest["ema200"], 5),
-            "rsi": round(latest["rsi"], 2),
-            "macd_hist": round(latest["macd_hist"], 4),
-            "atr": round(atr_v, 5),
-        },
-    }
+# ---- Schemas ----
+class Instrument(BaseModel):
+    symbol: str
+    name: str
+    market: str
+    tf_supported: List[str]
 
-# ------------------------ Position sizing / API -----------------------
+class Signal(BaseModel):
+    symbol: str
+    timeframe: str
+    signal: str
+    confidence: float
+    updated: str
+    features: Dict[str, float] = {}
 
-def position_size(entry: float, stop: float, equity: float, risk_pct: float) -> float:
-    risk_amt = equity * (risk_pct/100.0)
-    risk_per_unit = abs(entry - stop)
-    if risk_per_unit <= 0:
-        return 0.0
-    return round(risk_amt / risk_per_unit, 6)
+# ---- Routes ----
+@app.get("/health")
+def health():
+    return {"ok": True, "ts": time.time()}
 
-@app.get("/analyze")
-def analyze(
-    symbol: str,
-    asset_type: str,
-    tf: str = DEFAULT_TF,
-    equity: float = 10000.0,
-    risk_pct: float = 0.8,
-    Authorization: Optional[str] = Header(None)
-):
-    require_auth(Authorization)
+@app.get("/instruments", response_model=List[Instrument])
+def instruments(_: None = Depends(require_key)):
+    ensure_state()
+    return STATE["universe"]
 
-    if asset_type == "crypto":
-        df = fetch_ohlcv_crypto(symbol, tf)
-    elif asset_type == "fx":
-        df = fetch_ohlcv_fx(symbol.replace(" ","/"), tf)
-    else:
-        raise HTTPException(400, "asset_type must be crypto or fx")
+@app.get("/signals", response_model=Signal)
+def signals(symbol: str, tf: str = "1h", _: None = Depends(require_key)):
+    ensure_state()
+    key = (symbol, tf)
+    if key not in STATE["signals"]:
+        df = demo_prices(symbol, 500 if tf=="1h" else 400)
+        feats = compute_features(df).iloc[-1]
+        pred = simple_rule_inference(compute_features(df))
+        payload = {
+            "symbol": symbol,
+            "timeframe": tf,
+            "signal": pred["signal"],
+            "confidence": pred["confidence"],
+            "updated": pd.Timestamp.utcnow().isoformat(),
+            "features": {
+                "rsi14": float(feats["rsi14"]),
+                "sma20_50_diff": float(feats["sma20_50_diff"]),
+                "bb_pos": float(feats["bb_pos"]),
+                "ret5": float(feats["ret5"]),
+            }
+        }
+        STATE["signals"][key] = payload
+    return STATE["signals"][key]
 
-    # Need enough history for EMA200 etc.
-    if df.shape[0] < 220:
-        raise HTTPException(503, "Not enough data for indicators")
-
-    sig = compute_signals(df)
-    size_units = position_size(sig["entry"], sig["stop"], equity, risk_pct)
-    return {
-        "symbol": symbol,
-        "asset_type": asset_type,
-        "timeframe": tf,
-        "updated_at": _utc_now_iso(),
-        **sig,
-        "suggested_risk_pct": risk_pct,
-        "position_size_units": size_units,
-        "risk": {"account_equity": equity, "risk_amount": equity*(risk_pct/100.0)}
-    }
-
-@app.post("/batch")
-def batch(
-    req: AnalyzeBatchRequest,
-    limit_success: Optional[int] = Query(None, description="Early stop once N successes found"),
-    Authorization: Optional[str] = Header(None)
-):
-    require_auth(Authorization)
-    max_success = int(limit_success or BATCH_LIMIT_SUCCESS)
-
-    results = []
-    success_count = 0
-    for item in req.items:
-        if success_count >= max_success:
-            break
-        try:
-            r = analyze(
-                item.symbol,
-                item.asset_type,
-                item.timeframe,
-                item.equity,
-                item.risk_pct,
-                Authorization=f"Bearer {SECRET}"
-            )
-            results.append(r)
-            success_count += 1
-        except HTTPException as e:
-            # Pass along a compact error (frontend knows to skip)
-            results.append({"symbol": item.symbol, "error": e.detail})
-        except Exception as e:
-            results.append({"symbol": item.symbol, "error": str(e)})
-    return {"results": results}
+@app.get("/summary")
+def summary(_: None = Depends(require_key)):
+    ensure_state()
+    # dummy leaderboards
+    board = []
+    for inst in STATE["universe"]:
+        s = STATE["signals"].get((inst["symbol"], "1h")) or {}
+        board.append({
+            "symbol": inst["symbol"],
+            "signal": s.get("signal", "Neutral"),
+            "confidence": s.get("confidence", 0.0),
+        })
+    return {"universe": STATE["universe"], "leaderboard": board}
