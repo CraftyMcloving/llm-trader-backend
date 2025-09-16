@@ -8,3 +8,11 @@ services:
     envVars:
       - key: API_KEY
         sync: false
+      - key: EXCHANGE
+        value: binance
+      - key: QUOTE
+        value: USDT
+      - key: TOP_N
+        value: 25
+      - key: CACHE_TTL_SEC
+        value: 1800
