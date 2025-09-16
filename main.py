@@ -21,6 +21,21 @@ class AnalyzeRequest(BaseModel):
 
 class AnalyzeBatchRequest(BaseModel):
     items: List[AnalyzeRequest]
+    
+def first_col_like(df: pd.DataFrame, startswith: str) -> Optional[str]:
+    for c in df.columns:
+        if c.startswith(startswith):
+            return c
+    return None
+
+def bollinger_mid(close: pd.Series, length: int = 20, std: int = 2) -> pd.Series:
+    bb = ta.bbands(close, length=length, std=std)
+    if isinstance(bb, pd.DataFrame) and not bb.empty:
+        mid = first_col_like(bb, "BBM_")
+        if mid and mid in bb:
+            return bb[mid]
+    # Fallback if pandas-ta naming changed or BB not available yet
+    return ta.sma(close, length=length)
 
 
 def require_auth(auth: Optional[str]):
@@ -69,11 +84,15 @@ def fetch_ohlcv_fx(pair: str, timeframe: str) -> pd.DataFrame:
     # Minimal demo using Alpha Vantage FX_INTRADAY/FX_DAILY
     base, quote = pair.split("/")
     if timeframe in ("1h","4h"):
-        interval = "60min" if timeframe=="1h" else "60min"
-        url = f"https://www.alphavantage.co/query?function=FX_INTRADAY&from_symbol={base}&to_symbol={quote}&interval={interval}&apikey={ALPHA_VANTAGE_KEY}&outputsize=full"
+        interval = "60min"  # 60m → resample later for 4h
+        url = (
+            "https://www.alphavantage.co/query"
+            f"?function=FX_INTRADAY&from_symbol={base}&to_symbol={quote}"
+            f"&interval={interval}&apikey={ALPHA_VANTAGE_KEY}&outputsize=full"
+        )
         data = requests.get(url, timeout=30).json()
         key = f"Time Series FX ({interval})"
-    else:
+    else:  # treat everything else as Daily for now
         url = f"https://www.alphavantage.co/query?function=FX_DAILY&from_symbol={base}&to_symbol={quote}&apikey={ALPHA_VANTAGE_KEY}&outputsize=full"
         data = requests.get(url, timeout=30).json()
         key = "Time Series FX (Daily)"
@@ -84,21 +103,35 @@ def fetch_ohlcv_fx(pair: str, timeframe: str) -> pd.DataFrame:
     df.index = pd.to_datetime(df.index, utc=True)
     df = df.sort_index()
     df["volume"] = 0.0
-    return df.tail(500)
+
+    # Resample 60m FX to 4H bars if requested
+    if timeframe == "4h":
+        df = (
+            df.resample("4H")
+              .agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"})
+              .dropna()
+        )
+    return df.tail(1000)
 
 
 def compute_signals(df: pd.DataFrame) -> Dict:
     out = {}
     df = df.copy()
-    df["ema20"] = ta.ema(df["close"], length=20)
-    df["ema50"] = ta.ema(df["close"], length=50)
+    df["ema20"]  = ta.ema(df["close"], length=20)
+    df["ema50"]  = ta.ema(df["close"], length=50)
     df["ema200"] = ta.ema(df["close"], length=200)
+    
     macd = ta.macd(df["close"], fast=12, slow=26, signal=9)
-    df["macd_hist"] = macd["MACDh_12_26_9"]
-    df["rsi"] = ta.rsi(df["close"], length=14)
-    bb = ta.bbands(df["close"], length=20, std=2)
-    df["bb_mid"] = bb["BBM_20_2.0"]
-    df["atr"] = ta.atr(df["high"], df["low"], df["close"], length=14)
+    if isinstance(macd, pd.DataFrame) and not macd.empty:
+        # Prefer the histogram column regardless of suffix formatting
+        hist_col = first_col_like(macd, "MACDh_") or first_col_like(macd, "MACD_Hist")
+        df["macd_hist"] = macd[hist_col] if hist_col else pd.Series(index=df.index, dtype=float)
+    else:
+        df["macd_hist"] = pd.Series(index=df.index, dtype=float)
+
+    df["rsi"]    = ta.rsi(df["close"], length=14)
+    df["bb_mid"] = bollinger_mid(df["close"], length=20, std=2)
+    df["atr"]    = ta.atr(df["high"], df["low"], df["close"], length=14)
     latest = df.dropna().iloc[-1]
 
     # Trend filter
@@ -192,7 +225,8 @@ def analyze(symbol: str, asset_type: str, tf: str = DEFAULT_TF, equity: float = 
     else:
         raise HTTPException(400, "asset_type must be crypto or fx")
 
-    if len(df) < 200:
+    # Need enough history for EMA200; resampled FX can be tighter in practice.
+    if len(df.dropna()) < 150:
         raise HTTPException(503, "Not enough data for indicators")
 
     sig = compute_signals(df)
