@@ -1,287 +1,221 @@
-import os
-import json
-import time
-import logging
+from fastapi import FastAPI, HTTPException, Header
+from pydantic import BaseModel
+import time, os
 import pandas as pd
-import numpy as np
-import yfinance as yf
-import ta
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-import openai
+import pandas_ta as ta
+import ccxt
 import requests
+from typing import List, Optional, Dict
 
-# ===== Config =====
-app = Flask(__name__)
-CORS(app, origins=["https://craftyalpha.com"])
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+SECRET = os.getenv("AI_TRADE_SECRET", "changeme")
+DEFAULT_TF = "4h"
 
-OPENAI_KEY = os.environ.get("OPENAI_API_KEY")
-if OPENAI_KEY:
-    openai.api_key = OPENAI_KEY
+app = FastAPI(title="AI Trade Advisor Backend")
 
-# ===== Data fetching =====
-def fetch_bars(ticker, interval, period="7d"):
-    try:
-        df = yf.download(ticker, interval=interval, period=period, progress=False)
-    except Exception as e:
-        logger.error(f"yfinance download failed for {ticker}: {e}")
-        return pd.DataFrame()
-    if df is None or df.empty:
-        return pd.DataFrame()
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[0].lower() for c in df.columns]
-    else:
-        df.columns = [c.lower() for c in df.columns]
-    for col in ["open", "high", "low", "close", "volume"]:
-        if col not in df.columns:
-            df[col] = np.nan
-    return df
+class AnalyzeRequest(BaseModel):
+    symbol: str
+    asset_type: str  # "crypto" or "fx"
+    timeframe: str = DEFAULT_TF
+    equity: float = 10000.0
+    risk_pct: float = 0.8
 
-# ===== Indicators =====
-def compute_indicators(df):
-    df = df.copy().dropna()
-    if df.empty:
-        return df
-    try:
-        df["sma20"] = ta.trend.sma_indicator(df["close"], window=20)
-        df["ema20"] = ta.trend.ema_indicator(df["close"], window=20)
-        df["rsi14"] = ta.momentum.rsi(df["close"], window=14)
-        macd = ta.trend.MACD(df["close"])
-        df["macd"] = macd.macd()
-        df["macd_signal"] = macd.macd_signal()
-        df["atr14"] = ta.volatility.average_true_range(df["high"], df["low"], df["close"], window=14)
-    except Exception as e:
-        logger.error(f"compute_indicators failed: {e}")
-        return pd.DataFrame()
-    return df
+class AnalyzeBatchRequest(BaseModel):
+    items: List[AnalyzeRequest]
 
-# ===== Multi-timeframe summary =====
-def summarize_structure(df_daily, df_1h, df_15m, df_1m):
-    s = {}
-    try:
-        s['daily_trend'] = 'up' if not df_daily.empty and df_daily['close'].iloc[-1] > df_daily['sma20'].iloc[-1] else 'down'
-        s['1h_rsi'] = float(df_1h['rsi14'].iloc[-1]) if not df_1h.empty else None
-        s['15m_macd_hist'] = float(df_15m['macd'].iloc[-1] - df_15m['macd_signal'].iloc[-1]) if not df_15m.empty else None
-        s['1m_atr'] = float(df_1m['atr14'].iloc[-1]) if not df_1m.empty else None
-    except Exception as e:
-        logger.error(f"summarize_structure failed: {e}")
-    return s
 
-# ===== Heuristic analysis =====
-def heuristic_analysis(ticker, capital, risk_percent, summary, df_1m):
-    entries = []
-    last = float(df_1m['close'].iloc[-1]) if not df_1m.empty else None
-    atr = summary.get('1m_atr') or (float(df_1m['close'].pct_change().std()) * last if last else None)
-    if last is None or atr is None:
-        return {'entries': [], 'explanation': 'Insufficient data for heuristic analysis.'}
+def require_auth(auth: Optional[str]):
+    if not auth or not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing auth")
+    token = auth.split(" ",1)[1]
+    if token != SECRET:
+        raise HTTPException(status_code=403, detail="Invalid token")
 
-    daily_trend = summary.get('daily_trend', 'n/a')
-    macd_hist = summary.get('15m_macd_hist') or 0
+@app.get("/health")
+def health():
+    return {"ok": True, "ts": int(time.time())}
 
-    if daily_trend in ['up','n/a'] and macd_hist >= -0.1:
-        stop = round(last - (2 * atr), 4)
-        tgt1 = round(last + (2 * atr), 4)
-        tgt2 = round(last + (4 * atr), 4)
-        risk_per_trade_usd = (risk_percent / 100) * capital
-        qty = int(risk_per_trade_usd / (last - stop)) if (last - stop) > 0 else 0
-
-        entries.append({
-            'type':'long',
-            'entry_price': last,
-            'stop_loss': stop,
-            'target_1': tgt1,
-            'target_2': tgt2,
-            'confidence': 'medium',
-            'rationale': f'Daily trend {daily_trend} + 15m MACD histogram {macd_hist:.4f}; ATR-based stops.',
-            'position_size': qty,
-            'capital_at_risk_usd': round(risk_per_trade_usd, 2)
-        })
-    return {'entries': entries, 'position_size': qty if entries else 0, 'explanation': f'Heuristic suggestion with {risk_percent}% risk per trade.'}
-
-# ===== Prompt builder for LLM =====
-def build_prompt(ticker, capital, summary, recent_samples, top_n=5):
-    return f"""
-You are a professional quantitative trading assistant.
-Ticker: {ticker}
-Capital: {capital}
-Multi-timeframe summary: {json.dumps(summary)}
-Recent samples: {json.dumps(recent_samples)}
-Constraints:
-- Provide up to {top_n} candidate trades sorted by risk (least to most).
-- Include type, entry price, stop-loss, targets, position size, rationale.
-- Use ATR-based stops and explain confidence.
-- Return strictly JSON with keys: entries (list), explanation (string).
-"""
-
-# ===== Call OpenAI LLM with fallback through multiple models =====
-def call_llm_with_fallback(prompt):
-    trade_json = None
-    used_model = None
-    openai_models = ["gpt-5", "gpt-4.1", "gpt-4", "gpt-3.5-turbo"]
-
-    for model in openai_models:
-        if not OPENAI_KEY:
-            break
-        try:
-            resp = openai.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": "You are a trading assistant."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.2,
-                max_tokens=1000
-            )
-            trade_json = resp.choices[0].message.content
-            used_model = model
-            logger.info(f"LLM succeeded with model {model}")
-            break
-        except Exception as e:
-            logger.warning(f"Model {model} failed: {e}")
-
-    return trade_json, used_model
-
-# ===== Flask endpoint: /analyze =====
-@app.route("/analyze", methods=["POST"])
-def analyze():
-    data = request.json
-    ticker = data.get("ticker")
-    capital = float(data.get("capital", 1000))
-    risk_percent = float(data.get("risk_percent", 1))
-
-    df_daily = compute_indicators(fetch_bars(ticker, "1d", "1y"))
-    df_1h = compute_indicators(fetch_bars(ticker, "60m", "60d"))
-    df_15m = compute_indicators(fetch_bars(ticker, "15m", "60d"))
-    df_1m = compute_indicators(fetch_bars(ticker, "1m", "7d"))
-
-    summary = summarize_structure(df_daily, df_1h, df_15m, df_1m)
-    recent_samples = {
-        'daily_last_close': float(df_daily['close'].iloc[-1]) if not df_daily.empty else None,
-        '1h_last_close': float(df_1h['close'].iloc[-1]) if not df_1h.empty else None,
-        '15m_last_close': float(df_15m['close'].iloc[-1]) if not df_15m.empty else None
+@app.get("/instruments")
+def instruments():
+    return {
+        "crypto": [
+            "BTC/USDT","ETH/USDT","XRP/USDT","SOL/USDT","BNB/USDT",
+            "ADA/USDT","DOGE/USDT","AVAX/USDT","DOT/USDT","MATIC/USDT",
+            "LTC/USDT","TRX/USDT","LINK/USDT","ATOM/USDT","XLM/USDT",
+            "NEAR/USDT","FIL/USDT","APT/USDT","AAVE/USDT","ETC/USDT",
+            "ICP/USDT","HBAR/USDT","ARB/USDT","OP/USDT","SUI/USDT"
+        ],
+        "fx": [
+            "EUR/USD","GBP/USD","USD/JPY","USD/CHF","AUD/USD",
+            "USD/CAD","NZD/USD","EUR/GBP","EUR/JPY","GBP/JPY",
+            "EUR/AUD","AUD/JPY","CHF/JPY","EUR/CHF","GBP/CHF",
+            "AUD/NZD","CAD/JPY","EUR/CAD","GBP/CAD","NZD/JPY",
+            "USD/SEK","USD/NOK","USD/MXN","USD/TRY","USD/ZAR"
+        ]
     }
 
-    trade_id = f"{ticker}-{int(time.time())}"
 
-    if OPENAI_KEY:
-        prompt = build_prompt(ticker, capital, summary, recent_samples, top_n=5)
-        llm_out, used_model = call_llm_with_fallback(prompt)
+def fetch_ohlcv_crypto(symbol: str, timeframe: str) -> pd.DataFrame:
+    ex = ccxt.binance({"enableRateLimit": True})
+    # Convert symbol like BTC/USDT
+    ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=400)
+    df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"]).set_index("ts")
+    df.index = pd.to_datetime(df.index, unit="ms", utc=True)
+    return df
 
-        if llm_out:
-            try:
-                parsed = json.loads(llm_out)
-            except Exception:
-                parsed = {'entries': [], 'explanation': llm_out}
+# Placeholder for FX - replace with your provider
+ALPHA_VANTAGE_KEY = os.getenv("4N0D0EY6X6W42UJV")
 
-            for e in parsed.get('entries', []):
-                if 'position_size' not in e and 'stop_loss' in e and 'entry_price' in e:
-                    risk_usd = (risk_percent / 100) * capital
-                    qty = int(risk_usd / (e['entry_price'] - e['stop_loss'])) if (e['entry_price'] - e['stop_loss']) > 0 else 0
-                    e['position_size'] = qty
-                    e['capital_at_risk_usd'] = round(risk_usd, 2)
-
-            parsed['trade_id'] = trade_id
-            parsed['source'] = f"LLM ({used_model})"
-            return jsonify(parsed)
-
-        else:
-            result = heuristic_analysis(ticker, capital, risk_percent, summary, df_1m)
-            result['trade_id'] = trade_id
-            result['source'] = 'Heuristic (LLM failed)'
-            return jsonify(result)
-
+def fetch_ohlcv_fx(pair: str, timeframe: str) -> pd.DataFrame:
+    # Minimal demo using Alpha Vantage FX_INTRADAY/FX_DAILY
+    base, quote = pair.split("/")
+    if timeframe in ("1h","4h"):
+        interval = "60min" if timeframe=="1h" else "60min"
+        url = f"https://www.alphavantage.co/query?function=FX_INTRADAY&from_symbol={base}&to_symbol={quote}&interval={interval}&apikey={ALPHA_VANTAGE_KEY}&outputsize=full"
+        data = requests.get(url, timeout=30).json()
+        key = f"Time Series FX ({interval})"
     else:
-        result = heuristic_analysis(ticker, capital, risk_percent, summary, df_1m)
-        result['trade_id'] = trade_id
-        result['source'] = 'Heuristic'
-        return jsonify(result)
+        url = f"https://www.alphavantage.co/query?function=FX_DAILY&from_symbol={base}&to_symbol={quote}&apikey={ALPHA_VANTAGE_KEY}&outputsize=full"
+        data = requests.get(url, timeout=30).json()
+        key = "Time Series FX (Daily)"
+    ts = data.get(key, {})
+    df = pd.DataFrame.from_dict(ts, orient="index").rename(columns={
+        "1. open":"open","2. high":"high","3. low":"low","4. close":"close"
+    }).astype(float)
+    df.index = pd.to_datetime(df.index, utc=True)
+    df = df.sort_index()
+    df["volume"] = 0.0
+    return df.tail(500)
 
-# ===== Flask endpoint: /top5 =====
-@app.route("/top5", methods=["GET"])
-def top5():
-    tickers = ["AAPL", "MSFT", "TSLA", "AMZN", "NVDA", "META", "BTC-USD", "ETH-USD"]
-    capital = float(request.args.get("capital", 1000))
-    risk_percent = float(request.args.get("risk_percent", 1))
 
+def compute_signals(df: pd.DataFrame) -> Dict:
+    out = {}
+    df = df.copy()
+    df["ema20"] = ta.ema(df["close"], length=20)
+    df["ema50"] = ta.ema(df["close"], length=50)
+    df["ema200"] = ta.ema(df["close"], length=200)
+    macd = ta.macd(df["close"], fast=12, slow=26, signal=9)
+    df["macd_hist"] = macd["MACDh_12_26_9"]
+    df["rsi"] = ta.rsi(df["close"], length=14)
+    bb = ta.bbands(df["close"], length=20, std=2)
+    df["bb_mid"] = bb["BBM_20_2.0"]
+    df["atr"] = ta.atr(df["high"], df["low"], df["close"], length=14)
+    latest = df.dropna().iloc[-1]
+
+    # Trend filter
+    trend_long = latest.close > latest.ema200 and latest.ema50 > latest.ema200
+    trend_short = latest.close < latest.ema200 and latest.ema50 < latest.ema200
+
+    # Momentum
+    mom_long = latest.rsi > 55 and latest.macd_hist > 0 and latest.close > latest.bb_mid
+    mom_short = latest.rsi < 45 and latest.macd_hist < 0 and latest.close < latest.bb_mid
+
+    # Entry suggestion: pullback to ema20/ema50
+    pullback_long = latest.close > latest.ema20 > latest.ema50 if trend_long else False
+    pullback_short = latest.close < latest.ema20 < latest.ema50 if trend_short else False
+
+    direction = "flat"
+    if trend_long and mom_long:
+        direction = "long"
+    elif trend_short and mom_short:
+        direction = "short"
+
+    atr = float(latest.atr)
+    entry = float(latest.close)
+    if direction == "long":
+        stop = entry - max(1.5*atr, entry*0.004)
+        tp1 = entry + (entry - stop)
+        tp2 = entry + 2*(entry - stop)
+    elif direction == "short":
+        stop = entry + max(1.5*atr, entry*0.004)
+        tp1 = entry - (stop - entry)
+        tp2 = entry - 2*(stop - entry)
+    else:
+        stop, tp1, tp2 = entry, entry, entry
+
+    # Confidence score
+    conf = 0
+    if trend_long or trend_short: conf += 20
+    if mom_long or mom_short: conf += 20
+    if pullback_long or pullback_short: conf += 15
+    rr = 0.0
+    if direction != "flat":
+        rr = abs((tp2 - entry) / (entry - stop)) if entry != stop else 0.0
+        if rr >= 2.0: conf += 15
+    # Volatility regime
+    atr_pct = atr / entry * 100 if entry else 0
+    if 0.5 <= atr_pct <= 5: conf += 10
+
+    rationale = []
+    if direction == "long":
+        rationale += ["Price above rising 200 EMA" if trend_long else "200 EMA trend not confirmed",
+                      "RSI>55 & MACD>0" if mom_long else "Momentum mixed",
+                      "Pullback structure intact" if pullback_long else "No ideal pullback"]
+    elif direction == "short":
+        rationale += ["Price below falling 200 EMA" if trend_short else "200 EMA trend not confirmed",
+                      "RSI<45 & MACD<0" if mom_short else "Momentum mixed",
+                      "Pullback structure intact" if pullback_short else "No ideal pullback"]
+    else:
+        rationale.append("No aligned signals; staying flat")
+
+    return {
+        "direction": direction,
+        "entry": round(entry, 5),
+        "stop": round(stop, 5),
+        "take_profits": [round(tp1,5), round(tp2,5)],
+        "risk_reward": round(rr, 2),
+        "confidence": conf,
+        "rationale": rationale,
+        "indicators": {
+            "ema200": round(float(latest.ema200),5),
+            "rsi": round(float(latest.rsi),2),
+            "macd_hist": round(float(latest.macd_hist),4),
+            "atr": round(float(atr),5)
+        }
+    }
+
+
+def position_size(entry: float, stop: float, equity: float, risk_pct: float) -> float:
+    risk_amt = equity * (risk_pct/100.0)
+    risk_per_unit = abs(entry - stop)
+    if risk_per_unit <= 0:
+        return 0.0
+    return round(risk_amt / risk_per_unit, 6)
+
+
+@app.get("/analyze")
+def analyze(symbol: str, asset_type: str, tf: str = DEFAULT_TF, equity: float = 10000.0, risk_pct: float = 0.8, Authorization: Optional[str] = Header(None)):
+    require_auth(Authorization)
+    if asset_type == "crypto":
+        df = fetch_ohlcv_crypto(symbol, tf)
+    elif asset_type == "fx":
+        df = fetch_ohlcv_fx(symbol.replace(" ","/"), tf)
+    else:
+        raise HTTPException(400, "asset_type must be crypto or fx")
+
+    if len(df) < 200:
+        raise HTTPException(503, "Not enough data for indicators")
+
+    sig = compute_signals(df)
+    size_units = position_size(sig["entry"], sig["stop"], equity, risk_pct)
+    return {
+        "symbol": symbol,
+        "asset_type": asset_type,
+        "timeframe": tf,
+        "updated_at": pd.Timestamp.utcnow().isoformat(),
+        **sig,
+        "suggested_risk_pct": risk_pct,
+        "position_size_units": size_units,
+        "risk": {"account_equity": equity, "risk_amount": equity*(risk_pct/100.0)}
+    }
+
+@app.post("/batch")
+def batch(req: AnalyzeBatchRequest, Authorization: Optional[str] = Header(None)):
+    require_auth(Authorization)
     results = []
-    for ticker in tickers:
+    for item in req.items:
         try:
-            df_daily = compute_indicators(fetch_bars(ticker, "1d", "1y"))
-            df_1h = compute_indicators(fetch_bars(ticker, "60m", "60d"))
-            df_15m = compute_indicators(fetch_bars(ticker, "15m", "60d"))
-            df_1m = compute_indicators(fetch_bars(ticker, "1m", "7d"))
-
-            summary = summarize_structure(df_daily, df_1h, df_15m, df_1m)
-            trade = heuristic_analysis(ticker, capital, risk_percent, summary, df_1m)
-
-            if trade["entries"]:
-                e = trade["entries"][0]
-                risk_score = abs((e["entry_price"] - e["stop_loss"]) / e["entry_price"]) if e["stop_loss"] else 1
-                e["ticker"] = ticker
-                e["risk_score"] = round(risk_score, 4)
-                results.append(e)
-        except Exception as ex:
-            logger.error(f"Top5 error for {ticker}: {ex}")
-
-    if not results:
-        return jsonify({"trades": []})
-
-    trade_summaries = [
-        f"{t['ticker']} | {t['type'].upper()} | Entry: {t['entry_price']} | SL: {t['stop_loss']} | "
-        f"T1: {t['target_1']} | Risk Score: {t['risk_score']}"
-        for t in results
-    ]
-    prompt = (
-        "You are a professional trader assistant. Given these candidate trades:\n\n"
-        + "\n".join(trade_summaries)
-        + "\n\nRank the best 5 trades from safest (lowest risk) to most speculative. "
-          "Add a one-sentence rationale for each. Respond in JSON with this format:\n\n"
-          "{ \"trades\": [ { \"ticker\": ..., \"rank\": 1, \"risk_level\": ..., \"reason\": ... }, ... ] }"
-    )
-
-    ranked_json = None
-    used_model = None
-    openai_models = ["gpt-5", "gpt-4.1", "gpt-4", "gpt-3.5-turbo"]
-
-    for model in openai_models:
-        if OPENAI_KEY:
-            try:
-                resp = openai.chat.completions.create(
-                    model=model,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.3
-                )
-                ranked_json = json.loads(resp.choices[0].message.content)
-                used_model = model
-                logger.info(f"Top5 ranking succeeded with model {model}")
-                break
-            except Exception as e:
-                logger.warning(f"Model {model} failed for Top5: {e}")
-
-    if not ranked_json:
-        fallback_sorted = sorted(results, key=lambda x: x["risk_score"])[:5]
-        for t in fallback_sorted:
-            if t["risk_score"] < 0.01:
-                t["risk_level"] = "low"
-            elif t["risk_score"] < 0.03:
-                t["risk_level"] = "medium"
-            else:
-                t["risk_level"] = "high"
-            t["llm_reason"] = "Ranked heuristically by risk score (LLM unavailable)."
-        return jsonify({"trades": fallback_sorted})
-
-    ranked_trades = []
-    for item in ranked_json.get("trades", []):
-        match = next((t for t in results if t["ticker"] == item["ticker"]), None)
-        if match:
-            match["rank"] = item.get("rank")
-            match["risk_level"] = item.get("risk_level", "unknown")
-            match["llm_reason"] = item.get("reason", "")
-            ranked_trades.append(match)
-
-    return jsonify({"trades": sorted(ranked_trades, key=lambda x: x["rank"])[:5], "source": used_model})
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+            r = analyze(item.symbol, item.asset_type, item.timeframe, item.equity, item.risk_pct, Authorization=f"Bearer {SECRET}")
+            results.append(r)
+        except Exception as e:
+            results.append({"symbol": item.symbol, "error": str(e)})
+    return {"results": results}
