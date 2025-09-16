@@ -7,7 +7,7 @@ import ccxt
 import requests
 from typing import List, Optional, Dict
 
-SECRET = os.getenv("AI_TRADE_SECRET", "ScFcY5enmqPZ3HMGLKq21eoa57nrxj6x")
+SECRET = os.getenv("AI_TRADE_SECRET", "XxUjb7DilVuqcnmeLXmUCURndUzC4Vmf")
 DEFAULT_TF = "4h"
 
 app = FastAPI(title="AI Trade Advisor Backend")
