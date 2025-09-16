@@ -2,9 +2,6 @@ fastapi==0.115.0
 uvicorn[standard]==0.30.6
 pandas==2.2.2
 numpy==2.0.1
-# For real data + ML, add:
-# ccxt==4.3.89
-# scikit-learn==1.5.1
-# xgboost==2.1.1
-# SQLAlchemy==2.0.32
-# psycopg2-binary==2.9.9
+# LIVE mode (optional):
+ccxt==4.3.89
+requests==2.32.3
