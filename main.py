@@ -1,31 +1,36 @@
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
-import time, os, math
+import time, os
 import pandas as pd
 import pandas_ta as ta
 import ccxt
 import requests
 from typing import List, Optional, Dict, Tuple
 
-# ---------------------------
+# =========================
 # Config / constants
-# ---------------------------
-SECRET = os.getenv("AI_TRADE_SECRET", "")
+# =========================
+SECRET = os.getenv("AI_TRADE_SECRET", "XxUjb7DilVuqcnmeLXmUCURndUzC4Vmf")
 DEFAULT_TF = "4h"
 
-# FX providers
-ALPHA_VANTAGE_KEY = os.getenv("ALPHA_VANTAGE_KEY")  # primary
-TWELVE_DATA_KEY   = os.getenv("TWELVE_DATA_KEY")    # optional fallback
+# FX providers (set any subset; priority is OANDA -> AlphaVantage -> TwelveData)
+OANDA_API_KEY     = os.getenv("OANDA_API_KEY")          # required for OANDA
+OANDA_ENV         = (os.getenv("OANDA_ENV") or "practice").lower()  # "practice" | "live"
+ALPHA_VANTAGE_KEY = os.getenv("ALPHA_VANTAGE_KEY")      # optional fallback
+TWELVE_DATA_KEY   = os.getenv("TWELVE_DATA_KEY")        # optional fallback
 
 # Caching (in-memory)
-FX_CACHE_TTL_SEC = int(os.getenv("FX_CACHE_TTL_SEC", "300"))  # 5 minutes
-CRYPTO_CACHE_TTL_SEC = int(os.getenv("CRYPTO_CACHE_TTL_SEC", "60"))  # 1 minute
+FX_CACHE_TTL_SEC     = int(os.getenv("FX_CACHE_TTL_SEC", "300"))   # 5 min
+CRYPTO_CACHE_TTL_SEC = int(os.getenv("CRYPTO_CACHE_TTL_SEC", "60"))
+
+# OANDA endpoints
+OANDA_BASE = "https://api-fxtrade.oanda.com" if OANDA_ENV == "live" else "https://api-fxpractice.oanda.com"
 
 app = FastAPI(title="AI Trade Advisor Backend")
 
-# ---------------------------
+# =========================
 # Models
-# ---------------------------
+# =========================
 class AnalyzeRequest(BaseModel):
     symbol: str
     asset_type: str  # "crypto" or "fx"
@@ -36,9 +41,9 @@ class AnalyzeRequest(BaseModel):
 class AnalyzeBatchRequest(BaseModel):
     items: List[AnalyzeRequest]
 
-# ---------------------------
+# =========================
 # Auth
-# ---------------------------
+# =========================
 def require_auth(auth: Optional[str]):
     if not auth or not auth.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing auth")
@@ -46,9 +51,12 @@ def require_auth(auth: Optional[str]):
     if token != SECRET:
         raise HTTPException(status_code=403, detail="Invalid token")
 
-# ---------------------------
-# Utilities
-# ---------------------------
+# =========================
+# Utils
+# =========================
+def _now() -> float:
+    return time.time()
+
 def _first_col_startswith(df: pd.DataFrame, prefix: str) -> Optional[str]:
     if isinstance(df, pd.DataFrame):
         for c in df.columns:
@@ -81,41 +89,50 @@ def _macd_hist(close: pd.Series, fast=12, slow=26, signal=9) -> pd.Series:
     return pd.Series(index=close.index, dtype=float)
 
 def _resample(df: pd.DataFrame, tf: str) -> pd.DataFrame:
-    if tf.lower() in ("4h", "4hr", "240m"):
+    tfl = tf.lower()
+    if tfl in ("4h", "4hr", "240m"):
         rule = "4H"
-    elif tf.lower() in ("1h", "1hr", "60m"):
+    elif tfl in ("1h", "1hr", "60m"):
         rule = "1H"
-    elif tf.lower() in ("1d", "d", "day"):
+    elif tfl in ("1d", "d", "day"):
         rule = "1D"
     else:
-        return df  # return raw if unknown; callers supply correct interval upstream
+        return df
     return (
         df.resample(rule)
-          .agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"})
+          .agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
           .dropna()
     )
 
-def _now() -> float:
-    return time.time()
-
-def _http_get_json(url: str, timeout: int = 30, retries: int = 2, backoff_sec: float = 0.8) -> dict:
+def _http_get_json(url: str, timeout: int = 30, retries: int = 2, backoff_sec: float = 0.8, headers: Optional[Dict[str, str]] = None) -> dict:
     last_err = None
     for i in range(retries + 1):
         try:
-            r = requests.get(url, timeout=timeout, headers={"User-Agent":"ai-trade-advisor/1.0"})
-            if r.status_code >= 500:
-                last_err = f"HTTP {r.status_code}"
-            else:
-                return r.json()
+            r = requests.get(url, timeout=timeout, headers=headers or {"User-Agent": "ai-trade-advisor/1.0"})
+            # Prefer returning JSON even for 4xx to capture provider messages
+            data = {}
+            try:
+                data = r.json()
+            except Exception:
+                pass
+            if r.status_code < 400:
+                return data
+            # Bubble known rate limits
+            if r.status_code == 429:
+                msg = data.get("errorMessage") or data.get("message") or "Rate limited"
+                raise HTTPException(429, msg)
+            last_err = f"HTTP {r.status_code}: {data or r.text}"
+        except HTTPException:
+            raise
         except Exception as e:
             last_err = str(e)
         if i < retries:
             time.sleep(backoff_sec * (2 ** i))
     raise RuntimeError(f"GET failed: {last_err or 'unknown error'}")
 
-# ---------------------------
-# Health / instruments
-# ---------------------------
+# =========================
+# Health & instruments
+# =========================
 @app.get("/health")
 def health():
     return {"ok": True, "ts": int(time.time())}
@@ -139,16 +156,16 @@ def instruments():
         ]
     }
 
-# ---------------------------
+# =========================
 # Caches
-# ---------------------------
-_CRYPTO_CACHE: Dict[Tuple[str,str], Tuple[float, pd.DataFrame]] = {}
-_FX_CACHE: Dict[Tuple[str,str,str], Tuple[float, pd.DataFrame]] = {}
-# keys: (provider, pair, timeframe)
+# =========================
+_CRYPTO_CACHE: Dict[Tuple[str, str], Tuple[float, pd.DataFrame]] = {}
+_FX_CACHE: Dict[Tuple[str, str, str], Tuple[float, pd.DataFrame]] = {}  # (provider, pair, tf)
 
 def _get_cache(cache: dict, key: tuple, ttl: int) -> Optional[pd.DataFrame]:
     hit = cache.get(key)
-    if not hit: return None
+    if not hit:
+        return None
     ts, df = hit
     if _now() - ts <= ttl:
         return df.copy()
@@ -157,39 +174,86 @@ def _get_cache(cache: dict, key: tuple, ttl: int) -> Optional[pd.DataFrame]:
 def _set_cache(cache: dict, key: tuple, df: pd.DataFrame):
     cache[key] = (_now(), df.copy())
 
-# ---------------------------
+# =========================
 # Data fetchers
-# ---------------------------
+# =========================
 def fetch_ohlcv_crypto(symbol: str, timeframe: str) -> pd.DataFrame:
-    cache_key = (symbol, timeframe)
-    cached = _get_cache(_CRYPTO_CACHE, cache_key, CRYPTO_CACHE_TTL_SEC)
+    ck = (symbol, timeframe)
+    cached = _get_cache(_CRYPTO_CACHE, ck, CRYPTO_CACHE_TTL_SEC)
     if cached is not None:
         return cached
-
     ex = ccxt.binance({"enableRateLimit": True})
-    # Map common tf strings
-    tf_map = {"4h":"4h","1h":"1h","1d":"1d","d":"1d"}
+    tf_map = {"4h": "4h", "1h": "1h", "1d": "1d", "d": "1d"}
     tf = tf_map.get(timeframe.lower(), timeframe)
     ohlcv = ex.fetch_ohlcv(symbol, timeframe=tf, limit=400)
-    df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"]).set_index("ts")
+    df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"]).set_index("ts")
     df.index = pd.to_datetime(df.index, unit="ms", utc=True)
-    _set_cache(_CRYPTO_CACHE, cache_key, df)
+    _set_cache(_CRYPTO_CACHE, ck, df)
     return df
+
+def _fx_pair_to_oanda(pair: str) -> str:
+    # "EUR/USD" -> "EUR_USD"
+    return pair.replace("/", "_").upper()
+
+def _oanda_fx(pair: str, timeframe: str) -> pd.DataFrame:
+    if not OANDA_API_KEY:
+        raise HTTPException(500, "OANDA_API_KEY not set")
+    instrument = _fx_pair_to_oanda(pair)
+    tf = timeframe.lower()
+    gran_map = {"1h": "H1", "4h": "H4", "1d": "D", "d": "D"}
+    gran = gran_map.get(tf, "H4")  # default H4
+    url = (
+        f"{OANDA_BASE}/v3/instruments/{instrument}/candles"
+        f"?granularity={gran}&count=2000&price=M"  # mid prices
+    )
+    headers = {
+        "Authorization": f"Bearer {OANDA_API_KEY}",
+        "Accept": "application/json",
+        "User-Agent": "ai-trade-advisor/1.0"
+    }
+    data = _http_get_json(url, headers=headers, timeout=30, retries=2)
+    if "candles" not in data:
+        msg = data.get("errorMessage") or data.get("message") or "OANDA returned no candles"
+        raise HTTPException(502, msg)
+
+    rows = []
+    for c in data["candles"]:
+        # skip incomplete last candle
+        if not c.get("complete", False):
+            continue
+        t = pd.to_datetime(c["time"], utc=True)
+        mid = c.get("mid") or {}
+        try:
+            o = float(mid["o"]); h = float(mid["h"]); l = float(mid["l"]); cl = float(mid["c"])
+        except Exception:
+            # fall back if price=B/A someday
+            bid = c.get("bid") or {}
+            ask = c.get("ask") or {}
+            o = (float(bid.get("o", 0)) + float(ask.get("o", 0))) / 2.0
+            h = (float(bid.get("h", 0)) + float(ask.get("h", 0))) / 2.0
+            l = (float(bid.get("l", 0)) + float(ask.get("l", 0))) / 2.0
+            cl = (float(bid.get("c", 0)) + float(ask.get("c", 0))) / 2.0
+        vol = float(c.get("volume", 0))
+        rows.append((t, o, h, l, cl, vol))
+    if not rows:
+        raise HTTPException(502, "OANDA returned empty candles (after filtering incomplete)")
+    df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"]).set_index("ts")
+    df = df.sort_index()
+    return df.tail(1000)
 
 def _alpha_vantage_fx(pair: str, timeframe: str) -> pd.DataFrame:
     if not ALPHA_VANTAGE_KEY:
         raise HTTPException(500, "ALPHA_VANTAGE_KEY not set")
     base, quote = pair.split("/")
-    if timeframe.lower() in ("1h","4h"):
-        interval = "60min"  # request 60min and resample for 4h
+    if timeframe.lower() in ("1h", "4h"):
+        interval = "60min"  # request 60m then resample to 4h if needed
         url = (
             "https://www.alphavantage.co/query"
             f"?function=FX_INTRADAY&from_symbol={base}&to_symbol={quote}"
             f"&interval={interval}&apikey={ALPHA_VANTAGE_KEY}&outputsize=compact"
         )
-        data = _http_get_json(url)
+        data = _http_get_json(url, timeout=30, retries=2)
         if "Note" in data:
-            # Rate limited
             raise HTTPException(429, data["Note"])
         if "Error Message" in data:
             raise HTTPException(502, data["Error Message"])
@@ -200,7 +264,7 @@ def _alpha_vantage_fx(pair: str, timeframe: str) -> pd.DataFrame:
             f"?function=FX_DAILY&from_symbol={base}&to_symbol={quote}"
             f"&apikey={ALPHA_VANTAGE_KEY}&outputsize=compact"
         )
-        data = _http_get_json(url)
+        data = _http_get_json(url, timeout=30, retries=2)
         if "Note" in data:
             raise HTTPException(429, data["Note"])
         if "Error Message" in data:
@@ -213,7 +277,7 @@ def _alpha_vantage_fx(pair: str, timeframe: str) -> pd.DataFrame:
 
     df = (
         pd.DataFrame.from_dict(ts, orient="index")
-          .rename(columns={"1. open":"open","2. high":"high","3. low":"low","4. close":"close"})
+          .rename(columns={"1. open": "open", "2. high": "high", "3. low": "low", "4. close": "close"})
           .astype(float)
     )
     df.index = pd.to_datetime(df.index, utc=True)
@@ -225,100 +289,102 @@ def _alpha_vantage_fx(pair: str, timeframe: str) -> pd.DataFrame:
 
 def _twelve_data_fx(pair: str, timeframe: str) -> pd.DataFrame:
     if not TWELVE_DATA_KEY:
-        raise HTTPException(502, "Twelve Data fallback not configured")
-    # Twelve Data symbols look like "EUR/USD"
-    interval = "60min" if timeframe.lower() in ("1h","4h") else "1day"
-    # Big outputsize for intraday; TD caps free tier but still ok
+        raise HTTPException(500, "TWELVE_DATA_KEY not set")
+    interval = "60min" if timeframe.lower() in ("1h", "4h") else "1day"
     url = (
         "https://api.twelvedata.com/time_series"
         f"?symbol={pair}&interval={interval}&outputsize=5000&apikey={TWELVE_DATA_KEY}&format=JSON"
     )
-    data = _http_get_json(url)
-    if "status" in data and data["status"] == "error":
-        raise HTTPException(502, f"Twelve Data error: {data.get('message','unknown')}")
+    data = _http_get_json(url, timeout=30, retries=2)
+    if data.get("status") == "error":
+        raise HTTPException(502, data.get("message", "Twelve Data error"))
     values = data.get("values")
     if not values:
         raise HTTPException(502, "Twelve Data returned no values")
-
-    # values is list of dicts newest-first; normalize to OHLC
     df = pd.DataFrame(values)
-    # Expected keys: datetime, open, high, low, close, volume (volume may be None for FX)
-    for col in ["open","high","low","close"]:
-        df[col] = df[col].astype(float)
     df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
+    for col in ["open", "high", "low", "close"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
     df = df.set_index("datetime").sort_index()
-    if "volume" not in df.columns:
-        df["volume"] = 0.0
+    if "volume" in df.columns:
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0)
     else:
-        # Some FX volumes are empty strings
-        with pd.option_context("mode.use_inf_as_na", True):
-            df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0)
-
+        df["volume"] = 0.0
     if timeframe.lower() == "4h" and interval == "60min":
         df = _resample(df, "4h")
     return df.tail(1000)
 
 def fetch_ohlcv_fx(pair: str, timeframe: str) -> pd.DataFrame:
     """
-    FX fetcher with cache + fallback:
-    1) Alpha Vantage (if configured)
-    2) Twelve Data (if configured)
-    Serve cached data when provider is rate-limited.
+    FX data with provider priority + cache + stale-if-error:
+    1) OANDA (if configured)
+    2) Alpha Vantage (if configured)
+    3) Twelve Data (if configured)
     """
-    # Cache key includes provider so we can hold both
-    cache_key_av = ("alpha_vantage", pair, timeframe)
-    cache_key_td = ("twelve_data", pair, timeframe)
-
     # Serve fresh cache first (any provider)
-    cached = _get_cache(_FX_CACHE, cache_key_av, FX_CACHE_TTL_SEC) or _get_cache(_FX_CACHE, cache_key_td, FX_CACHE_TTL_SEC)
+    ck_oanda = ("oanda", pair, timeframe)
+    ck_av    = ("alpha_vantage", pair, timeframe)
+    ck_td    = ("twelve_data", pair, timeframe)
+    cached = (
+        _get_cache(_FX_CACHE, ck_oanda, FX_CACHE_TTL_SEC)
+        or _get_cache(_FX_CACHE, ck_av, FX_CACHE_TTL_SEC)
+        or _get_cache(_FX_CACHE, ck_td, FX_CACHE_TTL_SEC)
+    )
     if cached is not None:
         return cached
 
-    # Try Alpha Vantage
+    # OANDA first
+    if OANDA_API_KEY:
+        try:
+            df = _oanda_fx(pair, timeframe)
+            _set_cache(_FX_CACHE, ck_oanda, df)
+            return df
+        except HTTPException as e:
+            # keep going to fallbacks; serve stale if any
+            stale = _FX_CACHE.get(ck_oanda)
+            if stale:
+                return stale[1].copy()
+            if e.status_code == 429:
+                # hard rate limit; try next providers
+                pass
+            elif e.status_code >= 500:
+                pass
+            else:
+                # For 4xx other than rate limit, still try fallbacks
+                pass
+
+    # Alpha Vantage fallback
     if ALPHA_VANTAGE_KEY:
         try:
             df = _alpha_vantage_fx(pair, timeframe)
-            _set_cache(_FX_CACHE, cache_key_av, df)
+            _set_cache(_FX_CACHE, ck_av, df)
             return df
         except HTTPException as e:
-            # If rate-limited, try fallback (if available) or serve stale-if-present
-            if e.status_code == 429 and TWELVE_DATA_KEY:
-                try:
-                    df = _twelve_data_fx(pair, timeframe)
-                    _set_cache(_FX_CACHE, cache_key_td, df)
-                    return df
-                except HTTPException:
-                    pass
-            # Stale-if-error: serve any stale cache if present
-            stale_av = _FX_CACHE.get(cache_key_av)
-            if stale_av:
-                return stale_av[1].copy()
-            stale_td = _FX_CACHE.get(cache_key_td)
-            if stale_td:
-                return stale_td[1].copy()
-            raise  # no cache to fall back to: bubble up
+            stale = _FX_CACHE.get(ck_av)
+            if stale:
+                return stale[1].copy()
+            if e.status_code != 429:
+                pass  # proceed to next
 
-    # No AV or it failed, try Twelve Data if configured
+    # Twelve Data fallback
     if TWELVE_DATA_KEY:
         try:
             df = _twelve_data_fx(pair, timeframe)
-            _set_cache(_FX_CACHE, cache_key_td, df)
+            _set_cache(_FX_CACHE, ck_td, df)
             return df
-        except HTTPException:
-            stale_td = _FX_CACHE.get(cache_key_td)
-            if stale_td:
-                return stale_td[1].copy()
-            raise
+        except HTTPException as e:
+            stale = _FX_CACHE.get(ck_td)
+            if stale:
+                return stale[1].copy()
+            raise e
 
-    # No provider available
     raise HTTPException(502, "No FX provider configured or providers unavailable")
 
-# ---------------------------
-# Signal engine
-# ---------------------------
+# =========================
+# Signals
+# =========================
 def compute_signals(df: pd.DataFrame) -> Dict:
     df = df.copy()
-    # Core indicators
     df["ema20"]  = ta.ema(df["close"], length=20)
     df["ema50"]  = ta.ema(df["close"], length=50)
     df["ema200"] = ta.ema(df["close"], length=200)
@@ -334,7 +400,7 @@ def compute_signals(df: pd.DataFrame) -> Dict:
 
     latest = df_ready.iloc[-1]
 
-    # Trend filter
+    # Trend
     trend_long  = latest.close > latest.ema200 and latest.ema50 > latest.ema200
     trend_short = latest.close < latest.ema200 and latest.ema50 < latest.ema200
 
@@ -383,7 +449,6 @@ def compute_signals(df: pd.DataFrame) -> Dict:
     if 0.5 <= atr_pct <= 5:
         conf += 10
 
-    # Rationale
     rationale = []
     if direction == "long":
         rationale += [
@@ -416,19 +481,19 @@ def compute_signals(df: pd.DataFrame) -> Dict:
         },
     }
 
-# ---------------------------
+# =========================
 # Risk / sizing
-# ---------------------------
+# =========================
 def position_size(entry: float, stop: float, equity: float, risk_pct: float) -> float:
-    risk_amt = equity * (risk_pct/100.0)
+    risk_amt = equity * (risk_pct / 100.0)
     risk_per_unit = abs(entry - stop)
     if risk_per_unit <= 0:
         return 0.0
     return round(risk_amt / risk_per_unit, 6)
 
-# ---------------------------
-# API routes
-# ---------------------------
+# =========================
+# Routes
+# =========================
 @app.get("/analyze")
 def analyze(
     symbol: str,
@@ -447,7 +512,6 @@ def analyze(
     else:
         raise HTTPException(400, "asset_type must be crypto or fx")
 
-    # Need enough history for EMA200 etc.
     if len(df.dropna()) < 150:
         raise HTTPException(503, "Not enough data for indicators")
 
