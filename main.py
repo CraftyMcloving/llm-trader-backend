@@ -198,7 +198,6 @@ def build_trade(symbol: str, df: pd.DataFrame, direction: str,
         },
         "precision": mkt.get("precision", {})
     }
-}
 
 def infer_signal(feats: pd.DataFrame, min_conf: float) -> Tuple[str,float,Dict[str,bool],List[str]]:
     last = feats.iloc[-1]; reasons=[]
