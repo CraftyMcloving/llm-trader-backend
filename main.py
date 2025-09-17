@@ -17,13 +17,13 @@ CACHE_TTL_SEC = int(os.getenv("CACHE_TTL_SEC", "1800"))
 # Curated list (ordered) – will be tried first, in this exact order:
 CURATED_BASES = [b.strip().upper() for b in os.getenv(
     "CURATED_BASES",
-    "BTC,XRP,ETH,SOL,ADA,HYPE,USDT,BNB,USDC,DOGE,STETH,TRX,LINK,XLM"
+    "BTC,XRP,ETH,SOL,ADA,HYPE,USDT,BNB,USDC,DOGE,STETH,TRX,LINK,XLM,WBTC,SUI,AVAX,BCH,LTC,CRO,TON,USDS,DOT,XMR,MNT,UNI"
 ).split(",") if b.strip()]
 
 # When a base doesn’t have QUOTE on this exchange, we’ll try these quotes in order:
 QUOTE_FALLBACKS = [q.strip().upper() for q in os.getenv(
     "QUOTE_FALLBACKS",
-    f"{QUOTE},USD,USDT,USDC,EUR,USDE,SUI,AVAX,HBAR,WETH"
+    f"{QUOTE},USD,USDT,USDC,EUR,USDE,HBAR,WETH"
 ).split(",") if q.strip()]
 
 
@@ -59,6 +59,36 @@ def first_supported_symbol(markets: dict, base: str, quote_priority: list[str]) 
         if sym in markets and markets[sym].get("spot", True) and not markets[sym].get("contract"):
             return sym
     return None
+    
+def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
+    prev_close = df["close"].shift(1)
+    tr = pd.concat([
+        (df["high"] - df["low"]).abs(),
+        (df["high"] - prev_close).abs(),
+        (df["low"]  - prev_close).abs()
+    ], axis=1).max(axis=1)
+    return tr.rolling(n).mean()
+
+def recent_extrema(series: pd.Series, lookback: int = 10) -> tuple[float, float]:
+    # exclude the current bar for structure
+    window = series.iloc[-(lookback+1):-1]
+    return float(window.min()), float(window.max())
+
+def compute_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["ret1"] = df["close"].pct_change()
+    df["ret5"] = df["close"].pct_change(5)
+    df["sma20"] = df["close"].rolling(20).mean()
+    df["sma50"] = df["close"].rolling(50).mean()
+    df["sma20_50_diff"] = (df["sma20"] - df["sma50"]) / (df["sma50"] + 1e-12)
+    df["rsi14"] = rsi(df["close"], 14)
+    up, dn = bollinger(df["close"], 20, 2)
+    df["bb_up"], df["bb_dn"] = up, dn
+    df["bb_pos"] = (df["close"] - df["bb_dn"]) / ((df["bb_up"] - df["bb_dn"]) + 1e-12)
+    df["atr14"] = atr(df, 14)
+    df["atr14_pct"] = df["atr14"] / (df["close"].abs() + 1e-12)
+    return df
+
 
 def curated_universe(ex, markets, bases: list[str], quote_priority: list[str]) -> list[dict]:
     out = []
@@ -114,6 +144,59 @@ def require_key(authorization: Optional[str] = Header(None)):
     token = authorization.split(" ", 1)[1].strip()
     if token != API_KEY:
         raise HTTPException(status_code=403, detail="Invalid token")
+        
+# ---- Interface ----
+def build_trade(df: pd.DataFrame, direction: str, risk_pct: float = 1.0, equity: Optional[float] = None, leverage: float = 1.0) -> Optional[Dict[str, Any]]:
+    if direction not in ("Long", "Short"):
+        return None
+    last = df.iloc[-1]
+    px   = float(last["close"])
+    a    = float(last["atr14"])
+    if not np.isfinite(a) or a <= 0:  # safety
+        return None
+
+    # structure levels
+    recent_low, recent_high = recent_extrema(df["low"], 10)[0], recent_extrema(df["high"], 10)[1]
+    if direction == "Long":
+        base_sl   = px - 1.5*a
+        struct_sl = recent_low - 0.2*a
+        stop      = min(base_sl, struct_sl)
+        R         = px - stop
+        tps       = [px + k*R for k in (1, 2, 3)]
+    else:
+        base_sl   = px + 1.5*a
+        struct_sl = recent_high + 0.2*a
+        stop      = max(base_sl, struct_sl)
+        R         = stop - px
+        tps       = [px - k*R for k in (1, 2, 3)]
+
+    if R <= 0 or not np.isfinite(R):
+        return None
+
+    trade = {
+        "direction": direction,
+        "entry": px,
+        "stop": float(stop),
+        "targets": [float(t) for t in tps],
+        "rr": [1.0, 2.0, 3.0],               # TP multiples
+        "volatility": {"atr": a, "atr_pct": float(last["atr14_pct"])},
+        "risk_model": {"suggested_risk_pct": risk_pct, "leverage": leverage},
+    }
+
+    # Optional position sizing if equity provided (risk-based sizing)
+    if equity and equity > 0:
+        risk_amt = float(equity) * (risk_pct/100.0)
+        risk_per_unit = R  # quoted in quote currency per 1 base
+        qty = max(risk_amt / (risk_per_unit + 1e-12), 0.0)
+        notional = qty * px / max(leverage, 1.0)
+        trade["position_size"] = {
+            "equity": float(equity),
+            "risk_amount": risk_amt,
+            "qty": float(qty),            # base units
+            "notional": float(notional),  # quote currency
+        }
+    return trade
+
 
 # ---- App ----
 app = FastAPI(title="AI Trade Advisor", version="1.1.0")
@@ -365,13 +448,39 @@ def debug_universe(_: None = Depends(require_key)):
 def instruments(_: None = Depends(require_key)):
     return get_universe()
 
+from fastapi import Query
+
 @app.get("/signals", response_model=Signal)
-def signals(symbol: str, tf: str = "1h", _: None = Depends(require_key)):
+def signals(
+    symbol: str,
+    tf: str = "1h",
+    risk_pct: float = Query(1.0, ge=0.1, le=5.0),
+    equity: Optional[float] = Query(None, ge=0.0),
+    leverage: float = Query(1.0, ge=1.0, le=10.0),
+    _: None = Depends(require_key)
+):
     key = (symbol, tf)
     now = time.time()
     cached = STATE["signal_cache"].get(key)
-    if cached and now - cached["at"] < 300:  # 5m
-        return cached["payload"]
+    if cached and now - cached["at"] < 300:  # 5m cache
+        payload = cached["payload"]
+        # enrich on the fly with requested risk params (doesn't break cache)
+        if "trade" not in payload or payload["trade"] is None:
+            pass  # rebuild below
+        else:
+            # if user passed equity/risk, recompute position sizing
+            if equity is not None:
+                tr = payload["trade"]
+                # rebuild position size only, preserving levels
+                entry, stop = tr["entry"], tr["stop"]
+                R = abs(entry - stop)
+                risk_amt = float(equity) * (risk_pct/100.0)
+                qty = max(risk_amt / (R + 1e-12), 0.0)
+                notional = qty * entry / max(leverage, 1.0)
+                tr["risk_model"]["suggested_risk_pct"] = risk_pct
+                tr["risk_model"]["leverage"] = leverage
+                tr["position_size"] = {"equity": float(equity), "risk_amount": risk_amt, "qty": float(qty), "notional": float(notional)}
+            return payload
 
     df = fetch_ohlcv(symbol, tf)
     df = compute_features(df).dropna()
@@ -380,6 +489,11 @@ def signals(symbol: str, tf: str = "1h", _: None = Depends(require_key)):
 
     pred = rule_inference(df)
     feats = df.iloc[-1]
+
+    # direction from score/label
+    direction = "Long" if pred["signal"] == "Bullish" else "Short" if pred["signal"] == "Bearish" else "Neutral"
+    trade = build_trade(df, direction, risk_pct=risk_pct, equity=equity, leverage=leverage)
+
     payload = {
         "symbol": symbol,
         "timeframe": tf,
@@ -391,7 +505,10 @@ def signals(symbol: str, tf: str = "1h", _: None = Depends(require_key)):
             "sma20_50_diff": float(feats["sma20_50_diff"]),
             "bb_pos": float(feats["bb_pos"]),
             "ret5": float(feats["ret5"]),
-        }
+            "atr14": float(feats["atr14"]),
+            "atr14_pct": float(feats["atr14_pct"]),
+        },
+        "trade": trade
     }
     STATE["signal_cache"][key] = {"at": now, "payload": payload}
     return payload
@@ -417,8 +534,6 @@ def refresh(_: None = Depends(require_key)):
     STATE["universe_debug"].update({"path": "manual_refresh", "supported_count": 0, "last_error": None})
     uni = get_universe()
     return {"ok": True, "universe": len(uni)}
-
-# --- Add to app/main.py ---
 
 from fastapi import Query
 
