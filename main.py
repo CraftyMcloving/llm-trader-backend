@@ -416,6 +416,7 @@ def _safe_float(series, key):
     return float(v) if v is not None and np.isfinite(v) else None
 
 @app.get("/signals", response_model=SignalOut)
+@app.get("/signals", response_model=SignalOut)
 def signals(
     symbol: str,
     tf: str = "1h",
@@ -423,13 +424,15 @@ def signals(
     risk_pct: float = Query(1.0, ge=0.1, le=5.0),
     equity: Optional[float] = Query(None, ge=0.0),
     leverage: float = Query(1.0, ge=1.0, le=10.0),
-    # NEW: filter overrides from the UI (all optional)
-    min_confidence: Optional[float] = Query(None),   # e.g. 0.12
-    vol_cap: Optional[float] = Query(None),          # e.g. 0.10  (10% ATR)
-    vol_min: Optional[float] = Query(None),          # e.g. 0.002 (0.2% ATR)
-    allow_neutral: int = Query(0, ge=0, le=1),       # 1 => nudge neutral to long/short by SMA20 slope
-    ignore_trend: int = Query(0, ge=0, le=1),        # 1 => skip trend filter
-    ignore_vol: int = Query(0, ge=0, le=1),          # 1 => skip volatility filter
+    # overrides
+    min_confidence: Optional[float] = Query(None),
+    vol_cap: Optional[float] = Query(None),
+    vol_min: Optional[float] = Query(None),
+    allow_neutral: int = Query(0, ge=0, le=1),
+    ignore_trend: int = Query(0, ge=0, le=1),
+    ignore_vol: int = Query(0, ge=0, le=1),
+    # NEW: always build a plan even if filters fail
+    force: int = Query(0, ge=0, le=1),
     _: None = Depends(require_key)
 ):
     key = (symbol, tf)
@@ -442,6 +445,7 @@ def signals(
     IGN_TREND = bool(ignore_trend)
     IGN_VOL   = bool(ignore_vol)
     ALLOW_NEU = bool(allow_neutral)
+    FORCE     = bool(force)
 
     cached = STATE["signal_cache"].get(key)
     if cached and now - cached["at"] < 300:
@@ -466,14 +470,13 @@ def signals(
     pred = rule_inference(df)
     feats = df.iloc[-1]
 
-    # possibly nudge neutrals by SMA20 slope when allowed
     if pred["signal"] == "Neutral" and ALLOW_NEU:
         slope = (df["sma20"].iloc[-1] - df["sma20"].iloc[-5]) if df["sma20"].notna().tail(5).all() else 0.0
         direction = "Long" if slope >= 0 else "Short"
     else:
         direction = "Long" if pred["signal"] == "Bullish" else "Short" if pred["signal"] == "Bearish" else "Neutral"
 
-    # filters
+    # ---- Filters ----
     filters = {"trend_ok": True, "vol_ok": True, "confidence_ok": True, "reasons": []}
 
     if not IGN_TREND:
@@ -501,14 +504,18 @@ def signals(
         filters["confidence_ok"] = False
         filters["reasons"].append(f"Confidence {pred['confidence']:.2f} < {MINC:.2f}")
 
+    # ---- Decide & (maybe) build trade ----
+    pass_ok = (direction != "Neutral") and filters["confidence_ok"] and ((filters["trend_ok"] or IGN_TREND) and (filters["vol_ok"] or IGN_VOL))
+
     trade = None
-    advice = "Consider"
-    if direction == "Neutral" or not (filters["trend_ok"] or IGN_TREND) or not (filters["vol_ok"] or IGN_VOL) or not filters["confidence_ok"]:
-        advice = "Skip"
-    else:
+    if pass_ok or FORCE:
+        # if forced and still neutral, nudge by slope to pick a direction
+        if direction == "Neutral":
+            slope = (df["sma20"].iloc[-1] - df["sma20"].iloc[-5]) if df["sma20"].notna().tail(5).all() else 0.0
+            direction = "Long" if slope >= 0 else "Short"
         trade = build_trade(df, direction, risk_pct=risk_pct, equity=equity, leverage=leverage)
-        if trade is None:
-            advice = "Skip"
+
+    advice = "Consider" if pass_ok and trade else ("Draft" if FORCE and trade else "Skip")
 
     payload = {
         "symbol": symbol,
