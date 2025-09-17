@@ -793,3 +793,14 @@ def scan(
 
     return {"universe": len(uni), "note": note, "results": out}
 
+@app.post("/admin/warmup")
+def warmup(_: None = Depends(require_key)):
+    uni = get_universe()
+    for it in uni:
+        try: 
+            fetch_ohlcv(it["symbol"], "1h")
+            fetch_ohlcv(it["symbol"], "1d")
+        except Exception:
+            pass
+    return {"ok": True, "universe": len(uni)}
+
