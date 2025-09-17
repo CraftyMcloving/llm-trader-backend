@@ -60,7 +60,8 @@ def cache_set(key, data): CACHE[key] = (time.time(), data)
 CURATED = [
     "BTC","ETH","XRP","SOL","ADA","DOGE","LINK","LTC","BCH","TRX",
     "DOT","ATOM","XLM","ETC","MATIC","UNI","APT","ARB","OP","AVAX",
-    "NEAR","ALGO","FIL","SUI","SHIB"
+    "NEAR","ALGO","FIL","SUI","SHIB","USDC","USDT","XMR","AAVE"
+    ,"PAXG","ONDO","PEPE","SEI","IMX","FIL","TIA"
 ]
 def get_universe(quote=QUOTE, limit=TOP_N) -> List[Dict[str, Any]]:
     key = f"uni:{EXCHANGE_ID}:{quote}:{limit}"
@@ -234,22 +235,62 @@ def infer_signal(feats: pd.DataFrame, min_conf: float) -> Tuple[str,float,Dict[s
     return sig, conf, {"trend_ok":trend_ok,"vol_ok":vol_ok,"confidence_ok":conf>=min_conf}, reasons
 
 # ----- Pure helper used by both endpoints -----
-def evaluate_signal(symbol: str, tf: str, risk_pct: float, equity: Optional[float],
-                    leverage: float, min_confidence: Optional[float]) -> Dict[str, Any]:
+def evaluate_signal(
+    symbol: str,
+    tf: str,
+    risk_pct: float,
+    equity: Optional[float],
+    leverage: float,
+    min_confidence: Optional[float],
+    ignore_trend: bool = False,
+    ignore_vol: bool = False,
+    allow_neutral: bool = False,
+) -> Dict[str, Any]:
     df = fetch_ohlcv(symbol, tf, bars=400)
     feats = compute_features(df).dropna().iloc[-200:]
     if len(feats) < 50:
         raise HTTPException(502, detail="insufficient features window")
+
     thresh = min_confidence if (min_confidence is not None) else MIN_CONFIDENCE
     sig, conf, filt, reasons = infer_signal(feats, thresh)
-    trade = None; advice = "Skip"
-    if sig in ("Bullish","Bearish") and conf>=thresh and filt["vol_ok"]:
-        trade = build_trade(symbol, feats, "Long" if sig=="Bullish" else "Short", risk_pct, equity, leverage)
+
+    # Apply client relax flags to filters/reasons
+    if ignore_trend:
+        filt["trend_ok"] = True
+        reasons = [r for r in reasons if "trend" not in r.lower()]
+    if ignore_vol:
+        filt["vol_ok"] = True
+        reasons = [r for r in reasons if "atr%" not in r.lower() and "vol" not in r.lower()]
+
+    trade = None
+    advice = "Skip"
+
+    # Direction gate: allow neutral if requested (choose side from slope/RSI/bb_pos)
+    directional_ok = (sig in ("Bullish", "Bearish")) or allow_neutral
+    if conf >= thresh and filt["vol_ok"] and directional_ok:
+        if sig == "Bullish":
+            direction = "Long"
+        elif sig == "Bearish":
+            direction = "Short"
+        else:
+            # pick a side for neutral
+            slope = float(feats["slope20"].iloc[-1])
+            rsi14 = float(feats["rsi14"].iloc[-1])
+            bbpos = float(feats["bb_pos"].iloc[-1])
+            direction = "Long" if (slope >= 0 or rsi14 >= 50 or bbpos >= 0) else "Short"
+
+        trade = build_trade(symbol, feats, direction, risk_pct, equity, leverage)
         advice = "Consider"
+
     return {
-        "symbol": symbol, "timeframe": tf, "signal": sig, "confidence": conf,
-        "updated": pd.Timestamp.utcnow().isoformat(), "trade": trade,
-        "filters": {**filt, "reasons": reasons}, "advice": advice
+        "symbol": symbol,
+        "timeframe": tf,
+        "signal": sig,
+        "confidence": conf,
+        "updated": pd.Timestamp.utcnow().isoformat(),
+        "trade": trade,
+        "filters": {**filt, "reasons": reasons},
+        "advice": advice,
     }
 
 # ----- Schemas (light) -----
@@ -279,7 +320,7 @@ def signals(
     tf: str = "1h",
     risk_pct: float = Query(1.0, ge=0.1, le=5.0),
     equity: Optional[float] = Query(None, ge=0),
-    leverage: float = Query(1.0, ge=1.0, le=10.0),
+    leverage: float = Query(1.0, ge=1.0, le=100.0),
     min_confidence: Optional[float] = Query(None),
     _: None = Depends(require_key)
 ):
@@ -298,25 +339,26 @@ def scan(
     min_confidence: Optional[float] = Query(None),
     auto_relax: int = Query(1, ge=0, le=1),
     allow_neutral: int = Query(1, ge=0, le=1),
+    ignore_trend: int = Query(0, ge=0, le=1),   # NEW
+    ignore_vol: int = Query(0, ge=0, le=1),     # NEW
     risk_pct: float = Query(1.0, ge=0.1, le=5.0),
     equity: Optional[float] = Query(None, ge=0.0),
-    leverage: float = Query(1.0, ge=1.0, le=10.0),
+    leverage: float = Query(1.0, ge=1.0, le=100.0),   # raised cap
     include_chart: int = Query(1, ge=0, le=1),
     _: None = Depends(require_key)
 ):
-    # build universe
     uni = get_universe(limit=limit)
-
-    # pull signals
-    results: List[Dict[str, Any]] = []
-    ok: List[Dict[str, Any]] = []
+    results, ok = [], []
 
     for it in uni:
         try:
             s = evaluate_signal(
                 symbol=it["symbol"], tf=tf,
                 risk_pct=risk_pct, equity=equity, leverage=leverage,
-                min_confidence=min_confidence
+                min_confidence=min_confidence,
+                ignore_trend=bool(ignore_trend),
+                ignore_vol=bool(ignore_vol),
+                allow_neutral=bool(allow_neutral),
             )
             s["market"] = it["market"]
             if s["advice"] == "Consider":
@@ -326,18 +368,19 @@ def scan(
             results.append({
                 "symbol": it["symbol"], "timeframe": tf, "signal": "Neutral",
                 "confidence": 0.0, "updated": pd.Timestamp.utcnow().isoformat(),
-                "trade": None, "filters": {"trend_ok": False, "vol_ok": False, "confidence_ok": False,
-                                           "reasons": [he.detail]},
+                "trade": None,
+                "filters": {"trend_ok": False, "vol_ok": False, "confidence_ok": False, "reasons": [he.detail]},
                 "advice": "Skip", "market": it["market"]
             })
         except Exception as e:
             results.append({
                 "symbol": it["symbol"], "timeframe": tf, "signal": "Neutral",
                 "confidence": 0.0, "updated": pd.Timestamp.utcnow().isoformat(),
-                "trade": None, "filters": {"trend_ok": False, "vol_ok": False, "confidence_ok": False,
-                                           "reasons": [f"exception: {e}"]},
+                "trade": None,
+                "filters": {"trend_ok": False, "vol_ok": False, "confidence_ok": False, "reasons": [f"exception: {e}"]},
                 "advice": "Skip", "market": it["market"]
             })
+    # ... (rest of your /scan stays the same)
 
     # choose pool
     pool = ok if ok else results
