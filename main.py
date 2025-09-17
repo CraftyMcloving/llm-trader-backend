@@ -146,9 +146,6 @@ VOL_MIN_ATR_PCT    = float(os.getenv("VOL_MIN_ATR_PCT", "0.001"))
 
 def build_trade(symbol: str, df: pd.DataFrame, direction: str,
                 risk_pct: float = 1.0, equity: Optional[float] = None, leverage: float = 1.0) -> Dict[str, Any]:
-    """
-    Builds a trade plan and rounds price/qty to the exchange's precision for `symbol`.
-    """
     ex = get_exchange()
     markets = load_markets()
     mkt = markets.get(symbol, {})
@@ -159,7 +156,6 @@ def build_trade(symbol: str, df: pd.DataFrame, direction: str,
     if not math.isfinite(a) or a <= 0:
         raise ValueError("ATR not finite")
 
-    # Raw levels from ATR
     mult = 2.2
     if direction == "Long":
         stop_raw = price - mult * a
@@ -168,23 +164,21 @@ def build_trade(symbol: str, df: pd.DataFrame, direction: str,
         stop_raw = price + mult * a
         targets_raw = [price - k * a for k in (1.5, 2.5, 3.5)]
 
-    # Round to exchange precision
-    price_p  = float(ex.price_to_precision(symbol, price))
-    stop     = float(ex.price_to_precision(symbol, stop_raw))
-    targets  = [float(ex.price_to_precision(symbol, t)) for t in targets_raw]
+    price_p = float(ex.price_to_precision(symbol, price))
+    stop    = float(ex.price_to_precision(symbol, stop_raw))
+    targets = [float(ex.price_to_precision(symbol, t)) for t in targets_raw]
 
-    # Risk/Reward (rounded to 2dp)
     denom = (price_p - stop)
     rr = [round(abs((t - price_p) / denom), 2) if denom else 0.0 for t in targets]
 
-    # Position sizing
     pos = None
+    risk_amt = None
     if equity and risk_pct:
         risk_amt = float(equity) * (float(risk_pct) / 100.0)
         risk_per_unit = abs(denom) / max(float(leverage), 1.0)
         qty_raw = risk_amt / max(risk_per_unit, 1e-8)
         qty = float(ex.amount_to_precision(symbol, qty_raw))
-        notional = float(ex.price_to_precision(symbol, qty * price_p))
+        notional = qty * price_p
         pos = {"qty": qty, "notional": notional}
 
     return {
@@ -194,14 +188,17 @@ def build_trade(symbol: str, df: pd.DataFrame, direction: str,
         "targets": targets,
         "rr": rr,
         "position_size": pos,
+        "risk_amount": risk_amt,         # NEW: shows $ at risk
+        "leverage": leverage,            # handy for UI
         "risk_suggestions": {
             "breakeven_after_tp": 1,
             "trail_after_tp": 2,
             "trail_method": "ATR",
             "trail_multiple": 1.0
         },
-        "precision": mkt.get("precision", {})  # handy for UI if you ever need it
+        "precision": mkt.get("precision", {})
     }
+}
 
 def infer_signal(feats: pd.DataFrame, min_conf: float) -> Tuple[str,float,Dict[str,bool],List[str]]:
     last = feats.iloc[-1]; reasons=[]
