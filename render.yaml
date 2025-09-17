@@ -1,18 +1,22 @@
 services:
   - type: web
-    name: ai-trade-advisor-api
+    name: ai-trade-advisor
     env: python
+    buildCommand: |
+      pip install --upgrade pip setuptools wheel
+      pip install -r requirements.txt
+    startCommand: |
+      uvicorn main:app --host 0.0.0.0 --port $PORT
     plan: starter
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
     envVars:
       - key: API_KEY
         sync: false
       - key: EXCHANGE
-        value: binance
+        value: kraken
       - key: QUOTE
-        value: USDT
+        value: USD
       - key: TOP_N
-        value: 25
+        value: "30"
       - key: CACHE_TTL_SEC
-        value: 1800
+        value: "1800"
