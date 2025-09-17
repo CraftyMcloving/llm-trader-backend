@@ -696,3 +696,100 @@ def chart(symbol: str, tf: str = "1h", n: int = Query(120, ge=20, le=500), _: No
     if hi - lo < 1e-12: hi, lo = hi + 1e-6, lo - 1e-6
     chg = (closes[-1] / closes[0] - 1.0) if closes[0] else 0.0
     return {"symbol": symbol, "timeframe": tf, "n": len(closes), "timestamps": ts, "closes": closes, "min": lo, "max": hi, "change": chg}
+    
+@app.get("/scan")
+def scan(
+    tf: str = "1h",
+    limit: int = Query(20, ge=3, le=50),
+    top: int = Query(6, ge=1, le=12),
+    # same overrides you use in /signals:
+    min_confidence: Optional[float] = Query(None),
+    vol_cap: Optional[float] = Query(None),
+    vol_min: Optional[float] = Query(None),
+    allow_neutral: int = Query(ALLOW_NEUTRAL_DEFAULT, ge=0, le=1),
+    ignore_trend: int = Query(0, ge=0, le=1),
+    ignore_vol: int = Query(0, ge=0, le=1),
+    risk_pct: float = Query(1.0, ge=0.1, le=5.0),
+    equity: Optional[float] = Query(None, ge=0.0),
+    leverage: float = Query(1.0, ge=1.0, le=10.0),
+    auto_relax: int = Query(1, ge=0, le=1),
+    force_if_empty: int = Query(1, ge=0, le=1),
+    include_chart: int = Query(1, ge=0, le=1),
+    _: None = Depends(require_key)
+):
+    uni = get_universe()[:limit]
+
+    def run_pass(opts):
+        out = []
+        for it in uni:
+            try:
+                # compute like /signals but inline to avoid HTTP roundtrips
+                payload = signals.__wrapped__(  # call the underlying fn, bypass FastAPI layers
+                    symbol=it["symbol"], tf=tf,
+                    risk_pct=opts["risk_pct"], equity=opts["equity"], leverage=opts["leverage"],
+                    min_confidence=opts["min_confidence"], vol_cap=opts["vol_cap"], vol_min=opts["vol_min"],
+                    allow_neutral=opts["allow_neutral"], ignore_trend=opts["ignore_trend"], ignore_vol=opts["ignore_vol"],
+                    force=opts.get("force", 0), _=None  # auth handled above
+                )
+                payload["market"] = it["market"]
+                out.append(payload)
+            except Exception:
+                out.append({
+                    "symbol": it["symbol"], "timeframe": tf, "signal": "Neutral",
+                    "confidence": 0.0, "updated": pd.Timestamp.utcnow().isoformat(),
+                    "trade": None, "filters": {"trend_ok": False, "vol_ok": False, "confidence_ok": False, "reasons": ["load error"]},
+                    "advice": "Skip", "market": it["market"]
+                })
+        consider = [s for s in out if s.get("advice") == "Consider" and s.get("trade")]
+        consider.sort(key=lambda s: abs(s.get("confidence") or 0.0), reverse=True)
+        return out, consider
+
+    # Base options from query/env
+    base = dict(
+        risk_pct=risk_pct, equity=equity, leverage=leverage,
+        min_confidence=min_confidence if min_confidence is not None else MIN_CONFIDENCE,
+        vol_cap=vol_cap if vol_cap is not None else VOL_CAP_ATR_PCT,
+        vol_min=vol_min if vol_min is not None else VOL_MIN_ATR_PCT,
+        allow_neutral=allow_neutral, ignore_trend=ignore_trend, ignore_vol=ignore_vol
+    )
+
+    # Pass 0: as-is
+    all0, ok = run_pass({**base})
+    note = None
+    # Auto relax passes
+    if auto_relax and not ok:
+        all1, ok = run_pass({**base, "min_confidence": max(0.0, base["min_confidence"] - 0.06),
+                             "vol_cap": max(base["vol_cap"], 0.20), "allow_neutral": 1})
+        all0, note = all1, "Relaxed (level 1): lowered Min confidence; widened ATR cap; nudged neutral."
+    if auto_relax and not ok:
+        all2, ok = run_pass({**base, "min_confidence": max(0.0, base["min_confidence"] - 0.12),
+                             "vol_cap": max(base["vol_cap"], 0.35), "vol_min": 0.0,
+                             "ignore_trend": 1})
+        all0, note = all2, "Relaxed (level 2): ignored trend; widened ATR cap further; dropped ATR min."
+    # Forced plans
+    forced = None
+    if force_if_empty and not ok:
+        forced, _ = run_pass({**base, "min_confidence": 0.0, "vol_cap": 1.0, "vol_min": 0.0,
+                              "ignore_trend": 1, "allow_neutral": 1, "force": 1})
+        all0, note = forced, "Draft plans: filters bypassed to produce entries/SL/TP."
+
+    # choose results
+    pool = ok if ok else (forced or all0)
+    topK = (pool[:top] if ok else sorted(pool, key=lambda s: abs(s.get("confidence") or 0.0), reverse=True)[:top])
+
+    # include small sparkline data to avoid extra /chart calls
+    out = []
+    for s in topK:
+        if include_chart:
+            try:
+                df = fetch_ohlcv(s["symbol"], tf)
+                closes = df["close"].tail(120).astype(float).tolist()
+            except Exception:
+                closes = None
+        else:
+            closes = None
+        s["chart"] = {"closes": closes} if closes else None
+        out.append(s)
+
+    return {"universe": len(uni), "note": note, "results": out}
+
