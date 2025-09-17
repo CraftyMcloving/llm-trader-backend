@@ -1,3 +1,5 @@
+# main.py — AI Trade Advisor backend (Kraken/USD)
+# FastAPI + ccxt + pandas (py3.12 recommended; see requirements.txt)
 from fastapi import FastAPI, HTTPException, Depends, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -20,22 +22,21 @@ def require_key(authorization: Optional[str] = Header(None)):
 # ----- Exchange (Kraken) -----
 EXCHANGE_ID = os.getenv("EXCHANGE", "kraken")
 QUOTE = os.getenv("QUOTE", "USD")
-TOP_N = int(os.getenv("TOP_N", "20"))
+TOP_N = int(os.getenv("TOP_N", "30"))
 
+_ex = None
 def get_exchange():
-    global _EX
-    try:
-        _ = _EX  # type: ignore
-    except NameError:
-        _EX = getattr(ccxt, EXCHANGE_ID)({
-            'enableRateLimit': True,
-            'timeout': 20000,
+    global _ex
+    if _ex is None:
+        _ex = getattr(ccxt, EXCHANGE_ID)({
+            "enableRateLimit": True,
+            "timeout": 20000,
         })
-    return _EX  # type: ignore
+    return _ex
 
 def load_markets():
     ex = get_exchange()
-    if not getattr(ex, 'markets', None):
+    if not getattr(ex, "markets", None):
         ex.load_markets()
     return ex.markets
 
@@ -46,13 +47,13 @@ app.add_middleware(
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
 )
 
-# ----- Caching (simple in-memory) -----
+# ----- Cache -----
 CACHE: Dict[str, Tuple[float, Any]] = {}
 def cache_get(key, ttl):
-    v = CACHE.get(key); 
+    v = CACHE.get(key)
     if not v: return None
     ts, data = v
-    return data if time.time() - ts <= ttl else None
+    return data if (time.time() - ts) <= ttl else None
 def cache_set(key, data): CACHE[key] = (time.time(), data)
 
 # ----- Universe -----
@@ -67,21 +68,20 @@ def get_universe(quote=QUOTE, limit=TOP_N) -> List[Dict[str, Any]]:
     if u is not None: return u
     markets = load_markets()
 
-    available = []
+    available: List[str] = []
     for base in CURATED:
         sym = f"{base}/{quote}"
-        if sym in markets and markets[sym]['active']:
+        if sym in markets and markets[sym].get("active"):
             available.append(sym)
 
     if len(available) < limit:
-        # fallback: top volume quote=quote
-        extra = [m for m, info in markets.items() if info.get('quote') == quote and info.get('active')]
-        # if exchange doesn’t expose numeric volume, order is fine—this is just a fallback
-        for s in extra:
-            if s not in available:
-                available.append(s)
-            if len(available) >= limit:
-                break
+        # Fallback: fill with other active {quote} tickers
+        for m, info in markets.items():
+            if info.get("quote") == quote and info.get("active"):
+                if m not in available:
+                    available.append(m)
+                if len(available) >= limit:
+                    break
 
     out = [{"symbol": s, "name": s.split('/')[0], "market": EXCHANGE_ID, "tf_supported": ["1h","1d"]} for s in available[:limit]]
     cache_set(key, out)
@@ -116,7 +116,8 @@ def fetch_ohlcv(symbol: str, tf: str, bars: int = 720) -> pd.DataFrame:
 def ema(s: pd.Series, n: int) -> pd.Series: return s.ewm(span=n, adjust=False).mean()
 def rsi(s: pd.Series, n: int = 14) -> pd.Series:
     d = s.diff(); up = d.clip(lower=0); dn = -d.clip(upper=0)
-    rs = ema(up,n) / (ema(dn,n) + 1e-12); return 100 - (100/(1+rs))
+    rs = ema(up,n) / (ema(dn,n) + 1e-12)
+    return 100 - (100/(1+rs))
 def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
     h,l,c = df["high"], df["low"], df["close"]; pc = c.shift(1)
     tr = pd.concat([(h-l).abs(), (h-pc).abs(), (l-pc).abs()], axis=1).max(axis=1)
@@ -124,13 +125,17 @@ def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
 
 def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-    out["sma20"]  = out["close"].rolling(20).mean()
-    out["sma50"]  = out["close"].rolling(50).mean()
-    out["rsi14"]  = rsi(out["close"], 14)
-    out["atr14"]  = atr(out, 14)
-    out["atr_pct"]= (out["atr14"]/out["close"]).clip(lower=0, upper=2.0)
-    out["ret5"]   = out["close"].pct_change(5)
-    out["slope20"]= out["sma20"] - out["sma20"].shift(5)
+    out["sma20"]   = out["close"].rolling(20).mean()
+    out["sma50"]   = out["close"].rolling(50).mean()
+    out["sma200"]  = out["close"].rolling(200).mean()
+    out["rsi14"]   = rsi(out["close"], 14)
+    out["atr14"]   = atr(out, 14)
+    out["atr_pct"] = (out["atr14"]/out["close"]).clip(lower=0, upper=2.0)
+    out["ret5"]    = out["close"].pct_change(5)
+    out["slope20"] = out["sma20"] - out["sma20"].shift(5)
+    out["bb_mid"]  = out["close"].rolling(20).mean()
+    out["bb_std"]  = out["close"].rolling(20).std().replace(0, np.nan)
+    out["bb_pos"]  = ((out["close"] - out["bb_mid"]) / (2*out["bb_std"])).clip(-1,1)
     return out
 
 # ----- Signal logic -----
@@ -141,7 +146,8 @@ VOL_MIN_ATR_PCT    = float(os.getenv("VOL_MIN_ATR_PCT", "0.001"))
 def build_trade(df: pd.DataFrame, direction: str, risk_pct: float = 1.0,
                 equity: Optional[float] = None, leverage: float = 1.0) -> Dict[str, Any]:
     last  = df.iloc[-1]; price = float(last["close"]); a = float(last["atr14"])
-    if not math.isfinite(a) or a <= 0: raise ValueError("ATR not finite")
+    if not math.isfinite(a) or a <= 0:
+        raise ValueError("ATR not finite")
     mult  = 2.2
     if direction == "Long":
         stop = price - mult*a; targets = [price + k*a for k in (1.5,2.5,3.5)]
@@ -157,14 +163,15 @@ def build_trade(df: pd.DataFrame, direction: str, risk_pct: float = 1.0,
     return {"direction":direction,"entry":price,"stop":stop,"targets":targets,"rr":rr,
             "position_size":pos,"risk_suggestions":{"breakeven_after_tp":1,"trail_after_tp":2,"trail_method":"ATR","trail_multiple":1.0}}
 
-def infer_signal(df: pd.DataFrame) -> Tuple[str,float,Dict[str,bool],List[str]]:
-    last = df.iloc[-1]; reasons=[]
-    trend_up = bool(last["sma20"]>last["sma50"] and df["slope20"].iloc[-1]>0)
-    trend_dn = bool(last["sma20"]<last["sma50"] and df["slope20"].iloc[-1]<0)
+def infer_signal(feats: pd.DataFrame, min_conf: float) -> Tuple[str,float,Dict[str,bool],List[str]]:
+    last = feats.iloc[-1]; reasons=[]
+    trend_up = bool(last["sma20"]>last["sma50"] and feats["slope20"].iloc[-1]>0)
+    trend_dn = bool(last["sma20"]<last["sma50"] and feats["slope20"].iloc[-1]<0)
     trend_ok = trend_up or trend_dn
     if not trend_ok: reasons.append("no clear trend")
 
-    vol_ok = bool((last["atr_pct"]>=VOL_MIN_ATR_PCT) and (last["atr_pct"]<=VOL_CAP_ATR_PCT))
+    atr_pct = float(last["atr_pct"])
+    vol_ok = bool((atr_pct>=VOL_MIN_ATR_PCT) and (atr_pct<=VOL_CAP_ATR_PCT))
     if not vol_ok: reasons.append("ATR% outside bounds")
 
     rsi14 = float(last["rsi14"])
@@ -174,21 +181,41 @@ def infer_signal(df: pd.DataFrame) -> Tuple[str,float,Dict[str,bool],List[str]]:
     if trend_ok: conf += 0.45
     if vol_ok:   conf += 0.25
     if bias_up or bias_dn: conf += 0.15
-    conf += min(abs(float(df["ret5"].iloc[-1] or 0.0))*2.0, 0.15)
+    conf += min(abs(float(feats["ret5"].iloc[-1] or 0.0))*2.0, 0.15)
     conf = float(max(0.0, min(conf,1.0)))
 
     if trend_up and bias_up:   sig="Bullish"
     elif trend_dn and bias_dn: sig="Bearish"
     else:                      sig="Neutral"
 
-    return sig, conf, {"trend_ok":trend_ok,"vol_ok":vol_ok,"confidence_ok":conf>=MIN_CONFIDENCE}, reasons
+    # explicit reason for threshold gate
+    if conf < min_conf:
+        reasons.append(f"Composite conf {conf:.2f} < {min_conf:.2f}")
 
-# ----- Schemas -----
+    return sig, conf, {"trend_ok":trend_ok,"vol_ok":vol_ok,"confidence_ok":conf>=min_conf}, reasons
+
+# ----- Pure helper used by both endpoints -----
+def evaluate_signal(symbol: str, tf: str, risk_pct: float, equity: Optional[float],
+                    leverage: float, min_confidence: Optional[float]) -> Dict[str, Any]:
+    df = fetch_ohlcv(symbol, tf, bars=400)
+    feats = compute_features(df).dropna().iloc[-200:]
+    if len(feats) < 50:
+        raise HTTPException(502, detail="insufficient features window")
+    thresh = min_confidence if (min_confidence is not None) else MIN_CONFIDENCE
+    sig, conf, filt, reasons = infer_signal(feats, thresh)
+    trade = None; advice = "Skip"
+    if sig in ("Bullish","Bearish") and conf>=thresh and filt["vol_ok"]:
+        trade = build_trade(feats, "Long" if sig=="Bullish" else "Short", risk_pct, equity, leverage)
+        advice = "Consider"
+    return {
+        "symbol": symbol, "timeframe": tf, "signal": sig, "confidence": conf,
+        "updated": pd.Timestamp.utcnow().isoformat(), "trade": trade,
+        "filters": {**filt, "reasons": reasons}, "advice": advice
+    }
+
+# ----- Schemas (light) -----
 class Instrument(BaseModel):
     symbol: str; name: str; market: str; tf_supported: List[str]
-class SignalOut(BaseModel):
-    symbol: str; timeframe: str; signal: str; confidence: float; updated: str
-    trade: Optional[Dict[str, Any]]; filters: Dict[str, Any]; advice: str
 
 # ----- Endpoints -----
 @app.get("/health")
@@ -207,7 +234,7 @@ def chart(symbol: str, tf: str = "1h", n: int = 120, _: None = Depends(require_k
     closes = df["close"].tail(n).astype(float).tolist()
     return {"symbol": symbol, "tf": tf, "closes": closes}
 
-@app.get("/signals", response_model=SignalOut)
+@app.get("/signals")
 def signals(
     symbol: str,
     tf: str = "1h",
@@ -218,21 +245,7 @@ def signals(
     _: None = Depends(require_key)
 ):
     try:
-        df = fetch_ohlcv(symbol, tf, bars=400)
-        feats = compute_features(df).dropna().iloc[-200:]
-        if len(feats) < 50:
-            raise HTTPException(502, detail="insufficient features window")
-        sig, conf, filt, reasons = infer_signal(feats)
-        trade = None; advice = "Skip"
-        thresh = min_confidence if (min_confidence is not None) else MIN_CONFIDENCE
-        if sig in ("Bullish","Bearish") and conf>=thresh and filt["vol_ok"]:
-            trade = build_trade(feats, "Long" if sig=="Bullish" else "Short", risk_pct, equity, leverage)
-            advice = "Consider"
-        return {
-            "symbol": symbol, "timeframe": tf, "signal": sig, "confidence": conf,
-            "updated": pd.Timestamp.utcnow().isoformat(), "trade": trade,
-            "filters": {**filt, "reasons": reasons}, "advice": advice
-        }
+        return evaluate_signal(symbol, tf, risk_pct, equity, leverage, min_confidence)
     except HTTPException:
         raise
     except Exception as e:
@@ -252,35 +265,48 @@ def scan(
     include_chart: int = Query(1, ge=0, le=1),
     _: None = Depends(require_key)
 ):
+    # build universe
     uni = get_universe(limit=limit)
-    results, ok = [], []
+
+    # pull signals
+    results: List[Dict[str, Any]] = []
+    ok: List[Dict[str, Any]] = []
+
     for it in uni:
         try:
-            s = signals.__wrapped__(symbol=it["symbol"], tf=tf, risk_pct=risk_pct,
-                                    equity=equity, leverage=leverage,
-                                    min_confidence=min_confidence, _=None)
-            s["market"] = it["market"]; results.append(s)
-            if s["advice"] == "Consider": ok.append(s)
+            s = evaluate_signal(
+                symbol=it["symbol"], tf=tf,
+                risk_pct=risk_pct, equity=equity, leverage=leverage,
+                min_confidence=min_confidence
+            )
+            s["market"] = it["market"]
+            if s["advice"] == "Consider":
+                ok.append(s)
+            results.append(s)
         except HTTPException as he:
             results.append({
                 "symbol": it["symbol"], "timeframe": tf, "signal": "Neutral",
                 "confidence": 0.0, "updated": pd.Timestamp.utcnow().isoformat(),
-                "trade": None, "filters": {"trend_ok": False, "vol_ok": False, "confidence_ok": False, "reasons": [he.detail]},
+                "trade": None, "filters": {"trend_ok": False, "vol_ok": False, "confidence_ok": False,
+                                           "reasons": [he.detail]},
                 "advice": "Skip", "market": it["market"]
             })
         except Exception as e:
             results.append({
                 "symbol": it["symbol"], "timeframe": tf, "signal": "Neutral",
                 "confidence": 0.0, "updated": pd.Timestamp.utcnow().isoformat(),
-                "trade": None, "filters": {"trend_ok": False, "vol_ok": False, "confidence_ok": False, "reasons": [f"exception: {e}"]},
+                "trade": None, "filters": {"trend_ok": False, "vol_ok": False, "confidence_ok": False,
+                                           "reasons": [f"exception: {e}"]},
                 "advice": "Skip", "market": it["market"]
             })
 
+    # choose pool
     pool = ok if ok else results
     pool_sorted = sorted(pool, key=lambda s: abs(s.get("confidence") or 0.0), reverse=True)
     topK = pool_sorted[:top]
 
-    out = []
+    # attach chart data if requested
+    out: List[Dict[str, Any]] = []
     for s in topK:
         if include_chart:
             try:
@@ -289,4 +315,9 @@ def scan(
             except Exception:
                 s["chart"] = None
         out.append(s)
-    return {"universe": len(uni), "note": None, "results": out}
+
+    note = None
+    if not ok and allow_neutral:
+        note = "No high-confidence setups; returning best candidates by confidence."
+
+    return {"universe": len(uni), "note": note, "results": out}
