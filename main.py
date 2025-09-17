@@ -17,7 +17,7 @@ CACHE_TTL_SEC = int(os.getenv("CACHE_TTL_SEC", "1800"))
 # Curated & quote prefs
 CURATED_BASES = [b.strip().upper() for b in os.getenv(
     "CURATED_BASES",
-    "BTC,XRP,ETH,SOL,ADA,HYPE,USDT,BNB,USDC,DOGE,STETH,TRX,LINK"
+    "BTC,XRP,ETH,SOL,ADA,HYPE,USDT,BNB,USDC,DOGE,STETH,TRX,LINK,WBTC,SUI,AVAX,XLM,BCH,LTC,CRO,TON,USDS,SHIB,DOT,XMR,MNT,UNI"
 ).split(",") if b.strip()]
 QUOTE_FALLBACKS = [q.strip().upper() for q in os.getenv(
     "QUOTE_FALLBACKS",
@@ -419,17 +419,34 @@ def _safe_float(series, key):
 def signals(
     symbol: str,
     tf: str = "1h",
+    # sizing
     risk_pct: float = Query(1.0, ge=0.1, le=5.0),
     equity: Optional[float] = Query(None, ge=0.0),
     leverage: float = Query(1.0, ge=1.0, le=10.0),
+    # NEW: filter overrides from the UI (all optional)
+    min_confidence: Optional[float] = Query(None),   # e.g. 0.12
+    vol_cap: Optional[float] = Query(None),          # e.g. 0.10  (10% ATR)
+    vol_min: Optional[float] = Query(None),          # e.g. 0.002 (0.2% ATR)
+    allow_neutral: int = Query(0, ge=0, le=1),       # 1 => nudge neutral to long/short by SMA20 slope
+    ignore_trend: int = Query(0, ge=0, le=1),        # 1 => skip trend filter
+    ignore_vol: int = Query(0, ge=0, le=1),          # 1 => skip volatility filter
     _: None = Depends(require_key)
 ):
     key = (symbol, tf)
     now = time.time()
+
+    # use request overrides if provided, else env defaults
+    MINC = float(min_confidence) if min_confidence is not None else MIN_CONFIDENCE
+    VCAP = float(vol_cap) if vol_cap is not None else VOL_CAP_ATR_PCT
+    VMIN = float(vol_min) if vol_min is not None else VOL_MIN_ATR_PCT
+    IGN_TREND = bool(ignore_trend)
+    IGN_VOL   = bool(ignore_vol)
+    ALLOW_NEU = bool(allow_neutral)
+
     cached = STATE["signal_cache"].get(key)
     if cached and now - cached["at"] < 300:
-        # deep-copy so we don't mutate the cached trade when sizing per-user
         payload = copy.deepcopy(cached["payload"])
+        # Re-apply sizing with new equity/risk/leverage if provided
         if payload.get("trade") and equity is not None:
             tr = payload["trade"]
             entry, stop = tr["entry"], tr["stop"]
@@ -438,46 +455,55 @@ def signals(
             qty = max(risk_amt / (R + 1e-12), 0.0)
             notional = qty * entry / max(leverage, 1.0)
             tr["risk_model"].update({"suggested_risk_pct": risk_pct, "leverage": leverage})
-            tr["position_size"] = {
-                "equity": float(equity),
-                "risk_amount": risk_amt,
-                "qty": float(qty),
-                "notional": float(notional)
-            }
+            tr["position_size"] = {"equity": float(equity), "risk_amount": risk_amt, "qty": float(qty), "notional": float(notional)}
         return payload
 
     df = fetch_ohlcv(symbol, tf)
     df = compute_features(df).dropna()
-    if "atr14" not in df.columns or "atr14_pct" not in df.columns:
-        raise HTTPException(status_code=502, detail="Internal: ATR features not available after compute_features()")
-    if len(df) < 200:
-        raise HTTPException(status_code=502, detail="Not enough data to compute features")
+    if "atr14" not in df.columns or "atr14_pct" not in df.columns or len(df) < 200:
+        raise HTTPException(status_code=502, detail="Not enough features/history")
 
     pred = rule_inference(df)
     feats = df.iloc[-1]
-    direction = "Long" if pred["signal"] == "Bullish" else "Short" if pred["signal"] == "Bearish" else "Neutral"
+
+    # possibly nudge neutrals by SMA20 slope when allowed
+    if pred["signal"] == "Neutral" and ALLOW_NEU:
+        slope = (df["sma20"].iloc[-1] - df["sma20"].iloc[-5]) if df["sma20"].notna().tail(5).all() else 0.0
+        direction = "Long" if slope >= 0 else "Short"
+    else:
+        direction = "Long" if pred["signal"] == "Bullish" else "Short" if pred["signal"] == "Bearish" else "Neutral"
 
     # filters
     filters = {"trend_ok": True, "vol_ok": True, "confidence_ok": True, "reasons": []}
-    ok, msg = trend_ok(direction, df)
-    filters["trend_ok"] = ok
-    if not ok: filters["reasons"].append(msg)
 
-    atr_pct = float(_safe_float(feats, "atr14_pct") or 0.0)
-    if atr_pct > VOL_CAP_ATR_PCT:
-        filters["vol_ok"] = False
-        filters["reasons"].append(f"ATR% {atr_pct:.1%} > cap {VOL_CAP_ATR_PCT:.0%}")
-    if atr_pct < VOL_MIN_ATR_PCT:
-        filters["vol_ok"] = False
-        filters["reasons"].append(f"ATR% {atr_pct:.2%} < min {VOL_MIN_ATR_PCT:.2%}")
+    if not IGN_TREND:
+        ok, msg = trend_ok(direction, df)
+        filters["trend_ok"] = ok if direction != "Neutral" else False
+        if direction == "Neutral":
+            filters["reasons"].append("Neutral signal")
+        elif not ok:
+            filters["reasons"].append(msg)
 
-    if abs(pred["confidence"]) < MIN_CONFIDENCE:
+    atr_pct = float(feats.get("atr14_pct", np.nan))
+    if not IGN_VOL:
+        if np.isfinite(atr_pct):
+            if atr_pct > VCAP:
+                filters["vol_ok"] = False
+                filters["reasons"].append(f"ATR% {atr_pct:.1%} > cap {VCAP:.0%}")
+            if atr_pct < VMIN:
+                filters["vol_ok"] = False
+                filters["reasons"].append(f"ATR% {atr_pct:.2%} < min {VMIN:.2%}")
+        else:
+            filters["vol_ok"] = False
+            filters["reasons"].append("ATR% unavailable")
+
+    if abs(pred["confidence"]) < MINC:
         filters["confidence_ok"] = False
-        filters["reasons"].append(f"Confidence {pred['confidence']:.2f} < {MIN_CONFIDENCE:.2f}")
+        filters["reasons"].append(f"Confidence {pred['confidence']:.2f} < {MINC:.2f}")
 
     trade = None
     advice = "Consider"
-    if direction == "Neutral" or not (filters["trend_ok"] and filters["vol_ok"] and filters["confidence_ok"]):
+    if direction == "Neutral" or not (filters["trend_ok"] or IGN_TREND) or not (filters["vol_ok"] or IGN_VOL) or not filters["confidence_ok"]:
         advice = "Skip"
     else:
         trade = build_trade(df, direction, risk_pct=risk_pct, equity=equity, leverage=leverage)
