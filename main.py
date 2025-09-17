@@ -9,10 +9,23 @@ import numpy as np
 
 # ---- Config (normalize) ----
 API_KEY  = os.getenv("API_KEY", "change-me")
-EXCHANGE = os.getenv("EXCHANGE", "binance").lower()   # e.g., binance, kraken, coinbase
-QUOTE    = os.getenv("QUOTE", "USDT").upper()
-TOP_N    = int(os.getenv("TOP_N", "25"))
+EXCHANGE = os.getenv("EXCHANGE", "kraken").lower()   # kraken/binance/coinbase/...
+QUOTE    = os.getenv("QUOTE", "USD").upper()
+TOP_N    = int(os.getenv("TOP_N", "20"))
 CACHE_TTL_SEC = int(os.getenv("CACHE_TTL_SEC", "1800"))
+
+# Curated list (ordered) – will be tried first, in this exact order:
+CURATED_BASES = [b.strip().upper() for b in os.getenv(
+    "CURATED_BASES",
+    "BTC,XRP,ETH,SOL,ADA,HYPE,USDT,BNB,USDC,DOGE,STETH,TRX,LINK,XLM"
+).split(",") if b.strip()]
+
+# When a base doesn’t have QUOTE on this exchange, we’ll try these quotes in order:
+QUOTE_FALLBACKS = [q.strip().upper() for q in os.getenv(
+    "QUOTE_FALLBACKS",
+    f"{QUOTE},USD,USDT,USDC,EUR,USDE,SUI,AVAX,HBAR,WETH"
+).split(",") if q.strip()]
+
 
 # ---- Lazy imports ----
 _requests = None
@@ -30,6 +43,69 @@ def ccxt():
         import ccxt as c
         _ccxt = c
     return _ccxt
+    
+# ---- Helpers ----
+def get_exchange():
+    klass = getattr(ccxt(), EXCHANGE)
+    return klass({"enableRateLimit": True, "timeout": 20000})
+
+def first_supported_symbol(markets: dict, base: str, quote_priority: list[str]) -> Optional[str]:
+    """
+    Return first market symbol like 'BTC/USD' that exists in markets for the given base,
+    walking the quote_priority list. Uses CCXT unified symbols.
+    """
+    for q in quote_priority:
+        sym = f"{base}/{q}"
+        if sym in markets and markets[sym].get("spot", True) and not markets[sym].get("contract"):
+            return sym
+    return None
+
+def curated_universe(ex, markets, bases: list[str], quote_priority: list[str]) -> list[dict]:
+    out = []
+    for b in bases:
+        sym = first_supported_symbol(markets, b, quote_priority)
+        if not sym:
+            continue  # skip coins Kraken doesn't list in the preferred quotes
+        m = markets[sym]
+        out.append({
+            "symbol": sym,
+            "name": m.get("base") or b,
+            "market": EXCHANGE,
+            "tf_supported": ["1h", "1d"]
+        })
+    return out[:TOP_N]
+
+def tier_b_universe(ex, markets, limit: int, quote_priority: list[str]) -> list[dict]:
+    """
+    Fill from exchange catalogue using preferred quotes.
+    We prefer symbols whose quote is earlier in quote_priority and sort by our curated bases rank.
+    """
+    # Rank bases: curated bases first (keep their relative order), others after alphabetically
+    rank = {b: i for i, b in enumerate(CURATED_BASES)}
+    cand = []
+    for sym, m in markets.items():
+        if m.get("contract") or not m.get("spot", True):
+            continue
+        q = m.get("quote")
+        b = m.get("base")
+        if not b or not q: 
+            continue
+        if q.upper() not in {x.upper() for x in quote_priority}:
+            continue
+        cand.append({
+            "symbol": sym,
+            "base": b.upper(),
+            "quote": q.upper(),
+            "name": b,
+            "market": EXCHANGE,
+            "tf_supported": ["1h","1d"],
+            "qrank": quote_priority.index(q.upper()) if q.upper() in quote_priority else 999,
+            "brank": rank.get(b.upper(), 10_000)  # curated first
+        })
+    # Sort: curated-order first (brank), then quote priority (qrank), then symbol for stability
+    cand.sort(key=lambda r: (r["brank"], r["qrank"], r["symbol"]))
+    return [{k: r[k] for k in ("symbol","name","market","tf_supported")} for r in cand[:limit]]
+
 
 # ---- Security ----
 def require_key(authorization: Optional[str] = Header(None)):
@@ -163,39 +239,34 @@ def get_universe() -> List[Dict[str, Any]]:
     if STATE["universe"] and now - STATE["universe_fetched_at"] < CACHE_TTL_SEC:
         return STATE["universe"]
 
-    dbg = STATE["universe_debug"]
-    dbg.update({"path": None, "supported_count": 0, "last_error": None})
+    dbg = STATE.get("universe_debug", {})
+    dbg.update({"path": None, "supported_count": 0, "last_error": None, "exchange": EXCHANGE, "quote": QUOTE, "top_n": TOP_N})
+    STATE["universe_debug"] = dbg
 
     try:
         ex = get_exchange()
         markets = ex.load_markets()
 
-        # --- Tier A: CoinGecko top-N filtered to exchange spot USDT (or your QUOTE) ---
-        try:
-            top_bases = coingecko_top_bases(TOP_N)
-            supported = tier_a_universe(ex, markets, top_bases)
-            if len(supported) >= max(10, TOP_N // 2):
-                dbg["path"] = "tierA"
-                dbg["supported_count"] = len(supported)
-                STATE["universe"] = supported[:TOP_N]
-                STATE["universe_fetched_at"] = now
-                return STATE["universe"]
-            else:
-                dbg["last_error"] = f"tierA too small ({len(supported)})"
-        except HTTPException as e:
-            dbg["last_error"] = f"coingecko_fail: {e.detail}"
-
-        # --- Tier B: build directly from exchange catalogue (no CG dependency) ---
-        supported = tier_b_universe(ex, markets, TOP_N)
-        if supported:
-            dbg["path"] = "tierB"
-            dbg["supported_count"] = len(supported)
-            STATE["universe"] = supported
+        # ---------- Tier A: CURATED (exact order you supplied) ----------
+        curated = curated_universe(ex, markets, CURATED_BASES, QUOTE_FALLBACKS)
+        if curated:
+            dbg["path"] = "curated"
+            dbg["supported_count"] = len(curated)
+            STATE["universe"] = curated
             STATE["universe_fetched_at"] = now
-            return supported
+            return curated
 
-        # --- Fallback trio ---
-        dbg["path"] = "fallback"
+        # ---------- Tier B: Fill from exchange catalogue using preferred quotes ----------
+        tier_b = tier_b_universe(ex, markets, TOP_N, QUOTE_FALLBACKS)
+        if tier_b:
+            dbg["path"] = "tierB_exchange"
+            dbg["supported_count"] = len(tier_b)
+            STATE["universe"] = tier_b
+            STATE["universe_fetched_at"] = now
+            return tier_b
+
+        # ---------- Fallback trio ----------
+        dbg["path"] = "fallback_trio"
         dbg["supported_count"] = 3
         fallback = [
             {"symbol": f"BTC/{QUOTE}", "name": "Bitcoin",  "market": EXCHANGE, "tf_supported": ["1h","1d"]},
@@ -207,12 +278,10 @@ def get_universe() -> List[Dict[str, Any]]:
         return fallback
 
     except Exception as e:
-        dbg["path"] = dbg["path"] or "exception"
+        dbg["path"] = dbg.get("path") or "exception"
         dbg["last_error"] = str(e)
-        # serve stale if we have it
         if STATE["universe"]:
             return STATE["universe"]
-        # final safety
         fallback = [
             {"symbol": f"BTC/{QUOTE}", "name": "Bitcoin",  "market": EXCHANGE, "tf_supported": ["1h","1d"]},
             {"symbol": f"ETH/{QUOTE}", "name": "Ethereum", "market": EXCHANGE, "tf_supported": ["1h","1d"]},
@@ -221,6 +290,7 @@ def get_universe() -> List[Dict[str, Any]]:
         STATE["universe"] = fallback
         STATE["universe_fetched_at"] = now
         return fallback
+
 
 def fetch_ohlcv(symbol: str, timeframe: str) -> pd.DataFrame:
     key = (symbol, timeframe)
