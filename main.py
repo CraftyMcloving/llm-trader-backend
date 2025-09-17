@@ -143,25 +143,64 @@ MIN_CONFIDENCE     = float(os.getenv("MIN_CONFIDENCE", "0.14"))
 VOL_CAP_ATR_PCT    = float(os.getenv("VOL_CAP_ATR_PCT", "0.25"))
 VOL_MIN_ATR_PCT    = float(os.getenv("VOL_MIN_ATR_PCT", "0.001"))
 
-def build_trade(df: pd.DataFrame, direction: str, risk_pct: float = 1.0,
-                equity: Optional[float] = None, leverage: float = 1.0) -> Dict[str, Any]:
-    last  = df.iloc[-1]; price = float(last["close"]); a = float(last["atr14"])
+def build_trade(symbol: str, df: pd.DataFrame, direction: str,
+                risk_pct: float = 1.0, equity: Optional[float] = None, leverage: float = 1.0) -> Dict[str, Any]:
+    """
+    Builds a trade plan and rounds price/qty to the exchange's precision for `symbol`.
+    """
+    ex = get_exchange()
+    markets = load_markets()
+    mkt = markets.get(symbol, {})
+
+    last  = df.iloc[-1]
+    price = float(last["close"])
+    a     = float(last["atr14"])
     if not math.isfinite(a) or a <= 0:
         raise ValueError("ATR not finite")
-    mult  = 2.2
+
+    # Raw levels from ATR
+    mult = 2.2
     if direction == "Long":
-        stop = price - mult*a; targets = [price + k*a for k in (1.5,2.5,3.5)]
+        stop_raw = price - mult * a
+        targets_raw = [price + k * a for k in (1.5, 2.5, 3.5)]
     else:
-        stop = price + mult*a; targets = [price - k*a for k in (1.5,2.5,3.5)]
-    rr = [abs((t - price)/(price - stop)) for t in targets]
-    pos=None
+        stop_raw = price + mult * a
+        targets_raw = [price - k * a for k in (1.5, 2.5, 3.5)]
+
+    # Round to exchange precision
+    price_p  = float(ex.price_to_precision(symbol, price))
+    stop     = float(ex.price_to_precision(symbol, stop_raw))
+    targets  = [float(ex.price_to_precision(symbol, t)) for t in targets_raw]
+
+    # Risk/Reward (rounded to 2dp)
+    denom = (price_p - stop)
+    rr = [round(abs((t - price_p) / denom), 2) if denom else 0.0 for t in targets]
+
+    # Position sizing
+    pos = None
     if equity and risk_pct:
-        risk_amt = equity*(risk_pct/100.0)
-        risk_per_unit = abs(price - stop)/max(leverage,1.0)
-        qty = risk_amt/max(risk_per_unit,1e-8)
-        pos = {"qty": qty, "notional": qty*price}
-    return {"direction":direction,"entry":price,"stop":stop,"targets":targets,"rr":rr,
-            "position_size":pos,"risk_suggestions":{"breakeven_after_tp":1,"trail_after_tp":2,"trail_method":"ATR","trail_multiple":1.0}}
+        risk_amt = float(equity) * (float(risk_pct) / 100.0)
+        risk_per_unit = abs(denom) / max(float(leverage), 1.0)
+        qty_raw = risk_amt / max(risk_per_unit, 1e-8)
+        qty = float(ex.amount_to_precision(symbol, qty_raw))
+        notional = float(ex.price_to_precision(symbol, qty * price_p))
+        pos = {"qty": qty, "notional": notional}
+
+    return {
+        "direction": direction,
+        "entry": price_p,
+        "stop": stop,
+        "targets": targets,
+        "rr": rr,
+        "position_size": pos,
+        "risk_suggestions": {
+            "breakeven_after_tp": 1,
+            "trail_after_tp": 2,
+            "trail_method": "ATR",
+            "trail_multiple": 1.0
+        },
+        "precision": mkt.get("precision", {})  # handy for UI if you ever need it
+    }
 
 def infer_signal(feats: pd.DataFrame, min_conf: float) -> Tuple[str,float,Dict[str,bool],List[str]]:
     last = feats.iloc[-1]; reasons=[]
@@ -205,7 +244,7 @@ def evaluate_signal(symbol: str, tf: str, risk_pct: float, equity: Optional[floa
     sig, conf, filt, reasons = infer_signal(feats, thresh)
     trade = None; advice = "Skip"
     if sig in ("Bullish","Bearish") and conf>=thresh and filt["vol_ok"]:
-        trade = build_trade(feats, "Long" if sig=="Bullish" else "Short", risk_pct, equity, leverage)
+        trade = build_trade(symbol, feats, "Long" if sig=="Bullish" else "Short", risk_pct, equity, leverage)
         advice = "Consider"
     return {
         "symbol": symbol, "timeframe": tf, "signal": sig, "confidence": conf,
