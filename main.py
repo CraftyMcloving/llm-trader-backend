@@ -347,3 +347,40 @@ def refresh(_: None = Depends(require_key)):
     STATE["universe_debug"].update({"path": "manual_refresh", "supported_count": 0, "last_error": None})
     uni = get_universe()
     return {"ok": True, "universe": len(uni)}
+
+# --- Add to app/main.py ---
+
+from fastapi import Query
+
+@app.get("/chart")
+def chart(
+    symbol: str,
+    tf: str = "1h",
+    n: int = Query(120, ge=20, le=500),
+    _: None = Depends(require_key)
+):
+    """
+    Compact sparkline data for a symbol/timeframe.
+    Returns last `n` closes + timestamps and basic stats.
+    """
+    df = fetch_ohlcv(symbol, tf)
+    if df.empty:
+        raise HTTPException(status_code=502, detail="No OHLCV")
+    tail = df.tail(n).copy()
+    closes = tail["close"].astype(float).tolist()
+    ts = tail["ts"].dt.strftime("%Y-%m-%dT%H:%M:%SZ").tolist()
+    lo, hi = float(min(closes)), float(max(closes))
+    # avoid flatline zero range
+    if hi - lo < 1e-12:
+        hi, lo = hi + 1e-6, lo - 1e-6
+    chg = (closes[-1] / closes[0] - 1.0) if closes[0] else 0.0
+    return {
+        "symbol": symbol,
+        "timeframe": tf,
+        "n": len(closes),
+        "timestamps": ts,
+        "closes": closes,
+        "min": lo,
+        "max": hi,
+        "change": chg,
+    }
