@@ -9,6 +9,14 @@ import pandas as pd
 import numpy as np
 import ccxt
 
+# ---- FEEDBACK: imports ----
+import os, json, sqlite3, threading, time
+from typing import Optional, Dict, Any, List
+from pydantic import BaseModel, Field
+from fastapi import Request
+# ---------------------------
+
+
 # ----- Security -----
 API_KEY = os.getenv("API_KEY", "change-me")
 def require_key(authorization: Optional[str] = Header(None)):
@@ -46,6 +54,116 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
 )
+
+# ========= FEEDBACK STORAGE & ONLINE WEIGHTS =========
+DB_PATH = os.getenv("FEEDBACK_DB", "/tmp/ai_trade_feedback.db")
+_db_lock = threading.Lock()
+
+def _db():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    return conn
+
+def init_feedback_db():
+    with _db_lock:
+        conn = _db()
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS feedback(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts REAL NOT NULL,
+          symbol TEXT, tf TEXT, market TEXT,
+          direction TEXT, entry REAL, stop REAL, targets TEXT,
+          confidence REAL, advice TEXT, outcome INTEGER,  -- +1 good, -1 bad
+          features TEXT, edge TEXT, composite TEXT,
+          equity REAL, risk_pct REAL, leverage REAL,
+          ua TEXT, ip TEXT
+        );
+        CREATE TABLE IF NOT EXISTS weights(
+          feature TEXT PRIMARY KEY,
+          w REAL NOT NULL
+        );
+        """)
+        conn.commit()
+        conn.close()
+
+def get_weights() -> Dict[str, float]:
+    with _db_lock:
+        conn = _db()
+        cur = conn.execute("SELECT feature, w FROM weights")
+        d = {k: float(v) for k, v in cur.fetchall()}
+        conn.close()
+        return d
+
+def update_weights(features: Dict[str, Any], outcome: int, lr: float = 0.05):
+    """
+    Super-light online learning: w_i += lr * outcome * norm(feature_i)
+    outcome: +1 good (TP), -1 bad (SL). Features loosely normalized.
+    """
+    if not isinstance(features, dict):
+        return
+    # normalize a few known numeric features; ignore non-numerics
+    norm: Dict[str, float] = {}
+    for k, v in features.items():
+        if v is None: 
+            continue
+        try:
+            x = float(v)
+        except Exception:
+            continue
+        # coarse normalization per feature name
+        if "rsi" in k:          # RSI ~ [0..100]
+            x = (x - 50.0) / 50.0
+        elif "macd" in k or "diff" in k or "ret" in k or "bb_pos" in k or "donch" in k:
+            # typically around [-1..+1] already-ish
+            x = max(-2.0, min(2.0, x))
+        elif "atr" in k:        # ATR or atr% → keep small
+            x = max(-1.0, min(1.0, x))
+        else:
+            x = max(-3.0, min(3.0, x))
+        norm[k] = x
+
+    if not norm:
+        return
+
+    with _db_lock:
+        conn = _db()
+        for k, x in norm.items():
+            cur = conn.execute("SELECT w FROM weights WHERE feature=?", (k,))
+            row = cur.fetchone()
+            w = float(row[0]) if row else 0.0
+            w = w + lr * outcome * x
+            conn.execute("INSERT INTO weights(feature, w) VALUES(?,?) ON CONFLICT(feature) DO UPDATE SET w=excluded.w",
+                         (k, w))
+        conn.commit()
+        conn.close()
+
+def feedback_bias(features: Dict[str, Any], alpha: float = 0.15) -> float:
+    """
+    Compute a bias adjustment from learned weights; clamp to [-1..1] then scale by alpha.
+    """
+    ws = get_weights()
+    s = 0.0
+    for k, v in (features or {}).items():
+        try:
+            x = float(v)
+        except Exception:
+            continue
+        # re-use the same crude normalization as in update_weights
+        if "rsi" in k:          x = (x - 50.0) / 50.0
+        elif "macd" in k or "diff" in k or "ret" in k or "bb_pos" in k or "donch" in k:
+            x = max(-2.0, min(2.0, x))
+        elif "atr" in k:        x = max(-1.0, min(1.0, x))
+        else:                   x = max(-3.0, min(3.0, x))
+        w = ws.get(k, 0.0)
+        s += w * x
+    # squish
+    s = max(-1.0, min(1.0, s))
+    return alpha * s
+
+@app.on_event("startup")
+def _fb_startup():
+    init_feedback_db()
+# =====================================================
 
 # ----- Cache -----
 CACHE: Dict[str, Tuple[float, Any]] = {}
@@ -288,6 +406,7 @@ def evaluate_signal(
         "filters": {**filt, "reasons": reasons},
         "advice": advice,
     }
+    
 
 # ----- Schemas (light) -----
 class Instrument(BaseModel):
@@ -320,6 +439,11 @@ def signals(
     min_confidence: Optional[float] = Query(None),
     _: None = Depends(require_key)
 ):
+    try:
+    conf_bias = feedback_bias(features)  # in [-0.15..+0.15] by default
+    confidence = max(-1.0, min(1.0, float(confidence) + conf_bias))
+        except Exception:
+            pass
     try:
         return evaluate_signal(symbol, tf, risk_pct, equity, leverage, min_confidence)
     except HTTPException:
@@ -399,3 +523,69 @@ def scan(
         note = "No high-confidence setups; returning best candidates by confidence."
 
     return {"universe": len(uni), "note": note, "results": out}
+
+# ========= FEEDBACK API =========
+class FeedbackIn(BaseModel):
+    symbol: str
+    tf: str
+    market: Optional[str] = None
+    direction: Optional[str] = None
+    entry: Optional[float] = None
+    stop: Optional[float] = None
+    targets: Optional[List[float]] = None
+    confidence: Optional[float] = None
+    advice: Optional[str] = None
+    features: Optional[Dict[str, Any]] = None
+    edge: Optional[Dict[str, Any]] = None
+    composite: Optional[Dict[str, Any]] = None
+    equity: Optional[float] = None
+    risk_pct: Optional[float] = None
+    leverage: Optional[float] = None
+    outcome: int = Field(..., description="+1 good (TP/favorable), -1 bad (SL hit)")
+
+class FeedbackAck(BaseModel):
+    ok: bool
+    stored_id: Optional[int] = None
+
+@app.post("/feedback", response_model=FeedbackAck)
+def post_feedback(fb: FeedbackIn, request: Request):
+    ua = request.headers.get("user-agent", "")
+    ip = request.client.host if request.client else ""
+    with _db_lock:
+        conn = _db()
+        cur = conn.execute(
+            """INSERT INTO feedback
+               (ts, symbol, tf, market, direction, entry, stop, targets, confidence, advice,
+                outcome, features, edge, composite, equity, risk_pct, leverage, ua, ip)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                time.time(),
+                fb.symbol, fb.tf, fb.market, fb.direction,
+                fb.entry, fb.stop, json.dumps(fb.targets or []),
+                fb.confidence, fb.advice, fb.outcome,
+                json.dumps(fb.features or {}), json.dumps(fb.edge or {}),
+                json.dumps(fb.composite or {}), fb.equity, fb.risk_pct,
+                fb.leverage, ua[:300], ip
+            )
+        )
+        rid = cur.lastrowid
+        conn.commit()
+        conn.close()
+    # update model weights
+    try:
+        update_weights(fb.features or {}, fb.outcome)
+    except Exception:
+        pass
+    return FeedbackAck(ok=True, stored_id=rid)
+
+@app.get("/feedback/stats")
+def feedback_stats():
+    with _db_lock:
+        conn = _db()
+        total = conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0]
+        good  = conn.execute("SELECT COUNT(*) FROM feedback WHERE outcome=1").fetchone()[0]
+        bad   = conn.execute("SELECT COUNT(*) FROM feedback WHERE outcome=-1").fetchone()[0]
+        W = {k: v for k, v in conn.execute("SELECT feature, w FROM weights ORDER BY ABS(w) DESC LIMIT 24")}
+        conn.close()
+    return {"total": total, "good": good, "bad": bad, "weights": W}
+# =================================
