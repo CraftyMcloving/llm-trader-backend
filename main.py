@@ -165,6 +165,14 @@ def _fb_startup():
     init_feedback_db()
 # =====================================================
 
+def apply_feedback_bias(confidence: float, features: Dict[str, Any]) -> float:
+    """Return confidence nudged by learned weights; always safe."""
+    try:
+        return max(-1.0, min(1.0, float(confidence) + feedback_bias(features)))
+    except Exception:
+        return float(confidence)
+
+
 # ----- Cache -----
 CACHE: Dict[str, Tuple[float, Any]] = {}
 def cache_get(key, ttl):
@@ -429,6 +437,9 @@ def chart(symbol: str, tf: str = "1h", n: int = 120, _: None = Depends(require_k
     closes = df["close"].tail(n).astype(float).tolist()
     return {"symbol": symbol, "tf": tf, "closes": closes}
 
+from typing import Optional, Dict, Any
+from fastapi import Query, Depends, HTTPException
+
 @app.get("/signals")
 def signals(
     symbol: str,
@@ -437,19 +448,34 @@ def signals(
     equity: Optional[float] = Query(None, ge=0),
     leverage: float = Query(1.0, ge=1.0, le=100.0),
     min_confidence: Optional[float] = Query(None),
-    _: None = Depends(require_key)
+    _: None = Depends(require_key),
 ):
     try:
-    conf_bias = feedback_bias(features)  # in [-0.15..+0.15] by default
-    confidence = max(-1.0, min(1.0, float(confidence) + conf_bias))
-        except Exception:
-            pass
-    try:
-        return evaluate_signal(symbol, tf, risk_pct, equity, leverage, min_confidence)
+        # 1) get your base result (your existing function)
+        res = evaluate_signal(
+            symbol=symbol,
+            tf=tf,
+            risk_pct=risk_pct,
+            equity=equity,
+            leverage=leverage,
+            min_confidence=min_confidence,
+        )
+
+        # 2) gently nudge confidence using learned weights
+        base_conf = float(res.get("confidence", 0.0))
+        feats: Dict[str, Any] = res.get("features") or {}
+        res["confidence"] = apply_feedback_bias(base_conf, feats)
+
+        # 3) keep the filter flag consistent, if present
+        if isinstance(res.get("filters"), dict) and min_confidence is not None:
+            res["filters"]["confidence_ok"] = (res["confidence"] >= float(min_confidence))
+
+        return res
+
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(502, detail=f"signals failed: {e}")
+        raise HTTPException(status_code=502, detail=f"signals failed: {e}")
 
 @app.get("/scan")
 def scan(
