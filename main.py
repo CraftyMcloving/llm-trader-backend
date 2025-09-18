@@ -16,6 +16,9 @@ from pydantic import BaseModel, Field
 from fastapi import Request
 # ---------------------------
 
+import os, json, time, uuid, hmac, hashlib, sqlite3
+from typing import Any, Dict, Optional
+import ccxt  # you already use this
 
 # ----- Security -----
 API_KEY = os.getenv("API_KEY", "change-me")
@@ -26,6 +29,110 @@ def require_key(authorization: Optional[str] = Header(None)):
     if token != API_KEY:
         raise HTTPException(status_code=403, detail="Bad token")
     return None
+    
+FEEDBACK_SECRET = os.getenv("FEEDBACK_SECRET", "change-me")  # set in Render env
+DB_PATH = os.getenv("DB_PATH", "signals.sqlite3")
+
+def _db():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS signals (
+      id TEXT PRIMARY KEY,
+      created_at INTEGER,
+      symbol TEXT,
+      tf TEXT,
+      payload TEXT,         -- JSON of the full server snapshot
+      outcome TEXT,         -- 'stop' | 'tp1' | 'tp2' | 'tp3' | 'no_touch'
+      resolved_at INTEGER
+    )""")
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS votes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      sid TEXT,
+      ts INTEGER,
+      ip TEXT,
+      ua TEXT,
+      vote TEXT             -- 'up' | 'down'
+    )""")
+    return conn
+
+DB = _db()
+
+def plan_signature(snapshot: Dict[str, Any]) -> str:
+    # canonical minimal payload to sign (prevents client tampering)
+    msg = json.dumps({
+        "symbol":    snapshot.get("symbol"),
+        "tf":        snapshot.get("tf"),
+        "direction": (snapshot.get("trade") or {}).get("direction") or snapshot.get("signal"),
+        "entry":     (snapshot.get("trade") or {}).get("entry"),
+        "stop":      (snapshot.get("trade") or {}).get("stop"),
+        "targets":   (snapshot.get("trade") or {}).get("targets"),
+        "updated":   snapshot.get("updated"),    # iso8601 from your pipeline
+    }, sort_keys=True, separators=(",", ":")).encode()
+    return hmac.new(FEEDBACK_SECRET.encode(), msg, hashlib.sha256).hexdigest()
+
+def record_signal(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    sid = str(uuid.uuid4())
+    created_ts = int(time.time())
+    DB.execute("INSERT OR REPLACE INTO signals (id, created_at, symbol, tf, payload) VALUES (?,?,?,?,?)",
+               (sid, created_ts, snapshot.get("symbol"), snapshot.get("tf","1h"), json.dumps(snapshot)))
+    DB.commit()
+    # attach id/signature/timestamps for the client
+    snapshot["sid"] = sid
+    snapshot["sig"] = plan_signature(snapshot)
+    snapshot["created_at_unix"] = created_ts
+    return snapshot
+    
+def tf_to_ms(tf: str) -> int:
+    tf = tf.lower().strip()
+    if tf.endswith("m"): return int(tf[:-1]) * 60_000
+    if tf.endswith("h"): return int(tf[:-1]) * 3_600_000
+    if tf.endswith("d"): return int(tf[:-1]) * 86_400_000
+    return 3_600_000
+
+def resolve_outcome(sym: str, tf: str, direction: str, entry: float, stop: float,
+                    targets: list[float], created_at_unix: int, horizon_bars: int = 12) -> str:
+    # Pull future candles since signal creation
+    ex = ccxt.kraken()
+    since_ms = created_at_unix * 1000
+    limit = max(horizon_bars + 2, 20)
+    ohlcv = ex.fetch_ohlcv(sym, timeframe=tf, since=since_ms, limit=limit)
+    if not ohlcv:  # no data… be conservative
+        return "no_touch"
+
+    # First-touch-wins within the horizon window
+    # Candle: [ts, open, high, low, close, vol]
+    tps = sorted(targets or [])
+    if not tps:  # if no targets, treat as no-touch (or compute PnL at horizon)
+        return "no_touch"
+
+    bars = ohlcv[:horizon_bars]
+    is_long = (str(direction).lower() == "long")
+
+    # Walk forward; if in one bar both TP and SL are inside, count STOP first (conservative)
+    for ts, o, h, l, c, v in bars:
+        if is_long:
+            hit_stop = (l <= stop)
+            hit_tp   = any(h >= tp for tp in tps)
+        else:
+            hit_stop = (h >= stop)
+            hit_tp   = any(l <= tp for tp in tps)
+
+        if hit_stop and hit_tp:
+            return "stop"
+        if hit_stop:
+            return "stop"
+        if hit_tp:
+            # which TP? highest reached for long, lowest reached for short
+            if is_long:
+                for level in reversed(tps):
+                    if h >= level: 
+                        return f"tp{tps.index(level)+1}"
+            else:
+                for level in tps:
+                    if l <= level:
+                        return f"tp{tps.index(level)+1}"
+    return "no_touch"
 
 # ----- Exchange (Kraken) -----
 EXCHANGE_ID = os.getenv("EXCHANGE", "kraken")
@@ -469,7 +576,10 @@ def signals(
         # 3) keep the filter flag consistent, if present
         if isinstance(res.get("filters"), dict) and min_confidence is not None:
             res["filters"]["confidence_ok"] = (res["confidence"] >= float(min_confidence))
-
+            
+        # example inside evaluate_signal(...) just before `return res`
+        res["tf"] = tf
+        res = record_signal(res)
         return res
 
     except HTTPException:
@@ -485,14 +595,19 @@ def scan(
     min_confidence: Optional[float] = Query(None),
     auto_relax: int = Query(1, ge=0, le=1),
     allow_neutral: int = Query(1, ge=0, le=1),
-    ignore_trend: int = Query(0, ge=0, le=1),   # NEW
-    ignore_vol: int = Query(0, ge=0, le=1),     # NEW
+    ignore_trend: int = Query(0, ge=0, le=1),
+    ignore_vol: int = Query(0, ge=0, le=1),
     risk_pct: float = Query(1.0, ge=0.1, le=5.0),
     equity: Optional[float] = Query(None, ge=0.0),
-    leverage: float = Query(1.0, ge=1.0, le=100.0),   # raised cap
+    leverage: float = Query(1.0, ge=1.0, le=100.0),
     include_chart: int = Query(1, ge=0, le=1),
-    _: None = Depends(require_key)
+    _: None = Depends(require_key),
 ):
+    """
+    Universe scan → pick topK, attach server-signed IDs for feedback learning.
+    NOTE: We call record_signal() *after* selection (topK) and *before* adding chart,
+          so DB payload stays lean but the client still gets sid/sig.
+    """
     uni = get_universe(limit=limit)
     results, ok = [], []
 
@@ -507,42 +622,49 @@ def scan(
                 allow_neutral=bool(allow_neutral),
             )
             s["market"] = it["market"]
-            if s["advice"] == "Consider":
+            s.setdefault("tf", tf)  # make sure TF is present for signing
+            if s.get("advice") == "Consider":
                 ok.append(s)
             results.append(s)
         except HTTPException as he:
             results.append({
-                "symbol": it["symbol"], "timeframe": tf, "signal": "Neutral",
+                "symbol": it["symbol"], "tf": tf, "timeframe": tf, "signal": "Neutral",
                 "confidence": 0.0, "updated": pd.Timestamp.utcnow().isoformat(),
                 "trade": None,
-                "filters": {"trend_ok": False, "vol_ok": False, "confidence_ok": False, "reasons": [he.detail]},
-                "advice": "Skip", "market": it["market"]
+                "filters": {"trend_ok": False, "vol_ok": False, "confidence_ok": False,
+                            "reasons": [he.detail]},
+                "advice": "Skip", "market": it["market"],
             })
         except Exception as e:
             results.append({
-                "symbol": it["symbol"], "timeframe": tf, "signal": "Neutral",
+                "symbol": it["symbol"], "tf": tf, "timeframe": tf, "signal": "Neutral",
                 "confidence": 0.0, "updated": pd.Timestamp.utcnow().isoformat(),
                 "trade": None,
-                "filters": {"trend_ok": False, "vol_ok": False, "confidence_ok": False, "reasons": [f"exception: {e}"]},
-                "advice": "Skip", "market": it["market"]
+                "filters": {"trend_ok": False, "vol_ok": False, "confidence_ok": False,
+                            "reasons": [f"exception: {e}"]},
+                "advice": "Skip", "market": it["market"],
             })
-    # ... (rest of your /scan stays the same)
 
-    # choose pool
+    # pick pool (prefer 'Consider', else everything), sort by |confidence|
     pool = ok if ok else results
     pool_sorted = sorted(pool, key=lambda s: abs(s.get("confidence") or 0.0), reverse=True)
     topK = pool_sorted[:top]
 
-    # attach chart data if requested
-    out: List[Dict[str, Any]] = []
+    out: list[dict[str, Any]] = []
     for s in topK:
+        # 1) sign & store snapshot (adds sid/sig/created_at_unix)
+        #    IMPORTANT: do this BEFORE adding heavy extras like 'chart'
+        signed = record_signal(dict(s))  # copy to avoid side-effects if you reuse 's'
+
+        # 2) optional chart for the frontend
         if include_chart:
             try:
-                df = fetch_ohlcv(s["symbol"], tf, bars=160)
-                s["chart"] = {"closes": df["close"].tail(120).astype(float).tolist()}
+                df = fetch_ohlcv(signed["symbol"], tf, bars=160)
+                signed["chart"] = {"closes": df["close"].tail(120).astype(float).tolist()}
             except Exception:
-                s["chart"] = None
-        out.append(s)
+                signed["chart"] = None
+
+        out.append(signed)
 
     note = None
     if not ok and allow_neutral:
@@ -615,3 +737,69 @@ def feedback_stats():
         conn.close()
     return {"total": total, "good": good, "bad": bad, "weights": W}
 # =================================
+
+from fastapi import Body, Request
+
+@app.post("/feedback")
+def feedback(
+    payload: Dict[str, Any] = Body(...),
+    request: Request = None,
+    _: None = Depends(require_key)  # keep your auth
+):
+    sid = (payload.get("sid") or "").strip()
+    vote = (payload.get("vote") or "").strip().lower()  # 'up' or 'down'
+    if vote not in ("up","down") or not sid:
+        raise HTTPException(400, detail="bad payload")
+
+    # store raw vote (rate-limit: 1 per sid per IP)
+    ip = request.client.host if request else ""
+    ua = request.headers.get("user-agent","")
+    now = int(time.time())
+    # dedupe per sid/ip
+    row = DB.execute("SELECT 1 FROM votes WHERE sid=? AND ip=?", (sid, ip)).fetchone()
+    if not row:
+        DB.execute("INSERT INTO votes (sid, ts, ip, ua, vote) VALUES (?,?,?,?,?)", (sid, now, ip, ua, vote))
+        DB.commit()
+
+    # load snapshot
+    row = DB.execute("SELECT created_at, payload, outcome FROM signals WHERE id=?", (sid,)).fetchone()
+    if not row:
+        raise HTTPException(404, detail="unknown sid")
+
+    created_at, payload_json, outcome = row
+    snap = json.loads(payload_json)
+
+    # already resolved? return cached truth
+    if not outcome:
+        t = (snap.get("trade") or {})
+        direction = t.get("direction") or snap.get("signal") or "Neutral"
+        if str(direction).lower() in ("bullish","bearish","neutral"):
+            direction = "Long" if direction.lower()=="bullish" else "Short" if direction.lower()=="bearish" else "Neutral"
+
+        if direction in ("Long","Short") and t.get("entry") and t.get("stop") and t.get("targets"):
+            horizon = int((snap.get("edge") or {}).get("horizon") or 12)
+            outcome = resolve_outcome(
+                sym=snap["symbol"], tf=snap.get("tf","1h"),
+                direction=direction, entry=float(t["entry"]),
+                stop=float(t["stop"]), targets=[float(x) for x in t["targets"]],
+                created_at_unix=int(created_at), horizon_bars=horizon
+            )
+        else:
+            outcome = "no_touch"
+
+        DB.execute("UPDATE signals SET outcome=?, resolved_at=? WHERE id=?", (outcome, int(time.time()), sid))
+        DB.commit()
+
+    # grade the vote vs truth (optional: include in response)
+    # simple rule: TPx -> 'good', stop -> 'bad', no_touch -> neutral
+    truth_good = outcome.startswith("tp")
+    truth_bad  = (outcome == "stop")
+    truthful   = (vote == "up" and truth_good) or (vote == "down" and truth_bad)
+
+    return {
+        "ok": True,
+        "sid": sid,
+        "outcome": outcome,       # server-truth
+        "vote": vote,
+        "truthful": truthful      # whether the click agrees with truth
+    }
