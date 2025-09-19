@@ -577,15 +577,31 @@ class FeedbackAck(BaseModel):
 def post_feedback(fb: FeedbackIn, request: Request):
     ua = request.headers.get("user-agent", "")
     ip = request.client.host if request.client else ""
+    # basic anti-spam: limit feedback submissions from the same IP in rapid succession
+    # If the same client IP has submitted feedback within the last 30 seconds, reject
+    current_time = time.time()
     with _db_lock:
         conn = _db()
+        # check the most recent submission from this IP
+        try:
+            row = conn.execute(
+                "SELECT ts FROM feedback WHERE ip=? ORDER BY ts DESC LIMIT 1", (ip,)
+            ).fetchone()
+        except Exception:
+            row = None
+        if row is not None:
+            last_ts = row[0]
+            if isinstance(last_ts, (float, int)) and (current_time - last_ts) < 30:
+                conn.close()
+                raise HTTPException(status_code=429, detail="Feedback rate limit exceeded. Please wait and try again.")
+        # record feedback
         cur = conn.execute(
             """INSERT INTO feedback
                (ts, symbol, tf, market, direction, entry, stop, targets, confidence, advice,
                 outcome, features, edge, composite, equity, risk_pct, leverage, ua, ip)
                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
-                time.time(),
+                current_time,
                 fb.symbol, fb.tf, fb.market, fb.direction,
                 fb.entry, fb.stop, json.dumps(fb.targets or []),
                 fb.confidence, fb.advice, fb.outcome,
