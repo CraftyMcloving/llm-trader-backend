@@ -301,9 +301,21 @@ def build_trade(symbol: str, df: pd.DataFrame, direction: str,
     risk_amt = None
     if equity and risk_pct:
         risk_amt = float(equity) * (float(risk_pct) / 100.0)
-        risk_per_unit = abs(denom) / max(float(leverage), 1.0)
+
+        # P&L per unit is independent of leverage
+        risk_per_unit = abs(denom)
+
+        # Risk-based qty (no leverage multiplier)
         qty_raw = risk_amt / max(risk_per_unit, 1e-8)
-        qty = float(ex.amount_to_precision(symbol, qty_raw))
+
+        # Optional cap: do not exceed equity × leverage in notional
+        qty_capped = qty_raw
+        if equity and leverage:
+            max_notional = float(equity) * max(float(leverage), 1.0)
+            if (qty_raw * price_p) > max_notional:
+                qty_capped = max_notional / max(price_p, 1e-8)
+
+        qty = float(ex.amount_to_precision(symbol, qty_capped))
         notional = qty * price_p
         pos = {"qty": qty, "notional": notional}
 
@@ -624,9 +636,6 @@ from typing import Optional
 
 @app.get("/feedback/summary")
 def feedback_summary(symbol: str, tf: str, direction: Optional[str] = None):
-    """
-    Returns up/down/total votes for a (symbol, tf[, direction]).
-    """
     with _db_lock:
         conn = _db()
         params = [symbol, tf]
@@ -639,7 +648,6 @@ def feedback_summary(symbol: str, tf: str, direction: Optional[str] = None):
             f"SELECT outcome FROM feedback WHERE {where}",
             params
         ).fetchall()
-
     up = sum(1 for r in rows if (r[0] or 0) > 0)
     down = sum(1 for r in rows if (r[0] or 0) < 0)
     total = len(rows)
