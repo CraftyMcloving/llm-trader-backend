@@ -302,22 +302,26 @@ def build_trade(symbol: str, df: pd.DataFrame, direction: str,
     if equity and risk_pct:
         risk_amt = float(equity) * (float(risk_pct) / 100.0)
 
-        # P&L per unit is independent of leverage
+        # risk-based size: leverage should NOT change risk_per_unit
         risk_per_unit = abs(denom)
-
-        # Risk-based qty (no leverage multiplier)
         qty_raw = risk_amt / max(risk_per_unit, 1e-8)
-
-        # Optional cap: do not exceed equity × leverage in notional
-        qty_capped = qty_raw
-        if equity and leverage:
-            max_notional = float(equity) * max(float(leverage), 1.0)
-            if (qty_raw * price_p) > max_notional:
-                qty_capped = max_notional / max(price_p, 1e-8)
-
-        qty = float(ex.amount_to_precision(symbol, qty_capped))
+        qty = float(ex.amount_to_precision(symbol, qty_raw))
         notional = qty * price_p
-        pos = {"qty": qty, "notional": notional}
+
+        # margin uses leverage; risk does not
+        levf = max(float(leverage or 1.0), 1.0)
+        margin = notional / levf
+
+        # Optional safety: cap to available equity by margin (keeps margin <= equity)
+        if equity and margin > float(equity):
+            cap_notional = float(equity) * levf
+            scale = cap_notional / max(notional, 1e-8)
+            qty = float(ex.amount_to_precision(symbol, qty * scale))
+            notional = qty * price_p
+            margin = notional / levf
+
+        pos = {"qty": qty, "notional": notional, "margin": margin, "leverage": levf}
+
 
     return {
         "direction": direction,
@@ -327,7 +331,7 @@ def build_trade(symbol: str, df: pd.DataFrame, direction: str,
         "rr": rr,
         "position_size": pos,
         "risk_amount": risk_amt,         # NEW: shows $ at risk
-        "leverage": leverage,            # handy for UI
+        "leverage": float(leverage or 1.0),            # handy for UI
         "risk_suggestions": {
             "breakeven_after_tp": 1,
             "trail_after_tp": 2,
