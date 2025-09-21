@@ -631,3 +631,28 @@ def feedback_stats():
         conn.close()
     return {"total": total, "good": good, "bad": bad, "weights": W}
 # =================================
+
+# --- NEW: vote summary ---
+from fastapi import Query
+
+@app.get("/feedback/summary")
+def feedback_summary(
+    symbol: str,
+    tf: str,
+    direction: str | None = None,
+):
+    q = ["symbol = ?", "tf = ?"]
+    args = [symbol, tf]
+    if direction:
+        q.append("direction = ?")
+        args.append(direction)
+
+    where = " AND ".join(q)
+    with _db_lock:
+        conn = _db()
+        total = conn.execute(f"SELECT COUNT(*) FROM feedback WHERE {where}", args).fetchone()[0]
+        up    = conn.execute(f"SELECT COUNT(*) FROM feedback WHERE outcome=1 AND {where}", args).fetchone()[0]
+        down  = conn.execute(f"SELECT COUNT(*) FROM feedback WHERE outcome=-1 AND {where}", args).fetchone()[0]
+        conn.close()
+
+    return {"symbol": symbol, "tf": tf, "direction": direction, "total": total, "up": up, "down": down}
