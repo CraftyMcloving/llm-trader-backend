@@ -399,6 +399,31 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     out["bb_std"]  = out["close"].rolling(20).std().replace(0, np.nan)
     out["bb_pos"]  = ((out["close"] - out["bb_mid"]) / (2*out["bb_std"])).clip(-1,1)
     return out
+    
+# ---- Feature snapshot for learning/bias (add after compute_features) ----
+def last_features_snapshot(feats: pd.DataFrame) -> Dict[str, float]:
+    """
+    Take the latest row of computed features and return a small, clean dict
+    of numeric values the learner can use. Keep names stable.
+    """
+    row = feats.iloc[-1]
+    keys = [
+        "rsi14", "atr_pct", "ret5", "slope20", "bb_pos",
+        # you can add more later; keep them numeric and reasonably bounded
+    ]
+    out: Dict[str, float] = {}
+    for k in keys:
+        v = row.get(k)
+        try:
+            x = float(v)
+            if math.isfinite(x):
+                out[k] = x
+        except Exception:
+            pass
+    # Back-compat: your frontend used `atr14_pct`; duplicate the value
+    if "atr_pct" in out and "atr14_pct" not in out:
+        out["atr14_pct"] = out["atr_pct"]
+    return out
 
 # ----- Signal logic -----
 MIN_CONFIDENCE     = float(os.getenv("MIN_CONFIDENCE", "0.14"))
@@ -565,6 +590,8 @@ def evaluate_signal(
         "slope20": float(last["slope20"]),
         "sma20_gt_sma50": 1.0 if float(last["sma20"]) > float(last["sma50"]) else 0.0,
     }
+    
+    feat_map = last_features_snapshot(feats)
 
     return {
         "symbol": symbol,
@@ -576,6 +603,7 @@ def evaluate_signal(
         "filters": {**filt, "reasons": reasons},
         "advice": advice,
         "features": features_snapshot,
+        "features": feat_map, 
     }
     
 def resolve_offer_row(row: sqlite3.Row) -> dict:
@@ -649,6 +677,13 @@ def resolve_due_offers(limit: int = 50) -> dict:
                     "UPDATE offers SET resolved=1, result=?, pnl=?, resolved_ts=? WHERE id=?",
                     (upd["result"], upd["pnl"], upd["resolved_ts"], row["id"])
                 )
+                # NEW: log a synthetic feedback row (only if outcome is non-neutral)
+                try:
+                    if int(upd.get("outcome", 0)) != 0:
+                        row_map = {k: row[k] for k in row.keys()}  # sqlite3.Row -> dict
+                        _record_feedback_from_offer(row_map, int(upd["outcome"]), float(upd["resolved_ts"]), pnl=float(upd["pnl"]))
+                except Exception:
+                    pass
                 done += 1
                 if upd["outcome"] > 0: good += 1
                 elif upd["outcome"] < 0: bad += 1
@@ -699,7 +734,7 @@ def signals(
 ):
     try:
         # 1) get your base result (your existing function)
-        res = evaluate_signal(
+          res = evaluate_signal(
             symbol=symbol,
             tf=tf,
             risk_pct=risk_pct,
@@ -708,12 +743,12 @@ def signals(
             min_confidence=min_confidence,
         )
 
-        # 2) gently nudge confidence using learned weights
+        # Nudge confidence by learned weights
         base_conf = float(res.get("confidence", 0.0))
         feats: Dict[str, Any] = res.get("features") or {}
         res["confidence"] = apply_feedback_bias(base_conf, feats)
 
-        # 3) keep the filter flag consistent, if present
+        # Keep filter in sync with the threshold if provided
         if isinstance(res.get("filters"), dict) and min_confidence is not None:
             res["filters"]["confidence_ok"] = (res["confidence"] >= float(min_confidence))
 
@@ -753,6 +788,16 @@ def scan(
                 ignore_vol=bool(ignore_vol),
                 allow_neutral=bool(allow_neutral),
             )
+            
+            # Apply learned bias so ranking prefers what historically worked
+            base_conf = float(s.get("confidence", 0.0))
+            feats_map = s.get("features") or {}
+            s["confidence"] = apply_feedback_bias(base_conf, feats_map)
+
+            # keep the filter gate consistent if threshold provided
+            if isinstance(s.get("filters"), dict) and (min_confidence is not None):
+                s["filters"]["confidence_ok"] = (s["confidence"] >= float(min_confidence))
+            
             s["market"] = it["market"]
             if s["advice"] == "Consider":
                 ok.append(s)
@@ -976,6 +1021,13 @@ def learning_resolve_one(body: ResolveOneIn):
             "UPDATE offers SET resolved=1, result=?, pnl=?, resolved_ts=? WHERE id=?",
             (upd["result"], upd["pnl"], upd["resolved_ts"], row["id"])
         )
+        # NEW: log a synthetic feedback row (only if outcome is non-neutral)
+        try:
+            if int(upd.get("outcome", 0)) != 0:
+                row_map = {k: row[k] for k in row.keys()}  # sqlite3.Row -> dict
+                _record_feedback_from_offer(row_map, int(upd["outcome"]), float(upd["resolved_ts"]), pnl=float(upd["pnl"]))
+        except Exception:
+            pass  # never block resolution on logging
         conn.commit()
         conn.close()
     return {"ok": True, "id": body.id, **upd}
@@ -983,4 +1035,62 @@ def learning_resolve_one(body: ResolveOneIn):
 @app.post("/learning/resolve-due")
 def learning_resolve_due(limit: int = Query(50, ge=1, le=500)):
     return resolve_due_offers(limit=limit)
+    
+@app.get("/learning/stats")
+def learning_stats(_: None = Depends(require_key)):
+    with _db_lock:
+        conn = _db()
+        pending = conn.execute("SELECT COUNT(*) FROM offers WHERE resolved=0").fetchone()[0]
+        done    = conn.execute("SELECT COUNT(*) FROM offers WHERE resolved=1").fetchone()[0]
+        tp      = conn.execute("SELECT COUNT(*) FROM offers WHERE resolved=1 AND result='TP'").fetchone()[0]
+        sl      = conn.execute("SELECT COUNT(*) FROM offers WHERE resolved=1 AND result='SL'").fetchone()[0]
+        pnlp    = conn.execute("SELECT COUNT(*) FROM offers WHERE resolved=1 AND result='PNL' AND pnl>0").fetchone()[0]
+        pnln    = conn.execute("SELECT COUNT(*) FROM offers WHERE resolved=1 AND result='PNL' AND pnl<=0").fetchone()[0]
+        conn.close()
+    return {"offers": {"pending": pending, "resolved": done, "tp": tp, "sl": sl, "pnl_pos": pnlp, "pnl_neg": pnln}}
+    
+# ---- Learning: record a feedback row from an offer resolution ----
+def _record_feedback_from_offer(offer: Dict[str, Any], outcome: int, resolved_ts: float, pnl: Optional[float] = None):
+    """Insert a synthetic feedback row so /feedback/stats includes auto-resolutions."""
+    try:
+        feats = json.loads(offer.get("features") or "{}")
+    except Exception:
+        feats = {}
+
+    try:
+        targets = json.loads(offer.get("targets") or "[]")
+    except Exception:
+        targets = []
+
+    ua = "learning/auto-resolve"
+    ip = "127.0.0.1"
+    with _db_lock:
+        conn = _db()
+        conn.execute(
+            """INSERT INTO feedback
+               (ts, symbol, tf, market, direction, entry, stop, targets,
+                confidence, advice, outcome, features, edge, composite, equity, risk_pct, leverage, ua, ip)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                resolved_ts,
+                offer.get("symbol"),
+                offer.get("tf"),
+                offer.get("market"),
+                offer.get("direction"),
+                offer.get("entry"),
+                offer.get("stop"),
+                json.dumps(targets),
+                offer.get("confidence"),
+                offer.get("advice"),
+                outcome,
+                json.dumps(feats),
+                "{}", "{}",  # edge, composite (not used here)
+                offer.get("equity"),
+                offer.get("risk_pct"),
+                offer.get("leverage"),
+                ua, ip
+            )
+        )
+        conn.commit()
+        conn.close()
 # =================================
