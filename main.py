@@ -602,7 +602,6 @@ def evaluate_signal(
         "trade": trade,
         "filters": {**filt, "reasons": reasons},
         "advice": advice,
-        "features": features_snapshot,
         "features": feat_map, 
     }
     
@@ -626,12 +625,15 @@ def resolve_offer_row(row: sqlite3.Row) -> dict:
     df = fetch_ohlcv_window(symbol, tf, created_ts*1000, expires_ts*1000)
 
     if fallback_only:
-        # judge by PnL at expiry
+    # judge by PnL at expiry using created-bar close as entry if entry is missing
+        created_close = float(df.iloc[0]["close"])
         close = float(df.iloc[-1]["close"])
-        # try to infer direction from simple slope if missing
-        if not direction:
-            direction = "Long" if close >= float(df.iloc[0]["close"]) else "Short"
-        pnl_frac = (close - entry)/max(abs(entry),1e-12) if direction=="Long" else (entry - close)/max(abs(entry),1e-12)
+    # try to infer direction from simple slope if missing
+    if not direction:
+            direction = "Long" if close >= created_close else "Short"
+        entry_eff = float(entry) if isinstance(entry, (int, float)) and math.isfinite(float(entry)) else created_close
+        denom = max(abs(entry_eff), 1e-12)
+        pnl_frac = (close - entry_eff) / denom if direction == "Long" else (entry_eff - close) / denom
         result   = "PNL"
         outcome  = 1 if pnl_frac > 0 else (-1 if pnl_frac < 0 else 0)
     else:
@@ -734,7 +736,7 @@ def signals(
 ):
     try:
         # 1) get your base result (your existing function)
-          res = evaluate_signal(
+        res = evaluate_signal(
             symbol=symbol,
             tf=tf,
             risk_pct=risk_pct,
@@ -868,26 +870,26 @@ class FeedbackAck(BaseModel):
 class OfferIn(BaseModel):
     symbol: str
     tf: str
-    market: str | None = None
-    direction: str | None = None
-    entry: float | None = None
-    stop: float | None = None
-    targets: list[float] | None = None
-    confidence: float | None = None
-    advice: str | None = None
-    features: dict[str, Any] | None = None
-    equity: float | None = None
-    risk_pct: float | None = None
-    leverage: float | None = None
-    currency: str | None = None
+    market: Optional[str] = None
+    direction: Optional[str] = None
+    entry: Optional[float] = None
+    stop: Optional[float] = None
+    targets: Optional[List[float]] = None
+    confidence: Optional[float] = None
+    advice: Optional[str] = None
+    features: Optional[Dict[str, Any]] = None
+    equity: Optional[float] = None
+    risk_pct: Optional[float] = None
+    leverage: Optional[float] = None
+    currency: Optional[str] = None
 
     created_ts: float
     expires_ts: float
 
 class OffersBatch(BaseModel):
-    items: list[OfferIn]
-    universe: int | None = None
-    note: str | None = None
+    items: List[OfferIn]
+    universe: Optional[int] = None
+    note: Optional[str] = None
 
 @app.post("/feedback", response_model=FeedbackAck)
 def post_feedback(fb: FeedbackIn, request: Request):
