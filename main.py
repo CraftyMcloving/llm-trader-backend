@@ -317,6 +317,16 @@ def fetch_ohlcv_window(symbol: str, tf: str, start_ms: int, end_ms: int) -> pd.D
 
 EVAL_STOP_FIRST = bool(int(os.getenv("EVAL_STOP_FIRST", "0")))  # if 1: SL wins ties within same bar
 
+# --- Learning: default hold windows (env-overridable) ---
+HOLD_1H_SECS = int(os.getenv("HOLD_1H_SECS", "28800"))   # 8h default
+HOLD_1D_SECS = int(os.getenv("HOLD_1D_SECS", "604800"))  # 7d default
+
+def hold_secs_for(tf: str) -> int:
+    if tf == "1h": return HOLD_1H_SECS
+    if tf == "1d": return HOLD_1D_SECS
+    return HOLD_1H_SECS
+# --------------------------------------------------------
+
 def _tp_hit_first(row, entry, stop, tps, df, direction: str) -> Tuple[str, float]:
     """
     Walk forward per candle from offer creation to expiry, returning ("TP"/"SL"/"NONE", pnl_frac_at_event_or_expiry)
@@ -1053,6 +1063,15 @@ def learning_stats(_: None = Depends(require_key)):
         pnln    = conn.execute("SELECT COUNT(*) FROM offers WHERE resolved=1 AND result='PNL' AND pnl<=0").fetchone()[0]
         conn.close()
     return {"offers": {"pending": pending, "resolved": done, "tp": tp, "sl": sl, "pnl_pos": pnlp, "pnl_neg": pnln}}
+
+@app.get("/learning/config")
+def learning_config(_: None = Depends(require_key)):
+    """Small helper so the frontend knows how long to ‘hold’ before resolution."""
+    return {
+        "hold_secs": {"1h": HOLD_1H_SECS, "1d": HOLD_1D_SECS},
+        "bg_interval": BG_INTERVAL,
+        "eval_stop_first": bool(EVAL_STOP_FIRST),
+    }
 
 # ---- Learning: record a feedback row from an offer resolution ----
 def _record_feedback_from_offer(offer: Dict[str, Any], outcome: int, resolved_ts: float, pnl: Optional[float] = None):
