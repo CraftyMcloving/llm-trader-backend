@@ -134,7 +134,7 @@ def update_weights(features: Dict[str, Any], outcome: int, lr: float = 0.05):
     # normalize a few known numeric features; ignore non-numerics
     norm: Dict[str, float] = {}
     for k, v in features.items():
-        if v is None: 
+        if v is None:
             continue
         try:
             x = float(v)
@@ -193,7 +193,7 @@ def feedback_bias(features: Dict[str, Any], alpha: float = 0.15) -> float:
 @app.on_event("startup")
 def _fb_startup():
     init_feedback_db()
-    
+
 BG_INTERVAL = int(os.getenv("LEARNER_BG_INTERVAL_SEC", "0"))  # e.g. 300 for 5min
 
 def _bg_worker():
@@ -209,7 +209,7 @@ def _start_bg():
     if BG_INTERVAL > 0:
         t = threading.Thread(target=_bg_worker, daemon=True)
         t.start()
-    
+
 # =====================================================
 
 def apply_feedback_bias(confidence: float, features: Dict[str, Any]) -> float:
@@ -285,7 +285,7 @@ def fetch_ohlcv(symbol: str, tf: str, bars: int = 720) -> pd.DataFrame:
     df["ts"] = pd.to_datetime(df["ts"], unit="ms")
     cache_set(key, df)
     return df.copy()
-    
+
 # ms per bar
 def tf_ms(tf: str) -> int:
     if tf == "1h": return 60*60*1000
@@ -314,10 +314,10 @@ def fetch_ohlcv_window(symbol: str, tf: str, start_ms: int, end_ms: int) -> pd.D
     if len(df) < 1:
         raise HTTPException(502, detail="empty eval slice")
     return df.reset_index(drop=True)
-    
+
 EVAL_STOP_FIRST = bool(int(os.getenv("EVAL_STOP_FIRST", "0")))  # if 1: SL wins ties within same bar
 
-def _tp_hit_first(row, entry, stop, tps, df, direction: str) -> tuple[str, float]:
+def _tp_hit_first(row, entry, stop, tps, df, direction: str) -> Tuple[str, float]:
     """
     Walk forward per candle from offer creation to expiry, returning ("TP"/"SL"/"NONE", pnl_frac_at_event_or_expiry)
     pnl_frac is (price-entry)/entry for Long, (entry-price)/entry for Short.
@@ -399,7 +399,7 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     out["bb_std"]  = out["close"].rolling(20).std().replace(0, np.nan)
     out["bb_pos"]  = ((out["close"] - out["bb_mid"]) / (2*out["bb_std"])).clip(-1,1)
     return out
-    
+
 # ---- Feature snapshot for learning/bias (add after compute_features) ----
 def last_features_snapshot(feats: pd.DataFrame) -> Dict[str, float]:
     """
@@ -579,18 +579,8 @@ def evaluate_signal(
 
         trade = build_trade(symbol, feats, direction, risk_pct, equity, leverage)
         advice = "Consider"
-        
-        # snapshot of features for learning / bias
-    last = feats.iloc[-1]
-    features_snapshot = {
-        "rsi14": float(last["rsi14"]),
-        "atr14_pct": float(last["atr_pct"]),
-        "ret5": float(last["ret5"]),
-        "bb_pos": float(last["bb_pos"]),
-        "slope20": float(last["slope20"]),
-        "sma20_gt_sma50": 1.0 if float(last["sma20"]) > float(last["sma50"]) else 0.0,
-    }
-    
+
+    # stable feature snapshot for learning/bias
     feat_map = last_features_snapshot(feats)
 
     return {
@@ -602,43 +592,56 @@ def evaluate_signal(
         "trade": trade,
         "filters": {**filt, "reasons": reasons},
         "advice": advice,
-        "features": feat_map, 
+        "features": feat_map,
     }
-    
+
 def resolve_offer_row(row: sqlite3.Row) -> dict:
     """
     Resolve a single offers row. Returns a dict with fields updated and decision.
     """
-    symbol     = row["symbol"]
-    tf         = row["tf"]
-    direction  = row["direction"]
-    entry      = row["entry"]
-    stop       = row["stop"]
-    targets    = json.loads(row["targets"] or "[]")
+    symbol = row["symbol"]
+    tf = row["tf"]
+    direction = row["direction"]
+    entry = row["entry"]
+    stop = row["stop"]
+    targets = json.loads(row["targets"] or "[]")
     created_ts = int(row["created_ts"])
     expires_ts = int(row["expires_ts"])
 
     # if we cannot evaluate direction/entry/stop, fall back to PnL vs expiry close from created
-    fallback_only = not(direction and isinstance(entry, (int,float)) and isinstance(stop, (int,float)))
+    fallback_only = not (
+        direction and isinstance(entry, (int, float)) and isinstance(stop, (int, float))
+    )
 
     # fetch evaluation slice
-    df = fetch_ohlcv_window(symbol, tf, created_ts*1000, expires_ts*1000)
+    df = fetch_ohlcv_window(symbol, tf, created_ts * 1000, expires_ts * 1000)
 
     if fallback_only:
-    # judge by PnL at expiry using created-bar close as entry if entry is missing
+        # judge by PnL at expiry using created-bar close as entry if entry is missing
         created_close = float(df.iloc[0]["close"])
         close = float(df.iloc[-1]["close"])
-    # try to infer direction from simple slope if missing
-    if not direction:
+        if not direction:
             direction = "Long" if close >= created_close else "Short"
-        entry_eff = float(entry) if isinstance(entry, (int, float)) and math.isfinite(float(entry)) else created_close
+        if not isinstance(entry, (int, float)) or not math.isfinite(float(entry)):
+            entry_eff = created_close
+        else:
+            entry_eff = float(entry)
         denom = max(abs(entry_eff), 1e-12)
         pnl_frac = (close - entry_eff) / denom if direction == "Long" else (entry_eff - close) / denom
-        result   = "PNL"
-        outcome  = 1 if pnl_frac > 0 else (-1 if pnl_frac < 0 else 0)
+        result = "PNL"
+        outcome = 1 if pnl_frac > 0 else (-1 if pnl_frac < 0 else 0)
     else:
-        result, pnl_frac = _tp_hit_first(row, float(entry), float(stop), [float(x) for x in targets], df, direction)
-        outcome = 1 if (result == "TP" or (result == "PNL" and pnl_frac > 0)) else (-1 if result == "SL" or (result == "PNL" and pnl_frac < 0) else 0)
+        result, pnl_frac = _tp_hit_first(
+            row,
+            float(entry),
+            float(stop),
+            [float(x) for x in targets],
+            df,
+            direction,
+        )
+        outcome = 1 if (result == "TP" or (result == "PNL" and pnl_frac > 0)) else (
+            -1 if (result == "SL" or (result == "PNL" and pnl_frac < 0)) else 0
+        )
 
     # update weights using stored features (if any)
     try:
@@ -652,7 +655,7 @@ def resolve_offer_row(row: sqlite3.Row) -> dict:
         "result": result,
         "pnl": float(pnl_frac),
         "outcome": int(outcome),
-        "resolved_ts": time.time()
+        "resolved_ts": time.time(),
     }
 
 def resolve_due_offers(limit: int = 50) -> dict:
@@ -790,7 +793,7 @@ def scan(
                 ignore_vol=bool(ignore_vol),
                 allow_neutral=bool(allow_neutral),
             )
-            
+
             # Apply learned bias so ranking prefers what historically worked
             base_conf = float(s.get("confidence", 0.0))
             feats_map = s.get("features") or {}
@@ -799,7 +802,7 @@ def scan(
             # keep the filter gate consistent if threshold provided
             if isinstance(s.get("filters"), dict) and (min_confidence is not None):
                 s["filters"]["confidence_ok"] = (s["confidence"] >= float(min_confidence))
-            
+
             s["market"] = it["market"]
             if s["advice"] == "Consider":
                 ok.append(s)
@@ -866,7 +869,7 @@ class FeedbackIn(BaseModel):
 class FeedbackAck(BaseModel):
     ok: bool
     stored_id: Optional[int] = None
-    
+
 class OfferIn(BaseModel):
     symbol: str
     tf: str
@@ -937,7 +940,7 @@ def post_feedback(fb: FeedbackIn, request: Request):
     except Exception:
         pass
     return FeedbackAck(ok=True, stored_id=rid)
-    
+
 from typing import Optional
 
 @app.get("/feedback/summary")
@@ -969,7 +972,7 @@ def feedback_stats():
         W = {k: v for k, v in conn.execute("SELECT feature, w FROM weights ORDER BY ABS(w) DESC LIMIT 24")}
         conn.close()
     return {"total": total, "good": good, "bad": bad, "weights": W}
-    
+
 @app.post("/learning/offered")
 def learning_offered(batch: OffersBatch, request: Request):
     if not batch.items:
@@ -1003,7 +1006,7 @@ def learning_offered(batch: OffersBatch, request: Request):
             conn.close()
 
     return {"ok": True, "stored": len(batch.items)}
-    
+
 from pydantic import BaseModel
 
 class ResolveOneIn(BaseModel):
@@ -1037,7 +1040,7 @@ def learning_resolve_one(body: ResolveOneIn):
 @app.post("/learning/resolve-due")
 def learning_resolve_due(limit: int = Query(50, ge=1, le=500)):
     return resolve_due_offers(limit=limit)
-    
+
 @app.get("/learning/stats")
 def learning_stats(_: None = Depends(require_key)):
     with _db_lock:
@@ -1050,7 +1053,7 @@ def learning_stats(_: None = Depends(require_key)):
         pnln    = conn.execute("SELECT COUNT(*) FROM offers WHERE resolved=1 AND result='PNL' AND pnl<=0").fetchone()[0]
         conn.close()
     return {"offers": {"pending": pending, "resolved": done, "tp": tp, "sl": sl, "pnl_pos": pnlp, "pnl_neg": pnln}}
-    
+
 # ---- Learning: record a feedback row from an offer resolution ----
 def _record_feedback_from_offer(offer: Dict[str, Any], outcome: int, resolved_ts: float, pnl: Optional[float] = None):
     """Insert a synthetic feedback row so /feedback/stats includes auto-resolutions."""
