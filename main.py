@@ -1,4 +1,5 @@
-# main.py — AI Trade Advisor backend (Kraken/USD)
+# main.py — AI Trade Advisor backend v3.0.0 (Kraken/USD)
+
 # FastAPI + ccxt + pandas (py3.12 recommended; see requirements.txt)
 from fastapi import FastAPI, HTTPException, Depends, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -82,7 +83,34 @@ def init_feedback_db():
           feature TEXT PRIMARY KEY,
           w REAL NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS offers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_ts REAL NOT NULL,     -- epoch seconds when the card list was shown
+        expires_ts REAL,              -- planned eval time (created_ts + hold_ms)
+        symbol     TEXT NOT NULL,
+        tf         TEXT NOT NULL,
+        market     TEXT,
+        direction  TEXT,
+        entry      REAL,
+        stop       REAL,
+        targets    TEXT,              -- JSON array
+        confidence REAL,
+        advice     TEXT,
+        features   TEXT,              -- JSON map
+        equity     REAL,
+        risk_pct   REAL,
+        leverage   REAL,
+        currency   TEXT,              -- "USD"/"GBP"/"EUR"
+        universe   INTEGER,
+        note       TEXT,              -- free-form note for scan settings
+        resolved   INTEGER DEFAULT 0, -- Phase 2: 0=pending, 1=resolved
+        result     TEXT,              -- Phase 2: 'TP','SL','PNL','NEITHER' etc
+        pnl        REAL,              -- Phase 2: realized P/L at resolution
+        resolved_ts REAL              -- Phase 2: epoch seconds
+        );
         """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_offers_symbol_tf ON offers(symbol, tf);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_offers_created ON offers(created_ts);")
         conn.commit()
         conn.close()
 
@@ -588,6 +616,30 @@ class FeedbackIn(BaseModel):
 class FeedbackAck(BaseModel):
     ok: bool
     stored_id: Optional[int] = None
+    
+class OfferIn(BaseModel):
+    symbol: str
+    tf: str
+    market: str | None = None
+    direction: str | None = None
+    entry: float | None = None
+    stop: float | None = None
+    targets: list[float] | None = None
+    confidence: float | None = None
+    advice: str | None = None
+    features: dict[str, Any] | None = None
+    equity: float | None = None
+    risk_pct: float | None = None
+    leverage: float | None = None
+    currency: str | None = None
+
+    created_ts: float
+    expires_ts: float
+
+class OffersBatch(BaseModel):
+    items: list[OfferIn]
+    universe: int | None = None
+    note: str | None = None
 
 @app.post("/feedback", response_model=FeedbackAck)
 def post_feedback(fb: FeedbackIn, request: Request):
@@ -667,4 +719,38 @@ def feedback_stats():
         W = {k: v for k, v in conn.execute("SELECT feature, w FROM weights ORDER BY ABS(w) DESC LIMIT 24")}
         conn.close()
     return {"total": total, "good": good, "bad": bad, "weights": W}
+    
+@app.post("/learning/offered")
+def learning_offered(batch: OffersBatch, request: Request):
+    if not batch.items:
+        return {"ok": True, "stored": 0}
+
+    ua = request.headers.get("user-agent", "")[:300]
+    ip = request.client.host if request.client else ""
+
+    with _db_lock:
+        conn = _db()
+        try:
+            for it in batch.items:
+                conn.execute(
+                    """INSERT INTO offers
+                       (created_ts, expires_ts, symbol, tf, market, direction,
+                        entry, stop, targets, confidence, advice, features,
+                        equity, risk_pct, leverage, currency, universe, note)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        float(it.created_ts),
+                        float(it.expires_ts),
+                        it.symbol, it.tf, it.market, it.direction,
+                        it.entry, it.stop, json.dumps(it.targets or []),
+                        it.confidence, it.advice, json.dumps(it.features or {}),
+                        it.equity, it.risk_pct, it.leverage, it.currency,
+                        batch.universe, batch.note,
+                    )
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+    return {"ok": True, "stored": len(batch.items)}
 # =================================
