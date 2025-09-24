@@ -111,6 +111,8 @@ def init_feedback_db():
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_offers_symbol_tf ON offers(symbol, tf);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_offers_created ON offers(created_ts);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_offers_resolved ON offers(resolved, expires_ts);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_offers_exp ON offers(expires_ts);")
         conn.commit()
         conn.close()
 
@@ -191,6 +193,23 @@ def feedback_bias(features: Dict[str, Any], alpha: float = 0.15) -> float:
 @app.on_event("startup")
 def _fb_startup():
     init_feedback_db()
+    
+BG_INTERVAL = int(os.getenv("LEARNER_BG_INTERVAL_SEC", "0"))  # e.g. 300 for 5min
+
+def _bg_worker():
+    while True:
+        try:
+            resolve_due_offers(limit=100)
+        except Exception:
+            pass
+        time.sleep(max(60, BG_INTERVAL))
+
+@app.on_event("startup")
+def _start_bg():
+    if BG_INTERVAL > 0:
+        t = threading.Thread(target=_bg_worker, daemon=True)
+        t.start()
+    
 # =====================================================
 
 def apply_feedback_bias(confidence: float, features: Dict[str, Any]) -> float:
@@ -266,6 +285,94 @@ def fetch_ohlcv(symbol: str, tf: str, bars: int = 720) -> pd.DataFrame:
     df["ts"] = pd.to_datetime(df["ts"], unit="ms")
     cache_set(key, df)
     return df.copy()
+    
+# ms per bar
+def tf_ms(tf: str) -> int:
+    if tf == "1h": return 60*60*1000
+    if tf == "1d": return 24*60*60*1000
+    raise HTTPException(400, detail=f"Unsupported tf for eval: {tf}")
+
+def fetch_ohlcv_window(symbol: str, tf: str, start_ms: int, end_ms: int) -> pd.DataFrame:
+    """
+    Fetch enough OHLCV to cover [start_ms, end_ms]. We use ccxt 'since' + 'limit' with a small buffer.
+    """
+    ex = get_exchange()
+    per = tf_ms(tf)
+    need = max(2, int((end_ms - start_ms) / per) + 4)
+    since = max(0, start_ms - 2*per)
+    try:
+        data = ex.fetch_ohlcv(symbol, timeframe=TF_MAP[tf], since=since, limit=min(need+20, 2000))
+    except Exception as e:
+        raise HTTPException(502, detail=f"eval window fetch failed: {e}")
+
+    if not data:
+        raise HTTPException(502, detail="no candles for eval window")
+
+    df = pd.DataFrame(data, columns=["ts","open","high","low","close","volume"])
+    # keep only overlap window (with one bar margin on each side)
+    df = df[(df["ts"] >= (start_ms - per)) & (df["ts"] <= (end_ms + per))]
+    if len(df) < 1:
+        raise HTTPException(502, detail="empty eval slice")
+    return df.reset_index(drop=True)
+    
+EVAL_STOP_FIRST = bool(int(os.getenv("EVAL_STOP_FIRST", "0")))  # if 1: SL wins ties within same bar
+
+def _tp_hit_first(row, entry, stop, tps, df, direction: str) -> tuple[str, float]:
+    """
+    Walk forward per candle from offer creation to expiry, returning ("TP"/"SL"/"NONE", pnl_frac_at_event_or_expiry)
+    pnl_frac is (price-entry)/entry for Long, (entry-price)/entry for Short.
+    For ties in the same candle, TP wins unless EVAL_STOP_FIRST=1.
+    """
+    if not isinstance(tps, (list, tuple)) or not tps:
+        tps = []
+
+    # choose first target as success threshold
+    tp = min(tps) if direction == "Long" else max(tps) if tps else None
+
+    def pnl_frac(price: float) -> float:
+        if direction == "Long":
+            return (price - entry) / max(abs(entry), 1e-12)
+        else:
+            return (entry - price) / max(abs(entry), 1e-12)
+
+    first_event = "NONE"
+    event_pnl   = 0.0
+
+    for _, bar in df.iterrows():
+        high = float(bar["high"]); low = float(bar["low"]); close = float(bar["close"])
+        tp_hit = False
+        sl_hit = False
+
+        if direction == "Long":
+            if tp is not None and high >= tp: tp_hit = True
+            if low <= stop: sl_hit = True
+        else:  # Short
+            if tp is not None and low <= tp: tp_hit = True
+            if high >= stop: sl_hit = True
+
+        if tp_hit and sl_hit:
+            # tie-break rule in same candle
+            if EVAL_STOP_FIRST:
+                first_event = "SL"
+                event_pnl   = pnl_frac(stop)
+            else:
+                first_event = "TP"
+                event_pnl   = pnl_frac(tp if tp is not None else close)
+            break
+        elif tp_hit:
+            first_event = "TP"
+            event_pnl   = pnl_frac(tp if tp is not None else close)
+            break
+        elif sl_hit:
+            first_event = "SL"
+            event_pnl   = pnl_frac(stop)
+            break
+
+    if first_event == "NONE":
+        # judge by expiry-close
+        close = float(df.iloc[-1]["close"])
+        return "PNL", pnl_frac(close)
+    return first_event, event_pnl
 
 # ----- Indicators -----
 def ema(s: pd.Series, n: int) -> pd.Series: return s.ewm(span=n, adjust=False).mean()
@@ -447,6 +554,17 @@ def evaluate_signal(
 
         trade = build_trade(symbol, feats, direction, risk_pct, equity, leverage)
         advice = "Consider"
+        
+        # snapshot of features for learning / bias
+    last = feats.iloc[-1]
+    features_snapshot = {
+        "rsi14": float(last["rsi14"]),
+        "atr14_pct": float(last["atr_pct"]),
+        "ret5": float(last["ret5"]),
+        "bb_pos": float(last["bb_pos"]),
+        "slope20": float(last["slope20"]),
+        "sma20_gt_sma50": 1.0 if float(last["sma20"]) > float(last["sma50"]) else 0.0,
+    }
 
     return {
         "symbol": symbol,
@@ -457,8 +575,93 @@ def evaluate_signal(
         "trade": trade,
         "filters": {**filt, "reasons": reasons},
         "advice": advice,
+        "features": features_snapshot,
     }
     
+def resolve_offer_row(row: sqlite3.Row) -> dict:
+    """
+    Resolve a single offers row. Returns a dict with fields updated and decision.
+    """
+    symbol     = row["symbol"]
+    tf         = row["tf"]
+    direction  = row["direction"]
+    entry      = row["entry"]
+    stop       = row["stop"]
+    targets    = json.loads(row["targets"] or "[]")
+    created_ts = int(row["created_ts"])
+    expires_ts = int(row["expires_ts"])
+
+    # if we cannot evaluate direction/entry/stop, fall back to PnL vs expiry close from created
+    fallback_only = not(direction and isinstance(entry, (int,float)) and isinstance(stop, (int,float)))
+
+    # fetch evaluation slice
+    df = fetch_ohlcv_window(symbol, tf, created_ts*1000, expires_ts*1000)
+
+    if fallback_only:
+        # judge by PnL at expiry
+        close = float(df.iloc[-1]["close"])
+        # try to infer direction from simple slope if missing
+        if not direction:
+            direction = "Long" if close >= float(df.iloc[0]["close"]) else "Short"
+        pnl_frac = (close - entry)/max(abs(entry),1e-12) if direction=="Long" else (entry - close)/max(abs(entry),1e-12)
+        result   = "PNL"
+        outcome  = 1 if pnl_frac > 0 else (-1 if pnl_frac < 0 else 0)
+    else:
+        result, pnl_frac = _tp_hit_first(row, float(entry), float(stop), [float(x) for x in targets], df, direction)
+        outcome = 1 if (result == "TP" or (result == "PNL" and pnl_frac > 0)) else (-1 if result == "SL" or (result == "PNL" and pnl_frac < 0) else 0)
+
+    # update weights using stored features (if any)
+    try:
+        feats = json.loads(row["features"] or "{}")
+        if outcome != 0:
+            update_weights(feats, outcome)
+    except Exception:
+        pass
+
+    return {
+        "result": result,
+        "pnl": float(pnl_frac),
+        "outcome": int(outcome),
+        "resolved_ts": time.time()
+    }
+
+def resolve_due_offers(limit: int = 50) -> dict:
+    """
+    Resolve all due offers (expires_ts <= now) that are not yet resolved.
+    """
+    now = time.time()
+    done = 0
+    good = 0
+    bad  = 0
+
+    with _db_lock:
+        conn = _db()
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM offers WHERE resolved=0 AND expires_ts<=? ORDER BY expires_ts ASC LIMIT ?",
+            (now, int(limit)),
+        ).fetchall()
+
+        for row in rows:
+            try:
+                upd = resolve_offer_row(row)
+                conn.execute(
+                    "UPDATE offers SET resolved=1, result=?, pnl=?, resolved_ts=? WHERE id=?",
+                    (upd["result"], upd["pnl"], upd["resolved_ts"], row["id"])
+                )
+                done += 1
+                if upd["outcome"] > 0: good += 1
+                elif upd["outcome"] < 0: bad += 1
+            except Exception as e:
+                # mark resolved with NEITHER on hard failure to avoid blocking forever
+                conn.execute(
+                    "UPDATE offers SET resolved=1, result=?, pnl=?, resolved_ts=? WHERE id=?",
+                    ("NEITHER", 0.0, time.time(), row["id"])
+                )
+                done += 1
+        conn.commit()
+        conn.close()
+    return {"resolved": done, "good": good, "bad": bad}
 
 # ----- Schemas (light) -----
 class Instrument(BaseModel):
@@ -753,4 +956,31 @@ def learning_offered(batch: OffersBatch, request: Request):
             conn.close()
 
     return {"ok": True, "stored": len(batch.items)}
+    
+from pydantic import BaseModel
+
+class ResolveOneIn(BaseModel):
+    id: int
+
+@app.post("/learning/resolve-one")
+def learning_resolve_one(body: ResolveOneIn):
+    with _db_lock:
+        conn = _db()
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM offers WHERE id=?", (body.id,)).fetchone()
+        if not row:
+            conn.close()
+            raise HTTPException(404, detail="offer not found")
+        upd = resolve_offer_row(row)
+        conn.execute(
+            "UPDATE offers SET resolved=1, result=?, pnl=?, resolved_ts=? WHERE id=?",
+            (upd["result"], upd["pnl"], upd["resolved_ts"], row["id"])
+        )
+        conn.commit()
+        conn.close()
+    return {"ok": True, "id": body.id, **upd}
+
+@app.post("/learning/resolve-due")
+def learning_resolve_due(limit: int = Query(50, ge=1, le=500)):
+    return resolve_due_offers(limit=limit)
 # =================================
