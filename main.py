@@ -1013,9 +1013,9 @@ def post_feedback(fb: FeedbackIn, request: Request, x_user_id: Optional[int] = H
     ok, why = _vote_matches_market(fb)
     if not ok:
         raise HTTPException(status_code=422, detail=f"Vote rejected: {why}")
-    with _db_lock:
-    conn = _db()
-    try:
+            with _db_lock:
+        conn = _db()
+        try:
         # NEW: per-user cooldown (same window)
         row_u = conn.execute(
             "SELECT ts FROM feedback WHERE uid=? ORDER BY ts DESC LIMIT 1",
