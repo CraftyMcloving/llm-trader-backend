@@ -999,7 +999,7 @@ def post_feedback(fb: FeedbackIn, request: Request, x_user_id: Optional[int] = H
 
     # Must be logged in (WP proxy stamps this)
     if not fb.uid or fb.uid <= 0:
-    raise HTTPException(status_code=401, detail="login required")
+        raise HTTPException(status_code=401, detail="login required")
 
     # Build a fallback fingerprint if frontend didn’t send one
     if not fb.fingerprint:
