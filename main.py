@@ -1,17 +1,15 @@
 # main.py — AI Trade Advisor backend v3.0.4 (Kraken/USD)
-
 # FastAPI + ccxt + pandas (py3.12 recommended; see requirements.txt)
+from __future__ import annotations
 from fastapi import FastAPI, HTTPException, Depends, Header, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any, Tuple
-from __future__ import annotations
 import os, json, sqlite3, threading, time
 import math
 import pandas as pd
 import numpy as np
 import ccxt
-
 
 # ----- Security -----
 API_KEY = os.getenv("API_KEY", "change-me")
@@ -264,7 +262,6 @@ def apply_feedback_bias(confidence: float, features: Dict[str, Any]) -> float:
         return max(-1.0, min(1.0, float(confidence) + feedback_bias(features)))
     except Exception:
         return float(confidence)
-
 
 # ----- Cache -----
 CACHE: Dict[str, Tuple[float, Any]] = {}
