@@ -5,6 +5,7 @@ from fastapi import FastAPI, HTTPException, Depends, Header, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any, Tuple
+from __future__ import annotations
 import os, json, sqlite3, threading, time
 import math
 import pandas as pd
@@ -43,14 +44,20 @@ def load_markets():
         ex.load_markets()
     return ex.markets
 
-# ----- App -----
+# put this near the top, before app = FastAPI(...)
+ALLOWED_ORIGINS = os.getenv(
+    "ALLOWED_ORIGINS",
+    "https://craftyalpha.com,https://ai-trader-advisor.onrender.com"
+)
+ALLOWED_ORIGINS = [o.strip() for o in ALLOWED_ORIGINS.split(",") if o.strip()]
+
 app = FastAPI(title="AI Trade Advisor API", version="2025.09")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[os.getenv("ALLOWED_ORIGIN", "https://craftyalpha.com", "https://ai-trader-advisor.onrender.com")],
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
-    allow_credentials=True,
+    allow_credentials=True,   # keep true since you’re not using "*"
 )
 
 # ========= FEEDBACK STORAGE & ONLINE WEIGHTS =========
@@ -686,56 +693,44 @@ def evaluate_signal(
     }
 
 def resolve_offer_row(row: sqlite3.Row) -> dict:
-    """
-    Resolve a single offers row. Returns a dict with fields updated and decision.
-    """
-    symbol = row["symbol"]
-    tf = row["tf"]
-    direction = row["direction"]
-    entry = row["entry"]
-    stop = row["stop"]
-try:
-    targets = [float(x) for x in json.loads(row["targets"] or "[]") if x is not None]
-except Exception:
-    targets = []
+    symbol     = row["symbol"]
+    tf         = row["tf"]
+    direction  = row["direction"]
+    entry      = row["entry"]
+    stop       = row["stop"]
+
+    # targets: safe parse
+    try:
+        targets = [float(x) for x in json.loads(row["targets"] or "[]") if x is not None]
+    except Exception:
+        targets = []
+
+    # these must be set unconditionally
     created_ts = int(row["created_ts"])
     expires_ts = int(row["expires_ts"])
 
-    # if we cannot evaluate direction/entry/stop, fall back to PnL vs expiry close from created
     fallback_only = not (
         direction and isinstance(entry, (int, float)) and isinstance(stop, (int, float))
     )
 
-    # fetch evaluation slice
     df = fetch_ohlcv_window(symbol, tf, created_ts * 1000, expires_ts * 1000)
 
     if fallback_only:
-        # judge by PnL at expiry using created-bar close as entry if entry is missing
         created_close = float(df.iloc[0]["close"])
         close = float(df.iloc[-1]["close"])
         if not direction:
             direction = "Long" if close >= created_close else "Short"
-        if not isinstance(entry, (int, float)) or not math.isfinite(float(entry)):
-            entry_eff = created_close
-        else:
-            entry_eff = float(entry)
+        entry_eff = float(entry) if isinstance(entry, (int, float)) and math.isfinite(float(entry)) else created_close
         denom = max(abs(entry_eff), 1e-12)
         pnl_frac = (close - entry_eff) / denom if direction == "Long" else (entry_eff - close) / denom
         result = "PNL"
         outcome = 1 if pnl_frac > 0 else (-1 if pnl_frac < 0 else 0)
     else:
-        result, pnl_frac = _tp_hit_first(
-            float(entry),
-            float(stop),
-            [float(x) for x in targets],
-            df,
-            direction,
-        )
+        result, pnl_frac = _tp_hit_first(float(entry), float(stop), [float(x) for x in targets], df, direction)
         outcome = 1 if (result == "TP" or (result == "PNL" and pnl_frac > 0)) else (
             -1 if (result == "SL" or (result == "PNL" and pnl_frac < 0)) else 0
         )
 
-    # update weights using stored features (if any)
     try:
         feats = json.loads(row["features"] or "{}")
         if outcome != 0:
@@ -743,12 +738,7 @@ except Exception:
     except Exception:
         pass
 
-    return {
-        "result": result,
-        "pnl": float(pnl_frac),
-        "outcome": int(outcome),
-        "resolved_ts": time.time(),
-    }
+    return {"result": result, "pnl": float(pnl_frac), "outcome": int(outcome), "resolved_ts": time.time()}
 
 def resolve_due_offers(limit: int = 50) -> dict:
     """
@@ -992,16 +982,16 @@ def post_feedback(fb: FeedbackIn, request: Request, x_user_id: Optional[int] = H
     ua = request.headers.get("user-agent", "")[:300]
     ip = request.client.host if request.client else ""
     now = time.time()
+
     uid = x_user_id
     if not uid or uid <= 0:
         raise HTTPException(status_code=401, detail="login required")
-    fb.uid = int(uid)  # overwrite anything from client
+    fb.uid = int(uid)
 
-    # Must be logged in (WP proxy stamps this)
+    # Must be logged in (WP proxy stamps this) – keep, but it’s redundant now
     if not fb.uid or fb.uid <= 0:
         raise HTTPException(status_code=401, detail="login required")
 
-    # Build a fallback fingerprint if frontend didn’t send one
     if not fb.fingerprint:
         d = (fb.direction or "").upper()
         e = f"{fb.entry:.6f}" if fb.entry is not None else "0"
@@ -1009,62 +999,54 @@ def post_feedback(fb: FeedbackIn, request: Request, x_user_id: Optional[int] = H
         t = f"{(fb.targets or [None])[0]:.6f}" if (fb.targets and fb.targets[0] is not None) else "0"
         fb.fingerprint = "|".join([fb.symbol, fb.tf, d, e, s, t])
 
-    # Validate against live market at click time
     ok, why = _vote_matches_market(fb)
     if not ok:
         raise HTTPException(status_code=422, detail=f"Vote rejected: {why}")
-            with _db_lock:
+
+    with _db_lock:
         conn = _db()
         try:
-        # NEW: per-user cooldown (same window)
-        row_u = conn.execute(
-            "SELECT ts FROM feedback WHERE uid=? ORDER BY ts DESC LIMIT 1",
-            (int(fb.uid or 0),)
-        ).fetchone()
-        if row_u is not None and isinstance(row_u[0], (float, int)) and (now - row_u[0]) < 30:
-            raise HTTPException(status_code=429, detail="Too fast. Please wait a moment and try again.")
+            # per-user cooldown
+            row_u = conn.execute(
+                "SELECT ts FROM feedback WHERE uid=? ORDER BY ts DESC LIMIT 1",
+                (int(fb.uid or 0),)
+            ).fetchone()
+            if row_u is not None and isinstance(row_u[0], (float, int)) and (now - row_u[0]) < 30:
+                raise HTTPException(status_code=429, detail="Too fast. Please wait a moment and try again.")
 
-        # your existing simple anti-spam (IP based 30s)
-        try:
+            # IP-based cooldown
             row = conn.execute(
                 "SELECT ts FROM feedback WHERE ip=? ORDER BY ts DESC LIMIT 1", (ip,)
             ).fetchone()
-        except Exception:
-            row = None
-        if row is not None:
-            last_ts = row[0]
-            if isinstance(last_ts, (float, int)) and (now - last_ts) < 30:
-                raise HTTPException(status_code=429, detail="Feedback rate limit exceeded. Only one vote is allowed per trade.")
+            if row is not None:
+                last_ts = row[0]
+                if isinstance(last_ts, (float, int)) and (now - last_ts) < 30:
+                    raise HTTPException(status_code=429, detail="Feedback rate limit exceeded. Only one vote is allowed per trade.")
 
-        # Insert — one vote per (uid,fingerprint); mark accepted=1
-        try:
-            cur = conn.execute(
-                """INSERT INTO feedback
-                   (ts, symbol, tf, market, direction, entry, stop, targets, confidence, advice,
-                    outcome, features, edge, composite, equity, risk_pct, leverage, ua, ip,
-                    uid, fingerprint, accepted)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)""",
-                (
-                    now,
-                    fb.symbol, fb.tf, fb.market, fb.direction,
-                    fb.entry, fb.stop, json.dumps(fb.targets or []),
-                    fb.confidence, fb.advice, fb.outcome,
-                    json.dumps(fb.features or {}), json.dumps(fb.edge or {}),
-                    json.dumps(fb.composite or {}), fb.equity, fb.risk_pct,
-                    fb.leverage, ua, ip,
-                    int(fb.uid), fb.fingerprint
+            # unique (uid,fingerprint)
+            try:
+                cur = conn.execute(
+                    """INSERT INTO feedback
+                       (ts, symbol, tf, market, direction, entry, stop, targets, confidence, advice,
+                        outcome, features, edge, composite, equity, risk_pct, leverage, ua, ip,
+                        uid, fingerprint, accepted)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)""",
+                    (
+                        now, fb.symbol, fb.tf, fb.market, fb.direction, fb.entry, fb.stop,
+                        json.dumps(fb.targets or []), fb.confidence, fb.advice, fb.outcome,
+                        json.dumps(fb.features or {}), json.dumps(fb.edge or {}),
+                        json.dumps(fb.composite or {}), fb.equity, fb.risk_pct, fb.leverage,
+                        ua, ip, int(fb.uid), fb.fingerprint
+                    )
                 )
-            )
-        except sqlite3.IntegrityError:
-            # Unique (uid,fingerprint) violation
-            raise HTTPException(status_code=409, detail="Already voted for this trade")
+            except sqlite3.IntegrityError:
+                raise HTTPException(status_code=409, detail="Already voted for this trade")
 
-        rid = cur.lastrowid
-        conn.commit()
-    finally:
-        conn.close()
+            rid = cur.lastrowid
+            conn.commit()
+        finally:
+            conn.close()
 
-    # Optional: update weights as before (best-effort)
     try:
         update_weights(fb.features or {}, fb.outcome)
     except Exception:
