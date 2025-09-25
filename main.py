@@ -2,6 +2,7 @@
 # FastAPI + ccxt + pandas (py3.12 recommended; see requirements.txt)
 from __future__ import annotations
 from fastapi import FastAPI, HTTPException, Depends, Header, Query, Request
+from fastapi.responses import PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any, Tuple
@@ -43,20 +44,16 @@ def load_markets():
     return ex.markets
 
 # put this near the top, before app = FastAPI(...)
-ALLOWED_ORIGINS = os.getenv(
-    "ALLOWED_ORIGINS",
-    "https://craftyalpha.com,https://ai-trader-advisor.onrender.com"
-)
-ALLOWED_ORIGINS = [o.strip() for o in ALLOWED_ORIGINS.split(",") if o.strip()]
-
-app = FastAPI(title="AI Trade Advisor API", version="2025.09")
+origins_env = os.getenv("ALLOWED_ORIGINS", "*")
+origins = ["*"] if origins_env == "*" else [o.strip() for o in origins_env.split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
+    allow_origins=origins,
     allow_methods=["*"],
     allow_headers=["*"],
-    allow_credentials=True,   # keep true since you’re not using "*"
+    allow_credentials=True,
 )
+app = FastAPI(title="AI Trade Advisor API", version="2025.09")
 
 # ========= FEEDBACK STORAGE & ONLINE WEIGHTS =========
 DB_PATH = os.getenv("FEEDBACK_DB", "/tmp/ai_trade_feedback.db")
@@ -787,11 +784,16 @@ class Instrument(BaseModel):
     symbol: str; name: str; market: str; tf_supported: List[str]
 
 # ----- Endpoints -----
-@app.get("/health")
-def health():
-    try: name = get_exchange().id
-    except Exception as e: name = f"error: {e}"
-    return {"ok": True, "exchange": name, "quote": QUOTE}
+
+@app.get("/healthz", include_in_schema=False)
+def healthz():
+    return PlainTextResponse("ok")
+
+@app.middleware("http")
+async def _log_requests(request, call_next):
+    if request.url.path in ("/healthz", "/health"):
+        print(f"HEALTH HIT: {request.method} {request.url.path}")
+    return await call_next(request)
 
 @app.get("/instruments", response_model=List[Instrument])
 def instruments(_: None = Depends(require_key)):
