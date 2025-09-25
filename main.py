@@ -126,15 +126,21 @@ def ensure_feedback_migrations(conn):
     # Pre-dedupe to allow unique index creation on legacy data
     cur.execute("""
         DELETE FROM feedback
-        WHERE fingerprint IS NOT NULL
-          AND uid IS NOT NULL
-          AND id NOT IN (
-            SELECT MAX(id) FROM feedback
+        WHERE id IN (
+          SELECT id FROM (
+            SELECT id,
+                   ROW_NUMBER() OVER(
+                     PARTITION BY COALESCE(uid,0), COALESCE(fingerprint,'')
+                     ORDER BY id DESC
+                   ) AS rn
+            FROM feedback
             WHERE fingerprint IS NOT NULL
-            GROUP BY COALESCE(uid,0), COALESCE(fingerprint,'')
-          )
+          ) t
+          WHERE t.rn > 1
+        )
     """)
 
+    # Safe to create indexes now that columns exist
     cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_feedback_uid_fp ON feedback(uid, fingerprint)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_fb_sym_tf_acc_ts ON feedback(symbol, tf, accepted, ts)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_fb_uid_ts ON feedback(uid, ts)")
@@ -575,17 +581,17 @@ def infer_signal(feats: pd.DataFrame, min_conf: float) -> Tuple[str,float,Dict[s
 
     return sig, conf, {"trend_ok":trend_ok,"vol_ok":vol_ok,"confidence_ok":conf>=min_conf}, reasons
 
-def _vote_matches_market(fb: 'FeedbackIn') -> Tuple[bool, str]:
+def _vote_matches_market(fb: FeedbackIn) -> Tuple[bool, str]:
     # Need direction+entry for any meaningful check
     if not fb.direction or fb.entry is None:
         return False, "missing direction/entry for consistency check"
 
-    # Try real-time last price; fallback to last close
+    # Prefer real-time last price; fallback to last close
     ex = get_exchange()
     px = None
     try:
         t = ex.fetch_ticker(fb.symbol)
-        if t and "last" in t and t["last"] is not None:
+        if t and t.get("last"):
             px = float(t["last"])
     except Exception:
         pass
@@ -594,30 +600,21 @@ def _vote_matches_market(fb: 'FeedbackIn') -> Tuple[bool, str]:
         px = float(df["close"].iloc[-1])
 
     is_long = fb.direction.lower().startswith("long")
-
-    # TP1 selection identical to resolver’s rule: Long=min(tps), Short=max(tps)
     tp1 = None
     if fb.targets:
-        try:
-            tps = [float(x) for x in fb.targets if x is not None]
-        except Exception:
-            tps = []
+        tps = [float(x) for x in fb.targets if x is not None]
         if tps:
             tp1 = min(tps) if is_long else max(tps)
 
     if fb.outcome > 0:  # 👍 “good”
-        if is_long:
-            ok = (tp1 is not None and px >= tp1) or (px > float(fb.entry))
-        else:
-            ok = (tp1 is not None and px <= tp1) or (px < float(fb.entry))
+        ok = (tp1 is not None and ((px >= tp1) if is_long else (px <= tp1))) or \
+             ((px > float(fb.entry)) if is_long else (px < float(fb.entry)))
         return ok, "upvote requires TP1 hit or profit at vote time"
 
     if fb.outcome < 0:  # 👎 “bad”
         if fb.stop is not None:
-            if is_long:
-                ok = (px <= float(fb.stop)) or (px < float(fb.entry))
-            else:
-                ok = (px >= float(fb.stop)) or (px > float(fb.entry))
+            ok = ((px <= float(fb.stop)) if is_long else (px >= float(fb.stop))) or \
+                 ((px < float(fb.entry)) if is_long else (px > float(fb.entry)))
         else:
             # No SL provided; allow pure P&L check
             ok = (px < float(fb.entry)) if is_long else (px > float(fb.entry))
@@ -697,10 +694,10 @@ def resolve_offer_row(row: sqlite3.Row) -> dict:
     direction = row["direction"]
     entry = row["entry"]
     stop = row["stop"]
-    try:
-        targets = [float(x) for x in json.loads(row["targets"] or "[]") if x is not None]
-    except Exception:
-        targets = []
+try:
+    targets = [float(x) for x in json.loads(row["targets"] or "[]") if x is not None]
+except Exception:
+    targets = []
     created_ts = int(row["created_ts"])
     expires_ts = int(row["expires_ts"])
 
@@ -1016,60 +1013,56 @@ def post_feedback(fb: FeedbackIn, request: Request, x_user_id: Optional[int] = H
     ok, why = _vote_matches_market(fb)
     if not ok:
         raise HTTPException(status_code=422, detail=f"Vote rejected: {why}")
-
     with _db_lock:
-        conn = _db()
+    conn = _db()
+    try:
+        # NEW: per-user cooldown (same window)
+        row_u = conn.execute(
+            "SELECT ts FROM feedback WHERE uid=? ORDER BY ts DESC LIMIT 1",
+            (int(fb.uid or 0),)
+        ).fetchone()
+        if row_u is not None and isinstance(row_u[0], (float, int)) and (now - row_u[0]) < 30:
+            raise HTTPException(status_code=429, detail="Too fast. Please wait a moment and try again.")
+
+        # your existing simple anti-spam (IP based 30s)
         try:
-            # your existing simple anti-spam (IP based 30s)
-            try:
-                row = conn.execute(
-                    "SELECT ts FROM feedback WHERE ip=? ORDER BY ts DESC LIMIT 1", (ip,)
-                ).fetchone()
-            except Exception:
-                row = None
-            if row is not None:
-                last_ts = row[0]
-                if isinstance(last_ts, (float, int)) and (now - last_ts) < 30:
-                    raise HTTPException(status_code=429, detail="Too fast. Please wait a moment and try again.")
+            row = conn.execute(
+                "SELECT ts FROM feedback WHERE ip=? ORDER BY ts DESC LIMIT 1", (ip,)
+            ).fetchone()
+        except Exception:
+            row = None
+        if row is not None:
+            last_ts = row[0]
+            if isinstance(last_ts, (float, int)) and (now - last_ts) < 30:
+                raise HTTPException(status_code=429, detail="Feedback rate limit exceeded. Only one vote is allowed per trade.")
 
-            # NEW: per-user cooldown (same 30s window)
-            try:
-                row_u = conn.execute(
-                    "SELECT ts FROM feedback WHERE uid=? ORDER BY ts DESC LIMIT 1",
-                    (int(fb.uid),)
-                ).fetchone()
-            except Exception:
-                row_u = None
-            if row_u is not None and isinstance(row_u[0], (float, int)) and (now - row_u[0]) < 30:
-                raise HTTPException(status_code=429, detail="Too fast. Please wait a moment and try again.")
-
-            # Insert — one vote per (uid,fingerprint); mark accepted=1
-            try:
-                cur = conn.execute(
-                    """INSERT INTO feedback
-                       (ts, symbol, tf, market, direction, entry, stop, targets, confidence, advice,
-                        outcome, features, edge, composite, equity, risk_pct, leverage, ua, ip,
-                        uid, fingerprint, accepted)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)""",
-                    (
-                        now,
-                        fb.symbol, fb.tf, fb.market, fb.direction,
-                        fb.entry, fb.stop, json.dumps(fb.targets or []),
-                        fb.confidence, fb.advice, fb.outcome,
-                        json.dumps(fb.features or {}), json.dumps(fb.edge or {}),
-                        json.dumps(fb.composite or {}), fb.equity, fb.risk_pct,
-                        fb.leverage, ua, ip,
-                        int(fb.uid), fb.fingerprint
-                    )
+        # Insert — one vote per (uid,fingerprint); mark accepted=1
+        try:
+            cur = conn.execute(
+                """INSERT INTO feedback
+                   (ts, symbol, tf, market, direction, entry, stop, targets, confidence, advice,
+                    outcome, features, edge, composite, equity, risk_pct, leverage, ua, ip,
+                    uid, fingerprint, accepted)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)""",
+                (
+                    now,
+                    fb.symbol, fb.tf, fb.market, fb.direction,
+                    fb.entry, fb.stop, json.dumps(fb.targets or []),
+                    fb.confidence, fb.advice, fb.outcome,
+                    json.dumps(fb.features or {}), json.dumps(fb.edge or {}),
+                    json.dumps(fb.composite or {}), fb.equity, fb.risk_pct,
+                    fb.leverage, ua, ip,
+                    int(fb.uid), fb.fingerprint
                 )
-            except sqlite3.IntegrityError:
-                # Unique (uid,fingerprint) violation
-                raise HTTPException(status_code=409, detail="Already voted for this trade")
+            )
+        except sqlite3.IntegrityError:
+            # Unique (uid,fingerprint) violation
+            raise HTTPException(status_code=409, detail="Already voted for this trade")
 
-            rid = cur.lastrowid
-            conn.commit()
-        finally:
-            conn.close()
+        rid = cur.lastrowid
+        conn.commit()
+    finally:
+        conn.close()
 
     # Optional: update weights as before (best-effort)
     try:
