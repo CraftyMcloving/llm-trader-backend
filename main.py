@@ -1,21 +1,15 @@
-# main.py — AI Trade Advisor backend v3.0.0 (Kraken/USD)
+# main.py — AI Trade Advisor backend v3.0.4 (Kraken/USD)
 
 # FastAPI + ccxt + pandas (py3.12 recommended; see requirements.txt)
-from fastapi import FastAPI, HTTPException, Depends, Header, Query
+from fastapi import FastAPI, HTTPException, Depends, Header, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any, Tuple
-import os, time, math
+import os, json, sqlite3, threading, time
+import math
 import pandas as pd
 import numpy as np
 import ccxt
-
-# ---- FEEDBACK: imports ----
-import os, json, sqlite3, threading, time
-from typing import Optional, Dict, Any, List
-from pydantic import BaseModel, Field
-from fastapi import Request
-# ---------------------------
 
 
 # ----- Security -----
@@ -53,7 +47,10 @@ def load_markets():
 app = FastAPI(title="AI Trade Advisor API", version="2025.09")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
+    allow_origins=[os.getenv("ALLOWED_ORIGIN", "https://craftyalpha.com", "https://ai-trader-advisor.onrender.com")],
+    allow_methods=["*"],
+    allow_headers=["*"],
+    allow_credentials=True,
 )
 
 # ========= FEEDBACK STORAGE & ONLINE WEIGHTS =========
@@ -115,6 +112,33 @@ def init_feedback_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_offers_exp ON offers(expires_ts);")
         conn.commit()
         conn.close()
+
+def ensure_feedback_migrations(conn):
+    cur = conn.cursor()
+    cols = {r[1] for r in cur.execute("PRAGMA table_info(feedback)").fetchall()}
+    if "uid" not in cols:
+        cur.execute("ALTER TABLE feedback ADD COLUMN uid INTEGER DEFAULT 0")
+    if "fingerprint" not in cols:
+        cur.execute("ALTER TABLE feedback ADD COLUMN fingerprint TEXT")
+    if "accepted" not in cols:
+        cur.execute("ALTER TABLE feedback ADD COLUMN accepted INTEGER DEFAULT 1")
+
+    # Pre-dedupe to allow unique index creation on legacy data
+    cur.execute("""
+        DELETE FROM feedback
+        WHERE fingerprint IS NOT NULL
+          AND uid IS NOT NULL
+          AND id NOT IN (
+            SELECT MAX(id) FROM feedback
+            WHERE fingerprint IS NOT NULL
+            GROUP BY COALESCE(uid,0), COALESCE(fingerprint,'')
+          )
+    """)
+
+    cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_feedback_uid_fp ON feedback(uid, fingerprint)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_fb_sym_tf_acc_ts ON feedback(symbol, tf, accepted, ts)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_fb_uid_ts ON feedback(uid, ts)")
+    conn.commit()
 
 def get_weights() -> Dict[str, float]:
     with _db_lock:
@@ -210,6 +234,15 @@ def _start_bg():
         t = threading.Thread(target=_bg_worker, daemon=True)
         t.start()
 
+@app.on_event("startup")
+def _startup():
+    with _db_lock:
+        conn = _db()
+        try:
+            ensure_feedback_migrations(conn)
+        finally:
+            conn.close()
+
 # =====================================================
 
 def apply_feedback_bias(confidence: float, features: Dict[str, Any]) -> float:
@@ -234,7 +267,7 @@ CURATED = [
     "BTC","ETH","XRP","SOL","ADA","DOGE","LINK","LTC","BCH","TRX",
     "DOT","ATOM","XLM","ETC","MATIC","UNI","APT","ARB","OP","AVAX",
     "NEAR","ALGO","FIL","SUI","SHIB","USDC","USDT","XMR","AAVE"
-    ,"PAXG","ONDO","PEPE","SEI","IMX","FIL","TIA"
+    ,"PAXG","ONDO","PEPE","SEI","IMX","TIA"
 ]
 def get_universe(quote=QUOTE, limit=TOP_N) -> List[Dict[str, Any]]:
     key = f"uni:{EXCHANGE_ID}:{quote}:{limit}"
@@ -327,7 +360,7 @@ def hold_secs_for(tf: str) -> int:
     return HOLD_1H_SECS
 # --------------------------------------------------------
 
-def _tp_hit_first(row, entry, stop, tps, df, direction: str) -> Tuple[str, float]:
+def _tp_hit_first(entry, stop, tps, df, direction: str) -> Tuple[str, float]:
     """
     Walk forward per candle from offer creation to expiry, returning ("TP"/"SL"/"NONE", pnl_frac_at_event_or_expiry)
     pnl_frac is (price-entry)/entry for Long, (entry-price)/entry for Short.
@@ -542,6 +575,56 @@ def infer_signal(feats: pd.DataFrame, min_conf: float) -> Tuple[str,float,Dict[s
 
     return sig, conf, {"trend_ok":trend_ok,"vol_ok":vol_ok,"confidence_ok":conf>=min_conf}, reasons
 
+def _vote_matches_market(fb: 'FeedbackIn') -> Tuple[bool, str]:
+    # Need direction+entry for any meaningful check
+    if not fb.direction or fb.entry is None:
+        return False, "missing direction/entry for consistency check"
+
+    # Try real-time last price; fallback to last close
+    ex = get_exchange()
+    px = None
+    try:
+        t = ex.fetch_ticker(fb.symbol)
+        if t and "last" in t and t["last"] is not None:
+            px = float(t["last"])
+    except Exception:
+        pass
+    if px is None:
+        df = fetch_ohlcv(fb.symbol, fb.tf, bars=2)
+        px = float(df["close"].iloc[-1])
+
+    is_long = fb.direction.lower().startswith("long")
+
+    # TP1 selection identical to resolver’s rule: Long=min(tps), Short=max(tps)
+    tp1 = None
+    if fb.targets:
+        try:
+            tps = [float(x) for x in fb.targets if x is not None]
+        except Exception:
+            tps = []
+        if tps:
+            tp1 = min(tps) if is_long else max(tps)
+
+    if fb.outcome > 0:  # 👍 “good”
+        if is_long:
+            ok = (tp1 is not None and px >= tp1) or (px > float(fb.entry))
+        else:
+            ok = (tp1 is not None and px <= tp1) or (px < float(fb.entry))
+        return ok, "upvote requires TP1 hit or profit at vote time"
+
+    if fb.outcome < 0:  # 👎 “bad”
+        if fb.stop is not None:
+            if is_long:
+                ok = (px <= float(fb.stop)) or (px < float(fb.entry))
+            else:
+                ok = (px >= float(fb.stop)) or (px > float(fb.entry))
+        else:
+            # No SL provided; allow pure P&L check
+            ok = (px < float(fb.entry)) if is_long else (px > float(fb.entry))
+        return ok, "downvote requires SL hit or loss at vote time"
+
+    return False, "invalid outcome"
+
 # ----- Pure helper used by both endpoints -----
 def evaluate_signal(
     symbol: str,
@@ -614,7 +697,10 @@ def resolve_offer_row(row: sqlite3.Row) -> dict:
     direction = row["direction"]
     entry = row["entry"]
     stop = row["stop"]
-    targets = json.loads(row["targets"] or "[]")
+    try:
+        targets = [float(x) for x in json.loads(row["targets"] or "[]") if x is not None]
+    except Exception:
+        targets = []
     created_ts = int(row["created_ts"])
     expires_ts = int(row["expires_ts"])
 
@@ -642,7 +728,6 @@ def resolve_offer_row(row: sqlite3.Row) -> dict:
         outcome = 1 if pnl_frac > 0 else (-1 if pnl_frac < 0 else 0)
     else:
         result, pnl_frac = _tp_hit_first(
-            row,
             float(entry),
             float(stop),
             [float(x) for x in targets],
@@ -734,9 +819,6 @@ def chart(symbol: str, tf: str = "1h", n: int = 120, _: None = Depends(require_k
     closes = df["close"].tail(n).astype(float).tolist()
     return {"symbol": symbol, "tf": tf, "closes": closes}
 
-from typing import Optional, Dict, Any
-from fastapi import Query, Depends, HTTPException
-
 @app.get("/signals")
 def signals(
     symbol: str,
@@ -780,7 +862,6 @@ def scan(
     limit: int = Query(TOP_N, ge=3, le=50),
     top: int = Query(6, ge=1, le=12),
     min_confidence: Optional[float] = Query(None),
-    auto_relax: int = Query(1, ge=0, le=1),
     allow_neutral: int = Query(1, ge=0, le=1),
     ignore_trend: int = Query(0, ge=0, le=1),   # NEW
     ignore_vol: int = Query(0, ge=0, le=1),     # NEW
@@ -874,11 +955,16 @@ class FeedbackIn(BaseModel):
     equity: Optional[float] = None
     risk_pct: Optional[float] = None
     leverage: Optional[float] = None
+    currency: Optional[str] = None
     outcome: int = Field(..., description="+1 good (TP/favorable), -1 bad (SL hit)")
+    uid: Optional[int] = None
+    fingerprint: Optional[str] = None
 
 class FeedbackAck(BaseModel):
     ok: bool
     stored_id: Optional[int] = None
+    accepted: Optional[bool] = None
+    detail: Optional[str] = None
 
 class OfferIn(BaseModel):
     symbol: str
@@ -904,69 +990,108 @@ class OffersBatch(BaseModel):
     universe: Optional[int] = None
     note: Optional[str] = None
 
-@app.post("/feedback", response_model=FeedbackAck)
-def post_feedback(fb: FeedbackIn, request: Request):
-    ua = request.headers.get("user-agent", "")
+@app.post("/feedback", response_model=FeedbackAck, dependencies=[Depends(require_key)])
+def post_feedback(fb: FeedbackIn, request: Request, x_user_id: Optional[int] = Header(None)):
+    ua = request.headers.get("user-agent", "")[:300]
     ip = request.client.host if request.client else ""
-    # basic anti-spam: limit feedback submissions from the same IP in rapid succession
-    # If the same client IP has submitted feedback within the last 30 seconds, reject
-    current_time = time.time()
+    now = time.time()
+    uid = x_user_id
+    if not uid or uid <= 0:
+        raise HTTPException(status_code=401, detail="login required")
+    fb.uid = int(uid)  # overwrite anything from client
+
+    # Must be logged in (WP proxy stamps this)
+    if not fb.uid or fb.uid <= 0:
+    raise HTTPException(status_code=401, detail="login required")
+
+    # Build a fallback fingerprint if frontend didn’t send one
+    if not fb.fingerprint:
+        d = (fb.direction or "").upper()
+        e = f"{fb.entry:.6f}" if fb.entry is not None else "0"
+        s = f"{fb.stop:.6f}" if fb.stop is not None else "0"
+        t = f"{(fb.targets or [None])[0]:.6f}" if (fb.targets and fb.targets[0] is not None) else "0"
+        fb.fingerprint = "|".join([fb.symbol, fb.tf, d, e, s, t])
+
+    # Validate against live market at click time
+    ok, why = _vote_matches_market(fb)
+    if not ok:
+        raise HTTPException(status_code=422, detail=f"Vote rejected: {why}")
+
     with _db_lock:
         conn = _db()
-        # check the most recent submission from this IP
         try:
-            row = conn.execute(
-                "SELECT ts FROM feedback WHERE ip=? ORDER BY ts DESC LIMIT 1", (ip,)
-            ).fetchone()
-        except Exception:
-            row = None
-        if row is not None:
-            last_ts = row[0]
-            if isinstance(last_ts, (float, int)) and (current_time - last_ts) < 30:
-                conn.close()
-                raise HTTPException(status_code=429, detail="Feedback rate limit exceeded. Please wait and try again.")
-        # record feedback
-        cur = conn.execute(
-            """INSERT INTO feedback
-               (ts, symbol, tf, market, direction, entry, stop, targets, confidence, advice,
-                outcome, features, edge, composite, equity, risk_pct, leverage, ua, ip)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                current_time,
-                fb.symbol, fb.tf, fb.market, fb.direction,
-                fb.entry, fb.stop, json.dumps(fb.targets or []),
-                fb.confidence, fb.advice, fb.outcome,
-                json.dumps(fb.features or {}), json.dumps(fb.edge or {}),
-                json.dumps(fb.composite or {}), fb.equity, fb.risk_pct,
-                fb.leverage, ua[:300], ip
-            )
-        )
-        rid = cur.lastrowid
-        conn.commit()
-        conn.close()
-    # update model weights
+            # your existing simple anti-spam (IP based 30s)
+            try:
+                row = conn.execute(
+                    "SELECT ts FROM feedback WHERE ip=? ORDER BY ts DESC LIMIT 1", (ip,)
+                ).fetchone()
+            except Exception:
+                row = None
+            if row is not None:
+                last_ts = row[0]
+                if isinstance(last_ts, (float, int)) and (now - last_ts) < 30:
+                    raise HTTPException(status_code=429, detail="Too fast. Please wait a moment and try again.")
+
+            # NEW: per-user cooldown (same 30s window)
+            try:
+                row_u = conn.execute(
+                    "SELECT ts FROM feedback WHERE uid=? ORDER BY ts DESC LIMIT 1",
+                    (int(fb.uid),)
+                ).fetchone()
+            except Exception:
+                row_u = None
+            if row_u is not None and isinstance(row_u[0], (float, int)) and (now - row_u[0]) < 30:
+                raise HTTPException(status_code=429, detail="Too fast. Please wait a moment and try again.")
+
+            # Insert — one vote per (uid,fingerprint); mark accepted=1
+            try:
+                cur = conn.execute(
+                    """INSERT INTO feedback
+                       (ts, symbol, tf, market, direction, entry, stop, targets, confidence, advice,
+                        outcome, features, edge, composite, equity, risk_pct, leverage, ua, ip,
+                        uid, fingerprint, accepted)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)""",
+                    (
+                        now,
+                        fb.symbol, fb.tf, fb.market, fb.direction,
+                        fb.entry, fb.stop, json.dumps(fb.targets or []),
+                        fb.confidence, fb.advice, fb.outcome,
+                        json.dumps(fb.features or {}), json.dumps(fb.edge or {}),
+                        json.dumps(fb.composite or {}), fb.equity, fb.risk_pct,
+                        fb.leverage, ua, ip,
+                        int(fb.uid), fb.fingerprint
+                    )
+                )
+            except sqlite3.IntegrityError:
+                # Unique (uid,fingerprint) violation
+                raise HTTPException(status_code=409, detail="Already voted for this trade")
+
+            rid = cur.lastrowid
+            conn.commit()
+        finally:
+            conn.close()
+
+    # Optional: update weights as before (best-effort)
     try:
         update_weights(fb.features or {}, fb.outcome)
     except Exception:
         pass
-    return FeedbackAck(ok=True, stored_id=rid)
 
-from typing import Optional
+    return FeedbackAck(ok=True, stored_id=rid, accepted=True)
 
 @app.get("/feedback/summary")
-def feedback_summary(symbol: str, tf: str, direction: Optional[str] = None):
+def feedback_summary(symbol: str, tf: str, direction: Optional[str] = None, window: int = Query(86400, ge=1)):
+    """Summarize ONLY accepted, human votes in the last `window` seconds."""
+    cutoff = time.time() - float(window)
     with _db_lock:
         conn = _db()
-        params = [symbol, tf]
-        where = "symbol=? AND tf=?"
+        params = [symbol, tf, cutoff]
+        where = "symbol=? AND tf=? AND accepted=1 AND uid>0 AND ts>=?"
         if direction:
             where += " AND (direction=? OR (direction IS NULL AND ?=''))"
             params.extend([direction, direction])
-
-        rows = conn.execute(
-            f"SELECT outcome FROM feedback WHERE {where}",
-            params
-        ).fetchall()
+        rows = conn.execute(f"SELECT outcome FROM feedback WHERE {where}", params).fetchall()
+        conn.close()
     up = sum(1 for r in rows if (r[0] or 0) > 0)
     down = sum(1 for r in rows if (r[0] or 0) < 0)
     total = len(rows)
@@ -984,7 +1109,7 @@ def feedback_stats():
     return {"total": total, "good": good, "bad": bad, "weights": W}
 
 @app.post("/learning/offered")
-def learning_offered(batch: OffersBatch, request: Request):
+def learning_offered(batch: OffersBatch, request: Request, _: None = Depends(require_key)):
     if not batch.items:
         return {"ok": True, "stored": 0}
 
@@ -1017,13 +1142,11 @@ def learning_offered(batch: OffersBatch, request: Request):
 
     return {"ok": True, "stored": len(batch.items)}
 
-from pydantic import BaseModel
-
 class ResolveOneIn(BaseModel):
     id: int
 
 @app.post("/learning/resolve-one")
-def learning_resolve_one(body: ResolveOneIn):
+def learning_resolve_one(body: ResolveOneIn, _: None = Depends(require_key)):
     with _db_lock:
         conn = _db()
         conn.row_factory = sqlite3.Row
@@ -1048,7 +1171,7 @@ def learning_resolve_one(body: ResolveOneIn):
     return {"ok": True, "id": body.id, **upd}
 
 @app.post("/learning/resolve-due")
-def learning_resolve_due(limit: int = Query(50, ge=1, le=500)):
+def learning_resolve_due(limit: int = Query(50, ge=1, le=500), _: None = Depends(require_key)):
     return resolve_due_offers(limit=limit)
 
 @app.get("/learning/stats")
