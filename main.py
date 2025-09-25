@@ -789,12 +789,6 @@ class Instrument(BaseModel):
 def healthz():
     return PlainTextResponse("ok")
 
-@app.middleware("http")
-async def _log_requests(request, call_next):
-    if request.url.path in ("/healthz", "/health"):
-        print(f"HEALTH HIT: {request.method} {request.url.path}")
-    return await call_next(request)
-
 @app.get("/instruments", response_model=List[Instrument])
 def instruments(_: None = Depends(require_key)):
     return get_universe()
