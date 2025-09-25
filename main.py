@@ -26,10 +26,21 @@ app.add_middleware(
 
 # ----- Security -----
 API_KEY = os.getenv("API_KEY", "change-me")
-def require_key(authorization: Optional[str] = Header(None)):
-    if not authorization or not authorization.startswith("Bearer "):
+def require_key(
+    authorization: Optional[str] = Header(None),
+    x_api_key: Optional[str] = Header(None),
+    api_key_q: Optional[str] = Query(None),
+):
+    token = None
+    if authorization and authorization.lower().startswith("bearer "):
+        token = authorization.split(" ", 1)[1].strip()
+    elif x_api_key:       # fallback if proxy strips Authorization
+        token = x_api_key.strip()
+    elif api_key_q:       # last-resort fallback (avoid using in URLs routinely)
+        token = api_key_q.strip()
+
+    if not token:
         raise HTTPException(status_code=401, detail="Missing token")
-    token = authorization.split(" ", 1)[1].strip()
     if token != API_KEY:
         raise HTTPException(status_code=403, detail="Bad token")
     return None
@@ -976,6 +987,8 @@ class OffersBatch(BaseModel):
     items: List[OfferIn]
     universe: Optional[int] = None
     note: Optional[str] = None
+    
+from fastapi import Request, Header
 
 @app.post("/feedback", response_model=FeedbackAck, dependencies=[Depends(require_key)])
 def post_feedback(fb: FeedbackIn, request: Request, x_user_id: Optional[int] = Header(None)):
@@ -983,14 +996,15 @@ def post_feedback(fb: FeedbackIn, request: Request, x_user_id: Optional[int] = H
     ip = request.client.host if request.client else ""
     now = time.time()
 
-    uid = x_user_id
-    if not uid or uid <= 0:
-        raise HTTPException(status_code=401, detail="login required")
-    fb.uid = int(uid)
+    uid = int(x_user_id or 0)
+    if uid <= 0 and fb.uid:          # accept body fallback if header got dropped
+        uid = int(fb.uid or 0)
 
     # Must be logged in (WP proxy stamps this) – keep, but it’s redundant now
-    if not fb.uid or fb.uid <= 0:
+    if uid <= 0:
         raise HTTPException(status_code=401, detail="login required")
+
+    fb.uid = uid  # canonicalize
 
     if not fb.fingerprint:
         d = (fb.direction or "").upper()
