@@ -12,6 +12,19 @@ import pandas as pd
 import numpy as np
 import ccxt
 
+# put this near the top, before app = FastAPI(...)
+origins_env = os.getenv("ALLOWED_ORIGINS", "*")
+origins = ["*"] if origins_env == "*" else [o.strip() for o in origins_env.split(",") if o.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    allow_credentials=True,
+)
+
+app = FastAPI(title="AI Trade Advisor API", version="2025.09")
+
 # ----- Security -----
 API_KEY = os.getenv("API_KEY", "change-me")
 def require_key(authorization: Optional[str] = Header(None)):
@@ -43,17 +56,6 @@ def load_markets():
         ex.load_markets()
     return ex.markets
 
-# put this near the top, before app = FastAPI(...)
-origins_env = os.getenv("ALLOWED_ORIGINS", "*")
-origins = ["*"] if origins_env == "*" else [o.strip() for o in origins_env.split(",") if o.strip()]
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    allow_credentials=True,
-)
-app = FastAPI(title="AI Trade Advisor API", version="2025.09")
 
 # ========= FEEDBACK STORAGE & ONLINE WEIGHTS =========
 DB_PATH = os.getenv("FEEDBACK_DB", "/tmp/ai_trade_feedback.db")
@@ -788,6 +790,12 @@ class Instrument(BaseModel):
 @app.get("/healthz", include_in_schema=False)
 def healthz():
     return PlainTextResponse("ok")
+
+@app.middleware("http")
+async def _log_requests(request, call_next):
+    if request.url.path in ("/healthz", "/health"):
+        print(f"HEALTH HIT: {request.method} {request.url.path}")
+    return await call_next(request)
 
 @app.get("/instruments", response_model=List[Instrument])
 def instruments(_: None = Depends(require_key)):
