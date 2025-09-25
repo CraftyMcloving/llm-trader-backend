@@ -12,7 +12,8 @@ import pandas as pd
 import numpy as np
 import ccxt
 
-# put this near the top, before app = FastAPI(...)
+app = FastAPI(title="AI Trade Advisor API", version="2025.09")
+
 origins_env = os.getenv("ALLOWED_ORIGINS", "*")
 origins = ["*"] if origins_env == "*" else [o.strip() for o in origins_env.split(",") if o.strip()]
 app.add_middleware(
@@ -22,8 +23,6 @@ app.add_middleware(
     allow_headers=["*"],
     allow_credentials=True,
 )
-
-app = FastAPI(title="AI Trade Advisor API", version="2025.09")
 
 # ----- Security -----
 API_KEY = os.getenv("API_KEY", "change-me")
