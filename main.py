@@ -119,6 +119,14 @@ def init_feedback_db():
         pnl        REAL,              -- Phase 2: realized P/L at resolution
         resolved_ts REAL              -- Phase 2: epoch seconds
         );
+        CREATE TABLE IF NOT EXISTS tracked(
+          uid INTEGER NOT NULL,
+          id  TEXT PRIMARY KEY,
+          item_json  TEXT NOT NULL,
+          created_at_ms INTEGER NOT NULL,
+          expires_at_ms INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_tracked_uid ON tracked(uid);
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_offers_symbol_tf ON offers(symbol, tf);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_offers_created ON offers(created_ts);")
@@ -1184,6 +1192,112 @@ def learning_config(_: None = Depends(require_key)):
         "bg_interval": BG_INTERVAL,
         "eval_stop_first": bool(EVAL_STOP_FIRST),
     }
+
+# ========= TRACKED TRADES (for mobile app) =========
+from fastapi import Body
+
+def _uid_from_header(x_user_id: Optional[int]) -> int:
+    uid = int(x_user_id or 0)
+    if uid <= 0:
+        raise HTTPException(401, detail="login required (X-User-Id)")
+    return uid
+
+def _tracked_list_for(uid: int):
+    with _db_lock:
+        conn = _db()
+        now_ms = int(time.time() * 1000)
+        # prune expired
+        conn.execute("DELETE FROM tracked WHERE uid=? AND expires_at_ms<=?", (uid, now_ms))
+        rows = conn.execute(
+            "SELECT id, item_json, created_at_ms, expires_at_ms "
+            "FROM tracked WHERE uid=? ORDER BY created_at_ms DESC",
+            (uid,)
+        ).fetchall()
+        conn.close()
+
+    out = []
+    for (id_, js, ca, ea) in rows:
+        try:
+            item = json.loads(js)
+        except Exception:
+            item = None
+        out.append({
+            "id": id_, "item": item,
+            "createdAt": ca, "expiresAt": ea
+        })
+    return out
+
+@app.get("/tracked")
+def tracked_get(x_user_id: Optional[int] = Header(None), _: None = Depends(require_key)):
+    uid = _uid_from_header(x_user_id)
+    return _tracked_list_for(uid)
+
+class TrackIn(BaseModel):
+    item: Dict[str, Any]
+    expiresInMs: Optional[int] = None
+
+@app.post("/tracked")
+def tracked_post(body: TrackIn, x_user_id: Optional[int] = Header(None), _: None = Depends(require_key)):
+    uid = _uid_from_header(x_user_id)
+    now_ms = int(time.time() * 1000)
+    expires_ms = now_ms + int(body.expiresInMs or 0)
+
+    symbol = (body.item or {}).get("symbol", "NA")
+    tf     = (body.item or {}).get("timeframe") or (body.item or {}).get("tf") or "1h"
+    new_id = f"{symbol}|{tf}|{now_ms}"
+
+    with _db_lock:
+        conn = _db()
+        # prune first
+        conn.execute("DELETE FROM tracked WHERE uid=? AND expires_at_ms<=?", (uid, now_ms))
+        # insert newest on top
+        conn.execute(
+            "INSERT OR REPLACE INTO tracked(uid, id, item_json, created_at_ms, expires_at_ms) "
+            "VALUES(?,?,?,?,?)",
+            (uid, new_id, json.dumps(body.item or {}), now_ms, expires_ms)
+        )
+        # enforce max 3: keep newest 3
+        rows = conn.execute(
+            "SELECT id FROM tracked WHERE uid=? ORDER BY created_at_ms DESC",
+            (uid,)
+        ).fetchall()
+        if len(rows) > 3:
+            for r in rows[3:]:
+                conn.execute("DELETE FROM tracked WHERE uid=? AND id=?", (uid, r[0]))
+        conn.commit()
+        conn.close()
+
+    return _tracked_list_for(uid)
+
+@app.delete("/tracked")
+def tracked_delete(id: Optional[str] = None, x_user_id: Optional[int] = Header(None), req: Request = None, _: None = Depends(require_key)):
+    uid = _uid_from_header(x_user_id)
+    # accept id in query or JSON body
+    if not id:
+        try:
+            data = req.json() if hasattr(req, "json") else None
+        except Exception:
+            data = None
+        if data and isinstance(data, dict):
+            id = data.get("id")
+    if not id:
+        raise HTTPException(400, detail="id required")
+    with _db_lock:
+        conn = _db()
+        conn.execute("DELETE FROM tracked WHERE uid=? AND id=?", (uid, id))
+        conn.commit()
+        conn.close()
+    return _tracked_list_for(uid)
+
+@app.delete("/tracked/{id}")
+def tracked_delete_path(id: str, x_user_id: Optional[int] = Header(None), _: None = Depends(require_key)):
+    uid = _uid_from_header(x_user_id)
+    with _db_lock:
+        conn = _db()
+        conn.execute("DELETE FROM tracked WHERE uid=? AND id=?", (uid, id))
+        conn.commit()
+        conn.close()
+    return _tracked_list_for(uid)
 
 # ---- Learning: record a feedback row from an offer resolution ----
 def _record_feedback_from_offer(offer: Dict[str, Any], outcome: int, resolved_ts: float, pnl: Optional[float] = None):
