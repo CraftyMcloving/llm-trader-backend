@@ -1,19 +1,18 @@
 # main.py — AI Trade Advisor backend v3.1.0 (Kraken/USD)
 # FastAPI + ccxt + pandas (py3.12 recommended; see requirements.txt)
-from adapters import CryptoCCXT
 from __future__ import annotations
 from fastapi import FastAPI, HTTPException, Depends, Header, Query, Request
 from fastapi.responses import PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any, Tuple
+from adapters import CryptoCCXT
+MARKET = os.getenv("MARKET", "crypto")
 import os, json, sqlite3, threading, time
 import math
 import pandas as pd
 import numpy as np
 import ccxt
-
-MARKET = os.getenv("MARKET", "crypto")
 
 app = FastAPI(title="AI Trade Advisor API", version="2025.09")
 
