@@ -209,6 +209,25 @@ def ensure_feedback_migrations(conn):
     cur.execute("CREATE INDEX IF NOT EXISTS idx_fb_sym_tf_acc_ts ON feedback(symbol, tf, accepted, ts)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_fb_uid_ts ON feedback(uid, ts)")
     conn.commit()
+    
+def ensure_weights2(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS weights2(
+          scope   TEXT NOT NULL,
+          feature TEXT NOT NULL,
+          w       REAL NOT NULL,
+          PRIMARY KEY(scope, feature)
+        )
+    """)
+    # One-time migration from old global weights → 'global'
+    have_old = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='weights'").fetchone()
+    if have_old:
+        for (feat, w) in conn.execute("SELECT feature, w FROM weights"):
+            conn.execute(
+                "INSERT OR IGNORE INTO weights2(scope, feature, w) VALUES(?,?,?)",
+                ("global", feat, float(w))
+            )
+    conn.commit()
 
 def get_weights() -> Dict[str, float]:
     with _db_lock:
@@ -218,48 +237,36 @@ def get_weights() -> Dict[str, float]:
         conn.close()
         return d
 
-def update_weights(features: Dict[str, Any], outcome: int, lr: float = 0.05):
+def update_weights(
+    features: Dict[str, Any],
+    outcome: int,
+    tf: Optional[str] = None,
+    symbol: Optional[str] = None,
+    lr: float = 0.05,
+    l2: float = 1e-5
+):
     """
-    Super-light online learning: w_i += lr * outcome * norm(feature_i)
-    outcome: +1 good (TP), -1 bad (SL). Features loosely normalized.
+    Online logistic regression on the most specific scope.
+    outcome: +1 good → y=1, -1 bad → y=0
     """
     if not isinstance(features, dict):
         return
-    # normalize a few known numeric features; ignore non-numerics
-    norm: Dict[str, float] = {}
-    for k, v in features.items():
-        if v is None:
-            continue
-        try:
-            x = float(v)
-        except Exception:
-            continue
-        # coarse normalization per feature name
-        if "rsi" in k:          # RSI ~ [0..100]
-            x = (x - 50.0) / 50.0
-        elif "macd" in k or "diff" in k or "ret" in k or "bb_pos" in k or "donch" in k:
-            # typically around [-1..+1] already-ish
-            x = max(-2.0, min(2.0, x))
-        elif "atr" in k:        # ATR or atr% → keep small
-            x = max(-1.0, min(1.0, x))
-        else:
-            x = max(-3.0, min(3.0, x))
-        norm[k] = x
+    y = 1.0 if (int(outcome) > 0) else 0.0
+    x = _norm_feat_map(features)
+    scopes = _scopes_for(tf, symbol)
+    scope = scopes[0]  # most specific first
+    W = _read_weights(scopes)
 
-    if not norm:
-        return
+    # forward
+    z = sum(float(W.get(k, 0.0)) * float(v) for k, v in x.items())
+    p = _sigmoid(z)
+    g = (y - p)  # gradient for log-loss
 
-    with _db_lock:
-        conn = _db()
-        for k, x in norm.items():
-            cur = conn.execute("SELECT w FROM weights WHERE feature=?", (k,))
-            row = cur.fetchone()
-            w = float(row[0]) if row else 0.0
-            w = w + lr * outcome * x
-            conn.execute("INSERT INTO weights(feature, w) VALUES(?,?) ON CONFLICT(feature) DO UPDATE SET w=excluded.w",
-                         (k, w))
-        conn.commit()
-        conn.close()
+    # SGD step with tiny L2 regularization
+    for k, xv in x.items():
+        w = float(W.get(k, 0.0))
+        w_new = w + lr * (g * float(xv) - l2 * w)
+        _upsert_weight(scope, k, w_new)
 
 def feedback_bias(features: Dict[str, Any], alpha: float = 0.15) -> float:
     """
@@ -283,6 +290,72 @@ def feedback_bias(features: Dict[str, Any], alpha: float = 0.15) -> float:
     # squish
     s = max(-1.0, min(1.0, s))
     return alpha * s
+    
+def _sigmoid(z: float) -> float:
+    try:
+        return 1.0 / (1.0 + math.exp(-float(z)))
+    except Exception:
+        return 0.5
+
+def _norm_feat_map(features: Dict[str, Any]) -> Dict[str, float]:
+    out: Dict[str, float] = {"__bias__": 1.0}
+    for k, v in (features or {}).items():
+        if v is None:
+            continue
+        try:
+            x = float(v)
+        except Exception:
+            continue
+        kk = str(k)
+        if "rsi" in kk:          x = (x - 50.0) / 50.0
+        elif ("macd" in kk) or ("diff" in kk) or ("ret" in kk) or ("bb_pos" in kk) or ("donch" in kk):
+            x = max(-2.0, min(2.0, x))
+        elif "atr" in kk:
+            x = max(-1.0, min(1.0, x))
+        else:
+            x = max(-3.0, min(3.0, x))
+        out[kk] = x
+    return out
+
+def _scopes_for(tf: Optional[str] = None, symbol: Optional[str] = None) -> list[str]:
+    scopes = ["global"]
+    if tf:     scopes.insert(0, f"tf:{tf}")
+    if symbol: scopes.insert(0, f"sym:{symbol}")
+    return scopes
+
+def _read_weights(scopes: list[str]) -> Dict[str, float]:
+    W: Dict[str, float] = {}
+    with _db_lock:
+        conn = _db()
+        try:
+            # less specific last → most specific overwrite
+            for sc in reversed(scopes):
+                for (f, w) in conn.execute("SELECT feature, w FROM weights2 WHERE scope=?", (sc,)):
+                    W[f] = float(w)
+        finally:
+            conn.close()
+    return W
+
+def _upsert_weight(scope: str, feature: str, w_new: float):
+    with _db_lock:
+        conn = _db()
+        try:
+            conn.execute(
+                "INSERT INTO weights2(scope, feature, w) VALUES(?,?,?) "
+                "ON CONFLICT(scope, feature) DO UPDATE SET w=excluded.w",
+                (scope, feature, float(w_new))
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+def predict_prob(features: Dict[str, Any], tf: Optional[str] = None, symbol: Optional[str] = None) -> float:
+    x = _norm_feat_map(features)
+    W = _read_weights(_scopes_for(tf, symbol))
+    z = 0.0
+    for k, xv in x.items():
+        z += float(W.get(k, 0.0)) * float(xv)
+    return _sigmoid(z)
 
 @app.on_event("startup")
 def _fb_startup():
@@ -310,15 +383,27 @@ def _startup():
         conn = _db()
         try:
             ensure_feedback_migrations(conn)
+            ensure_weights2(conn)
         finally:
             conn.close()
 
 # =====================================================
 
-def apply_feedback_bias(confidence: float, features: Dict[str, Any]) -> float:
-    """Return confidence nudged by learned weights; always safe."""
+def apply_feedback_bias(
+    confidence: float,
+    features: Dict[str, Any],
+    tf: Optional[str] = None,
+    symbol: Optional[str] = None,
+    beta: float = 0.35
+) -> float:
+    """
+    Blend base model confidence with learned probability p.
+    beta controls influence (0..1).
+    """
     try:
-        return max(-1.0, min(1.0, float(confidence) + feedback_bias(features)))
+        base = float(confidence)
+        p = predict_prob(features or {}, tf=tf, symbol=symbol)
+        return max(0.0, min(1.0, (1.0 - beta) * base + beta * float(p)))
     except Exception:
         return float(confidence)
 
@@ -836,7 +921,7 @@ def resolve_offer_row(row: sqlite3.Row) -> dict:
     try:
         feats = json.loads(row["features"] or "{}")
         if outcome != 0:
-            update_weights(feats, outcome)
+            update_weights(feats, outcome, tf=tf, symbol=symbol)
     except Exception:
         pass
 
@@ -937,7 +1022,7 @@ def signals(
         # 2) learned bias nudge
         base_conf = float(res.get("confidence", 0.0))
         feats: Dict[str, Any] = res.get("features") or {}
-        res["confidence"] = apply_feedback_bias(base_conf, feats)
+        res["confidence"] = apply_feedback_bias(base_conf, feats, tf=tf, symbol=symbol)
 
         # 3) optional calibration (piecewise linear through saved bins)
         try:
@@ -1004,7 +1089,7 @@ def scan(
             # Apply learned bias so ranking prefers what historically worked
             base_conf = float(s.get("confidence", 0.0))
             feats_map = s.get("features") or {}
-            s["confidence"] = apply_feedback_bias(base_conf, feats_map)
+            s["confidence"] = apply_feedback_bias(base_conf, feats_map, tf=tf, symbol=s["symbol"])
 
             # keep the filter gate consistent if threshold provided
             if isinstance(s.get("filters"), dict) and (min_confidence is not None):
@@ -1105,8 +1190,6 @@ class OffersBatch(BaseModel):
     items: List[OfferIn]
     universe: Optional[int] = None
     note: Optional[str] = None
-    
-from fastapi import Request, Header
 
 @app.post("/feedback", response_model=FeedbackAck, dependencies=[Depends(require_key)])
 def post_feedback(fb: FeedbackIn, request: Request, x_user_id: Optional[int] = Header(None)):
@@ -1180,7 +1263,7 @@ def post_feedback(fb: FeedbackIn, request: Request, x_user_id: Optional[int] = H
             conn.close()
 
     try:
-        update_weights(fb.features or {}, fb.outcome)
+        update_weights(fb.features or {}, fb.outcome, tf=fb.tf, symbol=fb.symbol)
     except Exception:
         pass
 
@@ -1208,22 +1291,23 @@ def feedback_summary(symbol: str, tf: str, direction: Optional[str] = None, wind
 def feedback_stats():
     with _db_lock:
         conn = _db()
-        total = conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0]
-        good  = conn.execute("SELECT COUNT(*) FROM feedback WHERE outcome=1").fetchone()[0]
-        bad   = conn.execute("SELECT COUNT(*) FROM feedback WHERE outcome=-1").fetchone()[0]
-        W = {k: v for k, v in conn.execute("SELECT feature, w FROM weights ORDER BY ABS(w) DESC LIMIT 24")}
-        conn.close()
+        try:
+            total = conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0]
+            good  = conn.execute("SELECT COUNT(*) FROM feedback WHERE outcome=1").fetchone()[0]
+            bad   = conn.execute("SELECT COUNT(*) FROM feedback WHERE outcome=-1").fetchone()[0]
+            # Prefer weights2 aggregation (magnitude of influence); fall back to legacy weights
+            try:
+                W = {k: v for k, v in conn.execute(
+                    "SELECT feature, SUM(ABS(w)) AS mag FROM weights2 "
+                    "GROUP BY feature ORDER BY mag DESC LIMIT 24"
+                )}
+            except Exception:
+                W = {k: v for k, v in conn.execute(
+                    "SELECT feature, w FROM weights ORDER BY ABS(w) DESC LIMIT 24"
+                )}
+        finally:
+            conn.close()
     return {"total": total, "good": good, "bad": bad, "weights": W}
-    
-def _parse_window_to_seconds(window: str) -> int:
-    try:
-        window = (window or "30d").strip().lower()
-        if window.endswith("d"): return int(float(window[:-1]) * 86400)
-        if window.endswith("h"): return int(float(window[:-1]) * 3600)
-        if window.endswith("m"): return int(float(window[:-1]) * 60)
-        return int(window)
-    except Exception:
-        return 30*86400
 
 @app.get("/feedback/stats_series")
 def feedback_stats_series(window: str = Query("30d"), bucket: str = Query("day")):
@@ -1448,7 +1532,6 @@ def tracked_delete_path(id: str, x_user_id: Optional[int] = Header(None), _: Non
         conn.close()
     return _tracked_list_for(uid)
     
-import json
 @app.post("/calibration/rebuild")
 def calibration_rebuild(min_samples:int=200, bins:int=10, _: None = Depends(require_key)):
     """Compute a simple isotonic-like reliability mapping."""
@@ -1493,12 +1576,12 @@ def calibration_rebuild(min_samples:int=200, bins:int=10, _: None = Depends(requ
 
 # ---- Learning: record a feedback row from an offer resolution ----
 def _record_feedback_from_offer(offer: Dict[str, Any], outcome: int, resolved_ts: float, pnl: Optional[float] = None):
-    """Insert a synthetic feedback row so /feedback/stats includes auto-resolutions."""
+    """Insert a synthetic feedback row so /feedback/stats includes auto-resolutions, then learn."""
+    # Parse fields safely
     try:
         feats = json.loads(offer.get("features") or "{}")
     except Exception:
         feats = {}
-
     try:
         targets = json.loads(offer.get("targets") or "[]")
     except Exception:
@@ -1506,33 +1589,43 @@ def _record_feedback_from_offer(offer: Dict[str, Any], outcome: int, resolved_ts
 
     ua = "learning/auto-resolve"
     ip = "127.0.0.1"
+
+    # Write the feedback row (inside lock)
     with _db_lock:
         conn = _db()
-        conn.execute(
-            """INSERT INTO feedback
-               (ts, symbol, tf, market, direction, entry, stop, targets,
-                confidence, advice, outcome, features, edge, composite, equity, risk_pct, leverage, ua, ip)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                resolved_ts,
-                offer.get("symbol"),
-                offer.get("tf"),
-                offer.get("market"),
-                offer.get("direction"),
-                offer.get("entry"),
-                offer.get("stop"),
-                json.dumps(targets),
-                offer.get("confidence"),
-                offer.get("advice"),
-                outcome,
-                json.dumps(feats),
-                "{}", "{}",  # edge, composite (not used here)
-                offer.get("equity"),
-                offer.get("risk_pct"),
-                offer.get("leverage"),
-                ua, ip
+        try:
+            conn.execute(
+                """INSERT INTO feedback
+                   (ts, symbol, tf, market, direction, entry, stop, targets,
+                    confidence, advice, outcome, features, edge, composite, equity, risk_pct, leverage, ua, ip)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    resolved_ts,
+                    offer.get("symbol"),
+                    offer.get("tf"),
+                    offer.get("market"),
+                    offer.get("direction"),
+                    offer.get("entry"),
+                    offer.get("stop"),
+                    json.dumps(targets),
+                    offer.get("confidence"),
+                    offer.get("advice"),
+                    int(outcome),
+                    json.dumps(feats),
+                    "{}", "{}",  # edge, composite (unused here)
+                    offer.get("equity"),
+                    offer.get("risk_pct"),
+                    offer.get("leverage"),
+                    ua, ip,
+                )
             )
-        )
-        conn.commit()
-        conn.close()
+            conn.commit()
+        finally:
+            conn.close()
+
+    # Learn from the outcome (outside lock to avoid deadlocks)
+    try:
+        update_weights(feats, int(outcome), tf=offer.get("tf"), symbol=offer.get("symbol"))
+    except Exception:
+        pass
 # =================================
