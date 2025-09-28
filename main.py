@@ -1,29 +1,16 @@
-# main.py — AI Trade Advisor v3.1.0
+# main.py — AI Trade Advisor backend v3.0.4 (Kraken/USD)
+# FastAPI + ccxt + pandas (py3.12 recommended; see requirements.txt)
 from __future__ import annotations
-
-# ✅ keep imports first
-import os
-import json
-import sqlite3
-import threading
-import time
-import math
-
-from typing import List, Optional, Dict, Any, Tuple
 from fastapi import FastAPI, HTTPException, Depends, Header, Query, Request
 from fastapi.responses import PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from adapters import CryptoCCXT
-
+from typing import List, Optional, Dict, Any, Tuple
+import os, json, sqlite3, threading, time
+import math
 import pandas as pd
 import numpy as np
 import ccxt
-
-# ✅ only now is it safe to read env vars
-MARKET   = os.getenv("MARKET", "crypto")
-EXCHANGE = os.getenv("EXCHANGE", "kraken")
-QUOTE    = os.getenv("QUOTE", "USD")
 
 app = FastAPI(title="AI Trade Advisor API", version="2025.09")
 
@@ -34,7 +21,7 @@ app.add_middleware(
     allow_origins=origins,
     allow_methods=["*"],
     allow_headers=["*"],
-    allow_credentials=(origins != ["*"]),
+    allow_credentials=True,
 )
 
 # ----- Security -----
@@ -58,8 +45,10 @@ def require_key(
         raise HTTPException(status_code=403, detail="Bad token")
     return None
 
+# ----- Exchange (Kraken) -----
 EXCHANGE_ID = os.getenv("EXCHANGE", "kraken")
-TOP_N = int(os.getenv("TOP_N", "18"))
+QUOTE = os.getenv("QUOTE", "USD")
+TOP_N = int(os.getenv("TOP_N", "30"))
 
 _ex = None
 def get_exchange():
@@ -80,24 +69,11 @@ def load_markets():
 
 # ========= FEEDBACK STORAGE & ONLINE WEIGHTS =========
 DB_PATH = os.getenv("FEEDBACK_DB", "/tmp/ai_trade_feedback.db")
-
-# Ensure parent dir exists (important when FEEDBACK_DB=/var/data/... on Render Disk)
-try:
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-except Exception:
-    pass
-
 _db_lock = threading.Lock()
 
 def _db():
-    try:
-        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    except Exception:
-        pass
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA busy_timeout=5000;")     # wait up to 5s on lock
-    conn.execute("PRAGMA synchronous=NORMAL;")    # good tradeoff on Render
     return conn
 
 def init_feedback_db():
@@ -143,10 +119,6 @@ def init_feedback_db():
         pnl        REAL,              -- Phase 2: realized P/L at resolution
         resolved_ts REAL              -- Phase 2: epoch seconds
         );
-        CREATE TABLE IF NOT EXISTS meta(
-        k TEXT PRIMARY KEY,
-        v TEXT
-        );
         CREATE TABLE IF NOT EXISTS tracked(
           uid INTEGER NOT NULL,
           id  TEXT PRIMARY KEY,
@@ -160,20 +132,6 @@ def init_feedback_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_offers_created ON offers(created_ts);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_offers_resolved ON offers(resolved, expires_ts);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_offers_exp ON offers(expires_ts);")
-        conn.commit()
-        conn.close()
-
-def meta_get(key:str) -> Optional[str]:
-    with _db_lock:
-        conn = _db()
-        row = conn.execute("SELECT v FROM meta WHERE k=?", (key,)).fetchone()
-        conn.close()
-    return row[0] if row else None
-
-def meta_set(key:str, val:str):
-    with _db_lock:
-        conn = _db()
-        conn.execute("INSERT OR REPLACE INTO meta(k,v) VALUES(?,?)", (key, val))
         conn.commit()
         conn.close()
 
@@ -210,25 +168,6 @@ def ensure_feedback_migrations(conn):
     cur.execute("CREATE INDEX IF NOT EXISTS idx_fb_uid_ts ON feedback(uid, ts)")
     conn.commit()
 
-def ensure_weights2(conn):
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS weights2(
-          scope   TEXT NOT NULL,
-          feature TEXT NOT NULL,
-          w       REAL NOT NULL,
-          PRIMARY KEY(scope, feature)
-        )
-    """)
-    # One-time migration from old global weights → 'global'
-    have_old = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='weights'").fetchone()
-    if have_old:
-        for (feat, w) in conn.execute("SELECT feature, w FROM weights"):
-            conn.execute(
-                "INSERT OR IGNORE INTO weights2(scope, feature, w) VALUES(?,?,?)",
-                ("global", feat, float(w))
-            )
-    conn.commit()
-
 def get_weights() -> Dict[str, float]:
     with _db_lock:
         conn = _db()
@@ -237,36 +176,48 @@ def get_weights() -> Dict[str, float]:
         conn.close()
         return d
 
-def update_weights(
-    features: Dict[str, Any],
-    outcome: int,
-    tf: Optional[str] = None,
-    symbol: Optional[str] = None,
-    lr: float = 0.05,
-    l2: float = 1e-5
-):
+def update_weights(features: Dict[str, Any], outcome: int, lr: float = 0.05):
     """
-    Online logistic regression on the most specific scope.
-    outcome: +1 good → y=1, -1 bad → y=0
+    Super-light online learning: w_i += lr * outcome * norm(feature_i)
+    outcome: +1 good (TP), -1 bad (SL). Features loosely normalized.
     """
     if not isinstance(features, dict):
         return
-    y = 1.0 if (int(outcome) > 0) else 0.0
-    x = _norm_feat_map(features)
-    scopes = _scopes_for(tf, symbol)
-    scope = scopes[0]  # most specific first
-    W = _read_weights(scopes)
+    # normalize a few known numeric features; ignore non-numerics
+    norm: Dict[str, float] = {}
+    for k, v in features.items():
+        if v is None:
+            continue
+        try:
+            x = float(v)
+        except Exception:
+            continue
+        # coarse normalization per feature name
+        if "rsi" in k:          # RSI ~ [0..100]
+            x = (x - 50.0) / 50.0
+        elif "macd" in k or "diff" in k or "ret" in k or "bb_pos" in k or "donch" in k:
+            # typically around [-1..+1] already-ish
+            x = max(-2.0, min(2.0, x))
+        elif "atr" in k:        # ATR or atr% → keep small
+            x = max(-1.0, min(1.0, x))
+        else:
+            x = max(-3.0, min(3.0, x))
+        norm[k] = x
 
-    # forward
-    z = sum(float(W.get(k, 0.0)) * float(v) for k, v in x.items())
-    p = _sigmoid(z)
-    g = (y - p)  # gradient for log-loss
+    if not norm:
+        return
 
-    # SGD step with tiny L2 regularization
-    for k, xv in x.items():
-        w = float(W.get(k, 0.0))
-        w_new = w + lr * (g * float(xv) - l2 * w)
-        _upsert_weight(scope, k, w_new)
+    with _db_lock:
+        conn = _db()
+        for k, x in norm.items():
+            cur = conn.execute("SELECT w FROM weights WHERE feature=?", (k,))
+            row = cur.fetchone()
+            w = float(row[0]) if row else 0.0
+            w = w + lr * outcome * x
+            conn.execute("INSERT INTO weights(feature, w) VALUES(?,?) ON CONFLICT(feature) DO UPDATE SET w=excluded.w",
+                         (k, w))
+        conn.commit()
+        conn.close()
 
 def feedback_bias(features: Dict[str, Any], alpha: float = 0.15) -> float:
     """
@@ -290,72 +241,6 @@ def feedback_bias(features: Dict[str, Any], alpha: float = 0.15) -> float:
     # squish
     s = max(-1.0, min(1.0, s))
     return alpha * s
-
-def _sigmoid(z: float) -> float:
-    try:
-        return 1.0 / (1.0 + math.exp(-float(z)))
-    except Exception:
-        return 0.5
-
-def _norm_feat_map(features: Dict[str, Any]) -> Dict[str, float]:
-    out: Dict[str, float] = {"__bias__": 1.0}
-    for k, v in (features or {}).items():
-        if v is None:
-            continue
-        try:
-            x = float(v)
-        except Exception:
-            continue
-        kk = str(k)
-        if "rsi" in kk:          x = (x - 50.0) / 50.0
-        elif ("macd" in kk) or ("diff" in kk) or ("ret" in kk) or ("bb_pos" in kk) or ("donch" in kk):
-            x = max(-2.0, min(2.0, x))
-        elif "atr" in kk:
-            x = max(-1.0, min(1.0, x))
-        else:
-            x = max(-3.0, min(3.0, x))
-        out[kk] = x
-    return out
-
-def _scopes_for(tf: Optional[str] = None, symbol: Optional[str] = None) -> list[str]:
-    scopes = ["global"]
-    if tf:     scopes.insert(0, f"tf:{tf}")
-    if symbol: scopes.insert(0, f"sym:{symbol}")
-    return scopes
-
-def _read_weights(scopes: list[str]) -> Dict[str, float]:
-    W: Dict[str, float] = {}
-    with _db_lock:
-        conn = _db()
-        try:
-            # less specific last → most specific overwrite
-            for sc in reversed(scopes):
-                for (f, w) in conn.execute("SELECT feature, w FROM weights2 WHERE scope=?", (sc,)):
-                    W[f] = float(w)
-        finally:
-            conn.close()
-    return W
-
-def _upsert_weight(scope: str, feature: str, w_new: float):
-    with _db_lock:
-        conn = _db()
-        try:
-            conn.execute(
-                "INSERT INTO weights2(scope, feature, w) VALUES(?,?,?) "
-                "ON CONFLICT(scope, feature) DO UPDATE SET w=excluded.w",
-                (scope, feature, float(w_new))
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
-def predict_prob(features: Dict[str, Any], tf: Optional[str] = None, symbol: Optional[str] = None) -> float:
-    x = _norm_feat_map(features)
-    W = _read_weights(_scopes_for(tf, symbol))
-    z = 0.0
-    for k, xv in x.items():
-        z += float(W.get(k, 0.0)) * float(xv)
-    return _sigmoid(z)
 
 @app.on_event("startup")
 def _fb_startup():
@@ -383,27 +268,15 @@ def _startup():
         conn = _db()
         try:
             ensure_feedback_migrations(conn)
-            ensure_weights2(conn)
         finally:
             conn.close()
 
 # =====================================================
 
-def apply_feedback_bias(
-    confidence: float,
-    features: Dict[str, Any],
-    tf: Optional[str] = None,
-    symbol: Optional[str] = None,
-    beta: float = 0.35
-) -> float:
-    """
-    Blend base model confidence with learned probability p.
-    beta controls influence (0..1).
-    """
+def apply_feedback_bias(confidence: float, features: Dict[str, Any]) -> float:
+    """Return confidence nudged by learned weights; always safe."""
     try:
-        base = float(confidence)
-        p = predict_prob(features or {}, tf=tf, symbol=symbol)
-        return max(0.0, min(1.0, (1.0 - beta) * base + beta * float(p)))
+        return max(-1.0, min(1.0, float(confidence) + feedback_bias(features)))
     except Exception:
         return float(confidence)
 
@@ -416,53 +289,67 @@ def cache_get(key, ttl):
     return data if (time.time() - ts) <= ttl else None
 def cache_set(key, data): CACHE[key] = (time.time(), data)
 
+# ----- Universe -----
 CURATED = [
     "BTC","ETH","XRP","SOL","ADA","DOGE","LINK","LTC","BCH","TRX",
     "DOT","ATOM","XLM","ETC","MATIC","UNI","APT","ARB","OP","AVAX",
     "NEAR","ALGO","FIL","SUI","SHIB","USDC","USDT","XMR","AAVE"
     ,"PAXG","ONDO","PEPE","SEI","IMX","TIA"
 ]
-
-# ----- Universe -----
 def get_universe(quote=QUOTE, limit=TOP_N) -> List[Dict[str, Any]]:
-    # Crypto adapter (current behavior)
-    curated = [
-        "BTC","ETH","XRP","SOL","ADA","DOGE","LINK","LTC","BCH","TRX",
-        "DOT","ATOM","XLM","ETC","MATIC","UNI","APT","ARB","OP","AVAX",
-        "NEAR","ALGO","FIL","SUI","SHIB","USDC","USDT","XMR","AAVE","PAXG","ONDO","PEPE","SEI","IMX","TIA"
-    ]
-    adapter = CryptoCCXT(exchange_id=os.getenv("EXCHANGE","kraken"), quote=quote, curated=curated)
-    key = f"uni:{adapter.name()}:{limit}"
+    key = f"uni:{EXCHANGE_ID}:{quote}:{limit}"
     u = cache_get(key, 1800)
     if u is not None: return u
-    out = adapter.list_universe(limit)
+    markets = load_markets()
+
+    available: List[str] = []
+    for base in CURATED:
+        sym = f"{base}/{quote}"
+        if sym in markets and markets[sym].get("active"):
+            available.append(sym)
+
+    if len(available) < limit:
+        # Fallback: fill with other active {quote} tickers
+        for m, info in markets.items():
+            if info.get("quote") == quote and info.get("active"):
+                if m not in available:
+                    available.append(m)
+                if len(available) >= limit:
+                    break
+
+    out = [{"symbol": s, "name": s.split('/')[0], "market": EXCHANGE_ID, "tf_supported": ["1h","1d"]} for s in available[:limit]]
     cache_set(key, out)
     return out
 
 # ----- Market data -----
-TF_MAP = {"5m":"5m","15m":"15m","1h":"1h","1d":"1d"}
+TF_MAP = {"1h": "1h", "1d": "1d"}
 
 def fetch_ohlcv(symbol: str, tf: str, bars: int = 720) -> pd.DataFrame:
-    adapter = CryptoCCXT(exchange_id=os.getenv("EXCHANGE","kraken"), quote=QUOTE)
+    ex = get_exchange()
     tf_ex = TF_MAP.get(tf)
     if tf_ex is None:
         raise HTTPException(400, detail=f"Unsupported timeframe: {tf}")
-    key = f"ohlcv:{adapter.name()}:{symbol}:{tf_ex}:{bars}"
+    key = f"ohlcv:{symbol}:{tf_ex}:{bars}"
     cached = cache_get(key, 900)
     if cached is not None:
         return cached.copy()
-    df = adapter.fetch_ohlcv(symbol, tf_ex, bars=bars)
-    if df.empty:
-        raise HTTPException(502, detail="no candles")
+    try:
+        data = ex.fetch_ohlcv(symbol, timeframe=tf_ex, limit=bars)
+    except ccxt.BadSymbol:
+        raise HTTPException(502, detail=f"Symbol not available on {EXCHANGE_ID}: {symbol}")
+    except Exception as e:
+        raise HTTPException(502, detail=f"fetch_ohlcv failed: {e}")
+    if not data or len(data) < 50:
+        raise HTTPException(502, detail="insufficient candles")
+    df = pd.DataFrame(data, columns=["ts","open","high","low","close","volume"])
+    df["ts"] = pd.to_datetime(df["ts"], unit="ms")
     cache_set(key, df)
     return df.copy()
 
 # ms per bar
 def tf_ms(tf: str) -> int:
-    if tf == "5m":  return 5*60*1000
-    if tf == "15m": return 15*60*1000
-    if tf == "1h":  return 60*60*1000
-    if tf == "1d":  return 24*60*60*1000
+    if tf == "1h": return 60*60*1000
+    if tf == "1d": return 24*60*60*1000
     raise HTTPException(400, detail=f"Unsupported tf for eval: {tf}")
 
 def fetch_ohlcv_window(symbol: str, tf: str, start_ms: int, end_ms: int) -> pd.DataFrame:
@@ -583,54 +470,6 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     out["bb_pos"]  = ((out["close"] - out["bb_mid"]) / (2*out["bb_std"])).clip(-1,1)
     return out
 
-def _mtf_gate(symbol: str, primary_direction: str) -> Dict[str, Any]:
-    """
-    Multi-timeframe gate:
-    - Confirms 1h signal with 15m alignment.
-    - Produces 5m management hint (tighten/abort/none) without blocking.
-    Simple heuristic, fast and stable.
-    """
-    try:
-        df15 = compute_features(fetch_ohlcv(symbol, "15m", bars=400)).dropna().iloc[-120:]
-        df5  = compute_features(fetch_ohlcv(symbol, "5m",  bars=400)).dropna().iloc[-120:]
-    except HTTPException:
-        # If lower TFs unavailable, be permissive but mark it
-        return {"has": False, "confirm15m": True, "reason15m": "lower TF unavailable", "manage5m": "none"}
-
-    def _side_ok(feats, direction):
-        slope = float(feats["slope20"].iloc[-1])
-        rsi14 = float(feats["rsi14"].iloc[-1])
-        bbpos = float(feats["bb_pos"].iloc[-1])
-        if direction == "Long":
-            return (slope >= 0) and (rsi14 >= 45) and (bbpos >= -0.15)
-        else:
-            return (slope <= 0) and (rsi14 <= 55) and (bbpos <= 0.15)
-
-    confirm = _side_ok(df15, primary_direction)
-
-    # 5m hint
-    slope5 = float(df5["slope20"].iloc[-1])
-    rsi5   = float(df5["rsi14"].iloc[-1])
-    if primary_direction == "Long":
-        if (slope5 < 0 and rsi5 < 40):   hint = "abort"
-        elif (slope5 < 0 and rsi5 < 47): hint = "tighten"
-        else:                            hint = "none"
-    else:
-        if (slope5 > 0 and rsi5 > 60):   hint = "abort"
-        elif (slope5 > 0 and rsi5 > 53): hint = "tighten"
-        else:                            hint = "none"
-
-    return {
-        "has": True,
-        "confirm15m": bool(confirm),
-        "reason15m": "15m aligned" if confirm else "15m contradicts",
-        "manage5m": hint,
-        "checks": {
-            "m15": {"slope20": float(df15["slope20"].iloc[-1]), "rsi14": float(df15["rsi14"].iloc[-1]), "bb_pos": float(df15["bb_pos"].iloc[-1])},
-            "m5":  {"slope20": float(df5["slope20"].iloc[-1]),  "rsi14": float(df5["rsi14"].iloc[-1])}
-        }
-    }
-
 # ---- Feature snapshot for learning/bias (add after compute_features) ----
 def last_features_snapshot(feats: pd.DataFrame) -> Dict[str, float]:
     """
@@ -732,54 +571,36 @@ def build_trade(symbol: str, df: pd.DataFrame, direction: str,
         "precision": mkt.get("precision", {})
     }
 
-def infer_signal(
-    feats: pd.DataFrame,
-    min_conf: float,
-    vol_cap: Optional[float] = None,
-    vol_min: Optional[float] = None
-) -> Tuple[str, float, Dict[str, bool], List[str]]:
-    last = feats.iloc[-1]
-    reasons: List[str] = []
-
-    trend_up = bool(last["sma20"] > last["sma50"] and feats["slope20"].iloc[-1] > 0)
-    trend_dn = bool(last["sma20"] < last["sma50"] and feats["slope20"].iloc[-1] < 0)
+def infer_signal(feats: pd.DataFrame, min_conf: float) -> Tuple[str,float,Dict[str,bool],List[str]]:
+    last = feats.iloc[-1]; reasons=[]
+    trend_up = bool(last["sma20"]>last["sma50"] and feats["slope20"].iloc[-1]>0)
+    trend_dn = bool(last["sma20"]<last["sma50"] and feats["slope20"].iloc[-1]<0)
     trend_ok = trend_up or trend_dn
-    if not trend_ok:
-        reasons.append("no clear trend")
+    if not trend_ok: reasons.append("no clear trend")
 
-    # use UI-provided guardrails when present, else env defaults
-    cap = VOL_CAP_ATR_PCT if vol_cap is None else float(vol_cap)
-    floor = VOL_MIN_ATR_PCT if vol_min is None else float(vol_min)
     atr_pct = float(last["atr_pct"])
-    vol_ok = bool((atr_pct >= floor) and (atr_pct <= cap))
-    if not vol_ok:
-        reasons.append("ATR% outside bounds")
+    vol_ok = bool((atr_pct>=VOL_MIN_ATR_PCT) and (atr_pct<=VOL_CAP_ATR_PCT))
+    if not vol_ok: reasons.append("ATR% outside bounds")
 
     rsi14 = float(last["rsi14"])
-    bias_up = rsi14 >= 52
-    bias_dn = rsi14 <= 48
+    bias_up = rsi14>=52; bias_dn = rsi14<=48
 
-    conf = 0.0
-    if trend_ok:
-        conf += 0.45
-    if vol_ok:
-        conf += 0.25
-    if bias_up or bias_dn:
-        conf += 0.15
-    conf += min(abs(float(feats["ret5"].iloc[-1] or 0.0)) * 2.0, 0.15)
-    conf = float(max(0.0, min(conf, 1.0)))
+    conf=0.0
+    if trend_ok: conf += 0.45
+    if vol_ok:   conf += 0.25
+    if bias_up or bias_dn: conf += 0.15
+    conf += min(abs(float(feats["ret5"].iloc[-1] or 0.0))*2.0, 0.15)
+    conf = float(max(0.0, min(conf,1.0)))
 
-    if trend_up and bias_up:
-        sig = "Bullish"
-    elif trend_dn and bias_dn:
-        sig = "Bearish"
-    else:
-        sig = "Neutral"
+    if trend_up and bias_up:   sig="Bullish"
+    elif trend_dn and bias_dn: sig="Bearish"
+    else:                      sig="Neutral"
 
+    # explicit reason for threshold gate
     if conf < min_conf:
         reasons.append(f"Composite conf {conf:.2f} < {min_conf:.2f}")
 
-    return sig, conf, {"trend_ok": trend_ok, "vol_ok": vol_ok, "confidence_ok": conf >= min_conf}, reasons
+    return sig, conf, {"trend_ok":trend_ok,"vol_ok":vol_ok,"confidence_ok":conf>=min_conf}, reasons
 
 def _vote_matches_market(fb: FeedbackIn) -> Tuple[bool, str]:
     # Need direction+entry for any meaningful check
@@ -833,8 +654,6 @@ def evaluate_signal(
     ignore_trend: bool = False,
     ignore_vol: bool = False,
     allow_neutral: bool = False,
-    vol_cap: Optional[float] = None,
-    vol_min: Optional[float] = None,
 ) -> Dict[str, Any]:
     df = fetch_ohlcv(symbol, tf, bars=400)
     feats = compute_features(df).dropna().iloc[-200:]
@@ -842,7 +661,7 @@ def evaluate_signal(
         raise HTTPException(502, detail="insufficient features window")
 
     thresh = min_confidence if (min_confidence is not None) else MIN_CONFIDENCE
-    sig, conf, filt, reasons = infer_signal(feats, thresh, vol_cap=vol_cap, vol_min=vol_min)
+    sig, conf, filt, reasons = infer_signal(feats, thresh)
 
     # Apply client relax flags to filters/reasons
     if ignore_trend:
@@ -854,7 +673,6 @@ def evaluate_signal(
 
     trade = None
     advice = "Skip"
-    mtf = {"has": False}  # <-- ensure defined in all paths
 
     # Direction gate: allow neutral if requested (choose side from slope/RSI/bb_pos)
     directional_ok = (sig in ("Bullish", "Bearish")) or allow_neutral
@@ -873,16 +691,6 @@ def evaluate_signal(
         trade = build_trade(symbol, feats, direction, risk_pct, equity, leverage)
         advice = "Consider"
 
-        # --- MTF gate (1h -> confirm on 15m; 5m manage hint) ---
-        if tf == "1h" and direction:
-            mtf = _mtf_gate(symbol, direction)
-            if mtf.get("has") and not mtf.get("confirm15m", True):
-                # veto entry; degrade to "Wait"
-                trade = None
-                advice = "Wait"
-                if "reasons" in filt:
-                    filt["reasons"] = (filt.get("reasons") or []) + ["15m contradicts"]
-
     # stable feature snapshot for learning/bias
     feat_map = last_features_snapshot(feats)
 
@@ -896,7 +704,6 @@ def evaluate_signal(
         "filters": {**filt, "reasons": reasons},
         "advice": advice,
         "features": feat_map,
-        "mtf": mtf,
     }
 
 def resolve_offer_row(row: sqlite3.Row) -> dict:
@@ -941,7 +748,7 @@ def resolve_offer_row(row: sqlite3.Row) -> dict:
     try:
         feats = json.loads(row["features"] or "{}")
         if outcome != 0:
-            update_weights(feats, outcome, tf=tf, symbol=symbol)
+            update_weights(feats, outcome)
     except Exception:
         pass
 
@@ -1001,10 +808,6 @@ class Instrument(BaseModel):
 @app.get("/healthz", include_in_schema=False)
 def healthz():
     return PlainTextResponse("ok")
-    
-@app.get("/", include_in_schema=False)
-def root():
-    return {"ok": True}
 
 @app.middleware("http")
 async def _log_requests(request, call_next):
@@ -1033,7 +836,7 @@ def signals(
     _: None = Depends(require_key),
 ):
     try:
-        # 1) base evaluation
+        # 1) get your base result (your existing function)
         res = evaluate_signal(
             symbol=symbol,
             tf=tf,
@@ -1043,35 +846,13 @@ def signals(
             min_confidence=min_confidence,
         )
 
-        # 2) learned bias nudge
+        # Nudge confidence by learned weights
         base_conf = float(res.get("confidence", 0.0))
         feats: Dict[str, Any] = res.get("features") or {}
-        res["confidence"] = apply_feedback_bias(base_conf, feats, tf=tf, symbol=symbol)
+        res["confidence"] = apply_feedback_bias(base_conf, feats)
 
-        # 3) optional calibration (piecewise linear through saved bins)
-        try:
-            cal = meta_get("calibration_map")
-            if cal:
-                import bisect, json as _json
-                bins = _json.loads(cal)
-                xs = [float(a) for a, _ in bins]
-                ys = [float(b) for _, b in bins]
-                x = float(res["confidence"])
-                if x <= xs[0]:
-                    res["confidence"] = ys[0]
-                elif x >= xs[-1]:
-                    res["confidence"] = ys[-1]
-                else:
-                    i = bisect.bisect_left(xs, x)
-                    x0, x1 = xs[i-1], xs[i]
-                    y0, y1 = ys[i-1], ys[i]
-                    t = (x - x0) / max(1e-9, (x1 - x0))
-                    res["confidence"] = (1 - t) * y0 + t * y1
-        except Exception:
-            pass
-
-        # 4) keep filter gate consistent if client passed a threshold
-        if isinstance(res.get("filters"), dict) and (min_confidence is not None):
+        # Keep filter in sync with the threshold if provided
+        if isinstance(res.get("filters"), dict) and min_confidence is not None:
             res["filters"]["confidence_ok"] = (res["confidence"] >= float(min_confidence))
 
         return res
@@ -1088,28 +869,18 @@ def scan(
     top: int = Query(6, ge=1, le=12),
     min_confidence: Optional[float] = Query(None),
     allow_neutral: int = Query(1, ge=0, le=1),
-    ignore_trend: int = Query(0, ge=0, le=1),
-    ignore_vol: int = Query(0, ge=0, le=1),
+    ignore_trend: int = Query(0, ge=0, le=1),   # NEW
+    ignore_vol: int = Query(0, ge=0, le=1),     # NEW
     risk_pct: float = Query(1.0, ge=0.1, le=5.0),
     equity: Optional[float] = Query(None, ge=0.0),
-    leverage: float = Query(1.0, ge=1.0, le=100.0),
+    leverage: float = Query(1.0, ge=1.0, le=100.0),   # raised cap
     include_chart: int = Query(1, ge=0, le=1),
-    vol_cap: Optional[float] = Query(None),
-    vol_min: Optional[float] = Query(None),
-    budget_sec: float = Query(8.0, ge=2.0, le=30.0),   # NEW: default 8s budget
     _: None = Depends(require_key)
 ):
-    t0 = time.time()
     uni = get_universe(limit=limit)
     results, ok = [], []
 
-    def timed_out() -> bool:
-        return (time.time() - t0) >= float(budget_sec)
-
     for it in uni:
-        # stop early if we have enough winners and we’re out of time
-        if timed_out() and len(ok) >= max(3, top):
-            break
         try:
             s = evaluate_signal(
                 symbol=it["symbol"], tf=tf,
@@ -1118,13 +889,17 @@ def scan(
                 ignore_trend=bool(ignore_trend),
                 ignore_vol=bool(ignore_vol),
                 allow_neutral=bool(allow_neutral),
-                vol_cap=vol_cap, vol_min=vol_min,
             )
+
+            # Apply learned bias so ranking prefers what historically worked
             base_conf = float(s.get("confidence", 0.0))
             feats_map = s.get("features") or {}
-            s["confidence"] = apply_feedback_bias(base_conf, feats_map, tf=tf, symbol=s["symbol"])
+            s["confidence"] = apply_feedback_bias(base_conf, feats_map)
+
+            # keep the filter gate consistent if threshold provided
             if isinstance(s.get("filters"), dict) and (min_confidence is not None):
                 s["filters"]["confidence_ok"] = (s["confidence"] >= float(min_confidence))
+
             s["market"] = it["market"]
             if s["advice"] == "Consider":
                 ok.append(s)
@@ -1145,19 +920,17 @@ def scan(
                 "filters": {"trend_ok": False, "vol_ok": False, "confidence_ok": False, "reasons": [f"exception: {e}"]},
                 "advice": "Skip", "market": it["market"]
             })
-        # Soft stop if we already have a comfortable pool
-        if len(ok) >= top and (timed_out() or len(results) >= max(top*2, 10)):
-            break
+    # ... (rest of your /scan stays the same)
 
     # choose pool
     pool = ok if ok else results
     pool_sorted = sorted(pool, key=lambda s: abs(s.get("confidence") or 0.0), reverse=True)
     topK = pool_sorted[:top]
 
-    # attach chart data if requested and budget remains
+    # attach chart data if requested
     out: List[Dict[str, Any]] = []
     for s in topK:
-        if include_chart and not timed_out():
+        if include_chart:
             try:
                 df = fetch_ohlcv(s["symbol"], tf, bars=160)
                 s["chart"] = {"closes": df["close"].tail(120).astype(float).tolist()}
@@ -1165,14 +938,11 @@ def scan(
                 s["chart"] = None
         out.append(s)
 
-    note_bits = []
+    note = None
     if not ok and allow_neutral:
-        note_bits.append("No high-confidence setups; best candidates by confidence.")
-    spent = time.time() - t0
-    if spent >= budget_sec:
-        note_bits.append(f"Time budget reached ({spent:.1f}s). Partial list shown.")
+        note = "No high-confidence setups; returning best candidates by confidence."
 
-    return {"universe": len(uni), "note": " · ".join(note_bits) or None, "results": out}
+    return {"universe": len(uni), "note": note, "results": out}
 
 # ========= FEEDBACK API =========
 class FeedbackIn(BaseModel):
@@ -1225,6 +995,8 @@ class OffersBatch(BaseModel):
     items: List[OfferIn]
     universe: Optional[int] = None
     note: Optional[str] = None
+    
+from fastapi import Request, Header
 
 @app.post("/feedback", response_model=FeedbackAck, dependencies=[Depends(require_key)])
 def post_feedback(fb: FeedbackIn, request: Request, x_user_id: Optional[int] = Header(None)):
@@ -1298,7 +1070,7 @@ def post_feedback(fb: FeedbackIn, request: Request, x_user_id: Optional[int] = H
             conn.close()
 
     try:
-        update_weights(fb.features or {}, fb.outcome, tf=fb.tf, symbol=fb.symbol)
+        update_weights(fb.features or {}, fb.outcome)
     except Exception:
         pass
 
@@ -1313,82 +1085,25 @@ def feedback_summary(symbol: str, tf: str, direction: Optional[str] = None, wind
         params = [symbol, tf, cutoff]
         where = "symbol=? AND tf=? AND accepted=1 AND uid>0 AND ts>=?"
         if direction:
-            # include matching direction + directionless rows
-            where += " AND (direction = ? OR direction IS NULL)"
-            params.append(direction)
+            where += " AND (direction=? OR (direction IS NULL AND ?=''))"
+            params.extend([direction, direction])
         rows = conn.execute(f"SELECT outcome FROM feedback WHERE {where}", params).fetchall()
         conn.close()
-    up = sum(1 for (o,) in rows if (o or 0) > 0)
-    down = sum(1 for (o,) in rows if (o or 0) < 0)
-    return {"up": up, "down": down, "total": len(rows)}
+    up = sum(1 for r in rows if (r[0] or 0) > 0)
+    down = sum(1 for r in rows if (r[0] or 0) < 0)
+    total = len(rows)
+    return {"up": up, "down": down, "total": total}
 
 @app.get("/feedback/stats")
 def feedback_stats():
     with _db_lock:
         conn = _db()
-        try:
-            total = conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0]
-            good  = conn.execute("SELECT COUNT(*) FROM feedback WHERE outcome=1").fetchone()[0]
-            bad   = conn.execute("SELECT COUNT(*) FROM feedback WHERE outcome=-1").fetchone()[0]
-            # Prefer weights2 aggregation (magnitude of influence); fall back to legacy weights
-            try:
-                W = {k: v for k, v in conn.execute(
-                    "SELECT feature, SUM(ABS(w)) AS mag FROM weights2 "
-                    "GROUP BY feature ORDER BY mag DESC LIMIT 24"
-                )}
-            except Exception:
-                W = {k: v for k, v in conn.execute(
-                    "SELECT feature, w FROM weights ORDER BY ABS(w) DESC LIMIT 24"
-                )}
-        finally:
-            conn.close()
-    return {"total": total, "good": good, "bad": bad, "weights": W}
-
-def _parse_window_to_seconds(s: str) -> int:
-    """
-    Accepts strings like '30d', '24h', '60m' or raw seconds ('3600').
-    Falls back to 30d on parse issues.
-    """
-    s = (s or "30d").strip().lower()
-    try:
-        if s.endswith("d"):
-            return int(float(s[:-1]) * 86400)
-        if s.endswith("h"):
-            return int(float(s[:-1]) * 3600)
-        if s.endswith("m"):
-            return int(float(s[:-1]) * 60)
-        return int(float(s))  # raw seconds
-    except Exception:
-        return 30 * 86400
-
-@app.get("/feedback/stats_series")
-def feedback_stats_series(window: str = Query("30d"), bucket: str = Query("day")):
-    """Rolling stats series for sparkline etc."""
-    secs = _parse_window_to_seconds(window)
-    cutoff = time.time() - secs
-    with _db_lock:
-        conn = _db()
-        rows = conn.execute(
-            "SELECT ts, outcome FROM feedback WHERE accepted=1 AND ts>=? ORDER BY ts ASC",
-            (cutoff,)
-        ).fetchall()
+        total = conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0]
+        good  = conn.execute("SELECT COUNT(*) FROM feedback WHERE outcome=1").fetchone()[0]
+        bad   = conn.execute("SELECT COUNT(*) FROM feedback WHERE outcome=-1").fetchone()[0]
+        W = {k: v for k, v in conn.execute("SELECT feature, w FROM weights ORDER BY ABS(w) DESC LIMIT 24")}
         conn.close()
-    if not rows:
-        return {"by_day": []}
-    # bucket by day UTC
-    by = {}
-    for ts, outcome in rows:
-        d = time.strftime("%Y-%m-%d", time.gmtime(float(ts)))
-        x = by.setdefault(d, {"good":0,"bad":0,"n":0})
-        if (outcome or 0) > 0: x["good"] += 1
-        if (outcome or 0) < 0: x["bad"]  += 1
-        x["n"] += 1
-    series = []
-    for d in sorted(by.keys()):
-        g = by[d]["good"]; b = by[d]["bad"]; n = by[d]["n"]
-        wr = (g / n) if n else 0.0
-        series.append({"date": d, "good": g, "bad": b, "n": n, "win_rate": wr})
-    return {"by_day": series}
+    return {"total": total, "good": good, "bad": bad, "weights": W}
 
 @app.post("/learning/offered")
 def learning_offered(batch: OffersBatch, request: Request, _: None = Depends(require_key)):
@@ -1555,15 +1270,16 @@ def tracked_post(body: TrackIn, x_user_id: Optional[int] = Header(None), _: None
     return _tracked_list_for(uid)
 
 @app.delete("/tracked")
-def tracked_delete(
-    id: Optional[str] = None,
-    body: Optional[Dict[str, Any]] = Body(None),
-    x_user_id: Optional[int] = Header(None),
-    _: None = Depends(require_key)
-):
+def tracked_delete(id: Optional[str] = None, x_user_id: Optional[int] = Header(None), req: Request = None, _: None = Depends(require_key)):
     uid = _uid_from_header(x_user_id)
-    if not id and isinstance(body, dict):
-        id = body.get("id")
+    # accept id in query or JSON body
+    if not id:
+        try:
+            data = req.json() if hasattr(req, "json") else None
+        except Exception:
+            data = None
+        if data and isinstance(data, dict):
+            id = data.get("id")
     if not id:
         raise HTTPException(400, detail="id required")
     with _db_lock:
@@ -1583,56 +1299,14 @@ def tracked_delete_path(id: str, x_user_id: Optional[int] = Header(None), _: Non
         conn.close()
     return _tracked_list_for(uid)
 
-@app.post("/calibration/rebuild")
-def calibration_rebuild(min_samples:int=200, bins:int=10, _: None = Depends(require_key)):
-    """Compute a simple isotonic-like reliability mapping."""
-    with _db_lock:
-        conn = _db()
-        rows = conn.execute("""
-          SELECT confidence, outcome
-          FROM feedback
-          WHERE accepted=1 AND confidence IS NOT NULL
-          ORDER BY ts DESC
-          LIMIT 5000
-        """).fetchall()
-        conn.close()
-    if not rows or len(rows) < min_samples:
-        raise HTTPException(400, detail="not enough samples")
-
-    pairs = [(float(c), 1 if (o or 0)>0 else 0) for c,o in rows if c is not None]
-    if len(pairs) < min_samples:
-        raise HTTPException(400, detail="not enough samples")
-
-    # bin by predicted conf
-    pairs.sort(key=lambda x: x[0])
-    n = max(3, bins)
-    out = []
-    for i in range(n):
-        lo = int(i*len(pairs)/n); hi = int((i+1)*len(pairs)/n)
-        chunk = pairs[lo:hi] or []
-        if not chunk: continue
-        p_hat = sum(1 for _,y in chunk if y>0) / len(chunk)
-        c_mid = sum(c for c,_ in chunk)/len(chunk)
-        out.append([c_mid, p_hat])
-
-    # enforce monotonicity (isotonic-like via running max)
-    monot = []
-    m = 0.0
-    for c,ph in out:
-        m = max(m, ph)
-        monot.append([c, m])
-
-    meta_set("calibration_map", json.dumps(monot))
-    return {"bins": monot, "n": len(pairs)}
-
 # ---- Learning: record a feedback row from an offer resolution ----
 def _record_feedback_from_offer(offer: Dict[str, Any], outcome: int, resolved_ts: float, pnl: Optional[float] = None):
-    """Insert a synthetic feedback row so /feedback/stats includes auto-resolutions, then learn."""
-    # Parse fields safely
+    """Insert a synthetic feedback row so /feedback/stats includes auto-resolutions."""
     try:
         feats = json.loads(offer.get("features") or "{}")
     except Exception:
         feats = {}
+
     try:
         targets = json.loads(offer.get("targets") or "[]")
     except Exception:
@@ -1640,43 +1314,33 @@ def _record_feedback_from_offer(offer: Dict[str, Any], outcome: int, resolved_ts
 
     ua = "learning/auto-resolve"
     ip = "127.0.0.1"
-
-    # Write the feedback row (inside lock)
     with _db_lock:
         conn = _db()
-        try:
-            conn.execute(
-                """INSERT INTO feedback
-                   (ts, symbol, tf, market, direction, entry, stop, targets,
-                    confidence, advice, outcome, features, edge, composite, equity, risk_pct, leverage, ua, ip)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    resolved_ts,
-                    offer.get("symbol"),
-                    offer.get("tf"),
-                    offer.get("market"),
-                    offer.get("direction"),
-                    offer.get("entry"),
-                    offer.get("stop"),
-                    json.dumps(targets),
-                    offer.get("confidence"),
-                    offer.get("advice"),
-                    int(outcome),
-                    json.dumps(feats),
-                    "{}", "{}",  # edge, composite (unused here)
-                    offer.get("equity"),
-                    offer.get("risk_pct"),
-                    offer.get("leverage"),
-                    ua, ip,
-                )
+        conn.execute(
+            """INSERT INTO feedback
+               (ts, symbol, tf, market, direction, entry, stop, targets,
+                confidence, advice, outcome, features, edge, composite, equity, risk_pct, leverage, ua, ip)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                resolved_ts,
+                offer.get("symbol"),
+                offer.get("tf"),
+                offer.get("market"),
+                offer.get("direction"),
+                offer.get("entry"),
+                offer.get("stop"),
+                json.dumps(targets),
+                offer.get("confidence"),
+                offer.get("advice"),
+                outcome,
+                json.dumps(feats),
+                "{}", "{}",  # edge, composite (not used here)
+                offer.get("equity"),
+                offer.get("risk_pct"),
+                offer.get("leverage"),
+                ua, ip
             )
-            conn.commit()
-        finally:
-            conn.close()
-
-    # Learn from the outcome (outside lock to avoid deadlocks)
-    try:
-        update_weights(feats, int(outcome), tf=offer.get("tf"), symbol=offer.get("symbol"))
-    except Exception:
-        pass
+        )
+        conn.commit()
+        conn.close()
 # =================================
