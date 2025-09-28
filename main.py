@@ -1,18 +1,29 @@
-# main.py — AI Trade Advisor backend v3.1.0 (Kraken/USD)
-# FastAPI + ccxt + pandas (py3.12 recommended; see requirements.txt)
+# main.py — AI Trade Advisor v3.1.0
 from __future__ import annotations
+
+# ✅ keep imports first
+import os
+import json
+import sqlite3
+import threading
+import time
+import math
+
+from typing import List, Optional, Dict, Any, Tuple
 from fastapi import FastAPI, HTTPException, Depends, Header, Query, Request
 from fastapi.responses import PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Any, Tuple
 from adapters import CryptoCCXT
-MARKET = os.getenv("MARKET", "crypto")
-import os, json, sqlite3, threading, time
-import math
+
 import pandas as pd
 import numpy as np
 import ccxt
+
+# ✅ only now is it safe to read env vars
+MARKET   = os.getenv("MARKET", "crypto")
+EXCHANGE = os.getenv("EXCHANGE", "kraken")
+QUOTE    = os.getenv("QUOTE", "USD")
 
 app = FastAPI(title="AI Trade Advisor API", version="2025.09")
 

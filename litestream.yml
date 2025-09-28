@@ -1,0 +1,7 @@
+dbs:
+  - path: /data/ai_trade_feedback.db
+    replicas:
+      - url: s3://YOUR-BUCKET/ai-trade/feedback.db
+        access-key-id: ${S3_ACCESS_KEY_ID}
+        secret-access-key: ${S3_SECRET_ACCESS_KEY}
+        region: YOUR-S3-REGION
