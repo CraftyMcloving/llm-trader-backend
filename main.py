@@ -132,6 +132,10 @@ def init_feedback_db():
         pnl        REAL,              -- Phase 2: realized P/L at resolution
         resolved_ts REAL              -- Phase 2: epoch seconds
         );
+        CREATE TABLE IF NOT EXISTS meta(
+        k TEXT PRIMARY KEY,
+        v TEXT
+        );
         CREATE TABLE IF NOT EXISTS tracked(
           uid INTEGER NOT NULL,
           id  TEXT PRIMARY KEY,
@@ -145,6 +149,20 @@ def init_feedback_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_offers_created ON offers(created_ts);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_offers_resolved ON offers(resolved, expires_ts);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_offers_exp ON offers(expires_ts);")
+        conn.commit()
+        conn.close()
+
+def meta_get(key:str) -> Optional[str]:
+    with _db_lock:
+        conn = _db()
+        row = conn.execute("SELECT v FROM meta WHERE k=?", (key,)).fetchone()
+        conn.close()
+    return row[0] if row else None
+
+def meta_set(key:str, val:str):
+    with _db_lock:
+        conn = _db()
+        conn.execute("INSERT OR REPLACE INTO meta(k,v) VALUES(?,?)", (key, val))
         conn.commit()
         conn.close()
 
@@ -911,6 +929,25 @@ def signals(
         base_conf = float(res.get("confidence", 0.0))
         feats: Dict[str, Any] = res.get("features") or {}
         res["confidence"] = apply_feedback_bias(base_conf, feats)
+        # optional calibration (piecewise linear through saved bins)
+try:
+    cal = meta_get("calibration_map")
+    if cal:
+        import bisect
+        bins = json.loads(cal)
+        xs = [float(a) for a,_ in bins]
+        ys = [float(b) for _,b in bins]
+        x = float(res["confidence"])
+        if x <= xs[0]:         res["confidence"] = ys[0]
+        elif x >= xs[-1]:      res["confidence"] = ys[-1]
+        else:
+            i = bisect.bisect_left(xs, x)
+            x0,x1 = xs[i-1], xs[i]
+            y0,y1 = ys[i-1], ys[i]
+            t = (x - x0)/max(1e-9,(x1-x0))
+            res["confidence"] = (1-t)*y0 + t*y1
+except Exception:
+    pass
 
         # Keep filter in sync with the threshold if provided
         if isinstance(res.get("filters"), dict) and min_confidence is not None:
@@ -1398,6 +1435,49 @@ def tracked_delete_path(id: str, x_user_id: Optional[int] = Header(None), _: Non
         conn.commit()
         conn.close()
     return _tracked_list_for(uid)
+    
+import json
+@app.post("/calibration/rebuild")
+def calibration_rebuild(min_samples:int=200, bins:int=10, _: None = Depends(require_key)):
+    """Compute a simple isotonic-like reliability mapping."""
+    with _db_lock:
+        conn = _db()
+        rows = conn.execute("""
+          SELECT confidence, outcome
+          FROM feedback
+          WHERE accepted=1 AND confidence IS NOT NULL
+          ORDER BY ts DESC
+          LIMIT 5000
+        """).fetchall()
+        conn.close()
+    if not rows or len(rows) < min_samples:
+        raise HTTPException(400, detail="not enough samples")
+
+    pairs = [(float(c), 1 if (o or 0)>0 else 0) for c,o in rows if c is not None]
+    if len(pairs) < min_samples:
+        raise HTTPException(400, detail="not enough samples")
+
+    # bin by predicted conf
+    pairs.sort(key=lambda x: x[0])
+    n = max(3, bins)
+    out = []
+    for i in range(n):
+        lo = int(i*len(pairs)/n); hi = int((i+1)*len(pairs)/n)
+        chunk = pairs[lo:hi] or []
+        if not chunk: continue
+        p_hat = sum(1 for _,y in chunk if y>0) / len(chunk)
+        c_mid = sum(c for c,_ in chunk)/len(chunk)
+        out.append([c_mid, p_hat])
+
+    # enforce monotonicity (isotonic-like via running max)
+    monot = []
+    m = 0.0
+    for c,ph in out:
+        m = max(m, ph)
+        monot.append([c, m])
+
+    meta_set("calibration_map", json.dumps(monot))
+    return {"bins": monot, "n": len(pairs)}
 
 # ---- Learning: record a feedback row from an offer resolution ----
 def _record_feedback_from_offer(offer: Dict[str, Any], outcome: int, resolved_ts: float, pnl: Optional[float] = None):
