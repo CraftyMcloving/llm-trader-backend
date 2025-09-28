@@ -1,5 +1,7 @@
-# main.py — AI Trade Advisor backend v3.0.4 (Kraken/USD)
+# main.py — AI Trade Advisor backend v3.1.0 (Kraken/USD)
 # FastAPI + ccxt + pandas (py3.12 recommended; see requirements.txt)
+from adapters import CryptoCCXT
+MARKET = os.getenv("MARKET", "crypto")
 from __future__ import annotations
 from fastapi import FastAPI, HTTPException, Depends, Header, Query, Request
 from fastapi.responses import PlainTextResponse
@@ -289,35 +291,26 @@ def cache_get(key, ttl):
     return data if (time.time() - ts) <= ttl else None
 def cache_set(key, data): CACHE[key] = (time.time(), data)
 
-# ----- Universe -----
 CURATED = [
     "BTC","ETH","XRP","SOL","ADA","DOGE","LINK","LTC","BCH","TRX",
     "DOT","ATOM","XLM","ETC","MATIC","UNI","APT","ARB","OP","AVAX",
     "NEAR","ALGO","FIL","SUI","SHIB","USDC","USDT","XMR","AAVE"
     ,"PAXG","ONDO","PEPE","SEI","IMX","TIA"
 ]
+
+# ----- Universe -----
 def get_universe(quote=QUOTE, limit=TOP_N) -> List[Dict[str, Any]]:
-    key = f"uni:{EXCHANGE_ID}:{quote}:{limit}"
+    # Crypto adapter (current behavior)
+    curated = [
+        "BTC","ETH","XRP","SOL","ADA","DOGE","LINK","LTC","BCH","TRX",
+        "DOT","ATOM","XLM","ETC","MATIC","UNI","APT","ARB","OP","AVAX",
+        "NEAR","ALGO","FIL","SUI","SHIB","USDC","USDT","XMR","AAVE","PAXG","ONDO","PEPE","SEI","IMX","TIA"
+    ]
+    adapter = CryptoCCXT(exchange_id=os.getenv("EXCHANGE","kraken"), quote=quote, curated=curated)
+    key = f"uni:{adapter.name()}:{limit}"
     u = cache_get(key, 1800)
     if u is not None: return u
-    markets = load_markets()
-
-    available: List[str] = []
-    for base in CURATED:
-        sym = f"{base}/{quote}"
-        if sym in markets and markets[sym].get("active"):
-            available.append(sym)
-
-    if len(available) < limit:
-        # Fallback: fill with other active {quote} tickers
-        for m, info in markets.items():
-            if info.get("quote") == quote and info.get("active"):
-                if m not in available:
-                    available.append(m)
-                if len(available) >= limit:
-                    break
-
-    out = [{"symbol": s, "name": s.split('/')[0], "market": EXCHANGE_ID, "tf_supported": ["1h","1d"]} for s in available[:limit]]
+    out = adapter.list_universe(limit)
     cache_set(key, out)
     return out
 
@@ -325,24 +318,17 @@ def get_universe(quote=QUOTE, limit=TOP_N) -> List[Dict[str, Any]]:
 TF_MAP = {"5m":"5m","15m":"15m","1h":"1h","1d":"1d"}
 
 def fetch_ohlcv(symbol: str, tf: str, bars: int = 720) -> pd.DataFrame:
-    ex = get_exchange()
+    adapter = CryptoCCXT(exchange_id=os.getenv("EXCHANGE","kraken"), quote=QUOTE)
     tf_ex = TF_MAP.get(tf)
     if tf_ex is None:
         raise HTTPException(400, detail=f"Unsupported timeframe: {tf}")
-    key = f"ohlcv:{symbol}:{tf_ex}:{bars}"
+    key = f"ohlcv:{adapter.name()}:{symbol}:{tf_ex}:{bars}"
     cached = cache_get(key, 900)
     if cached is not None:
         return cached.copy()
-    try:
-        data = ex.fetch_ohlcv(symbol, timeframe=tf_ex, limit=bars)
-    except ccxt.BadSymbol:
-        raise HTTPException(502, detail=f"Symbol not available on {EXCHANGE_ID}: {symbol}")
-    except Exception as e:
-        raise HTTPException(502, detail=f"fetch_ohlcv failed: {e}")
-    if not data or len(data) < 50:
-        raise HTTPException(502, detail="insufficient candles")
-    df = pd.DataFrame(data, columns=["ts","open","high","low","close","volume"])
-    df["ts"] = pd.to_datetime(df["ts"], unit="ms")
+    df = adapter.fetch_ohlcv(symbol, tf_ex, bars=bars)
+    if df.empty:
+        raise HTTPException(502, detail="no candles")
     cache_set(key, df)
     return df.copy()
 
