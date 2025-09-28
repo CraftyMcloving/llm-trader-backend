@@ -58,6 +58,9 @@ def require_key(
         raise HTTPException(status_code=403, detail="Bad token")
     return None
 
+EXCHANGE_ID = os.getenv("EXCHANGE", "kraken")
+TOP_N = int(os.getenv("TOP_N", "30"))
+
 _ex = None
 def get_exchange():
     global _ex
