@@ -82,9 +82,20 @@ def load_markets():
 
 # ========= FEEDBACK STORAGE & ONLINE WEIGHTS =========
 DB_PATH = os.getenv("FEEDBACK_DB", "/tmp/ai_trade_feedback.db")
+
+# Ensure parent dir exists (important when FEEDBACK_DB=/var/data/... on Render Disk)
+try:
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+except Exception:
+    pass
+
 _db_lock = threading.Lock()
 
 def _db():
+    try:
+        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    except Exception:
+        pass
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL;")
     return conn
@@ -738,6 +749,7 @@ def evaluate_signal(
 
     trade = None
     advice = "Skip"
+    mtf = {"has": False}  # <-- ensure defined in all paths
 
     # Direction gate: allow neutral if requested (choose side from slope/RSI/bb_pos)
     directional_ok = (sig in ("Bullish", "Bearish")) or allow_neutral
@@ -755,8 +767,8 @@ def evaluate_signal(
 
         trade = build_trade(symbol, feats, direction, risk_pct, equity, leverage)
         advice = "Consider"
-                # --- MTF gate (1h -> confirm on 15m; 5m manage hint) ---
-        mtf = None
+
+        # --- MTF gate (1h -> confirm on 15m; 5m manage hint) ---
         if tf == "1h" and direction:
             mtf = _mtf_gate(symbol, direction)
             if mtf.get("has") and not mtf.get("confirm15m", True):
@@ -765,9 +777,6 @@ def evaluate_signal(
                 advice = "Wait"
                 if "reasons" in filt:
                     filt["reasons"] = (filt.get("reasons") or []) + ["15m contradicts"]
-            # attach MTF meta either way
-        else:
-            mtf = {"has": False}
 
     # stable feature snapshot for learning/bias
     feat_map = last_features_snapshot(feats)
@@ -915,7 +924,7 @@ def signals(
     _: None = Depends(require_key),
 ):
     try:
-        # 1) get your base result (your existing function)
+        # 1) base evaluation
         res = evaluate_signal(
             symbol=symbol,
             tf=tf,
@@ -925,36 +934,38 @@ def signals(
             min_confidence=min_confidence,
         )
 
-        # Nudge confidence by learned weights
+        # 2) learned bias nudge
         base_conf = float(res.get("confidence", 0.0))
         feats: Dict[str, Any] = res.get("features") or {}
         res["confidence"] = apply_feedback_bias(base_conf, feats)
-        # optional calibration (piecewise linear through saved bins)
 
-        # Keep filter in sync with the threshold if provided
-        if isinstance(res.get("filters"), dict) and min_confidence is not None:
+        # 3) optional calibration (piecewise linear through saved bins)
+        try:
+            cal = meta_get("calibration_map")
+            if cal:
+                import bisect, json as _json
+                bins = _json.loads(cal)
+                xs = [float(a) for a, _ in bins]
+                ys = [float(b) for _, b in bins]
+                x = float(res["confidence"])
+                if x <= xs[0]:
+                    res["confidence"] = ys[0]
+                elif x >= xs[-1]:
+                    res["confidence"] = ys[-1]
+                else:
+                    i = bisect.bisect_left(xs, x)
+                    x0, x1 = xs[i-1], xs[i]
+                    y0, y1 = ys[i-1], ys[i]
+                    t = (x - x0) / max(1e-9, (x1 - x0))
+                    res["confidence"] = (1 - t) * y0 + t * y1
+        except Exception:
+            pass
+
+        # 4) keep filter gate consistent if client passed a threshold
+        if isinstance(res.get("filters"), dict) and (min_confidence is not None):
             res["filters"]["confidence_ok"] = (res["confidence"] >= float(min_confidence))
 
         return res
-        
-    try:
-    cal = meta_get("calibration_map")
-    if cal:
-        import bisect
-        bins = json.loads(cal)
-        xs = [float(a) for a,_ in bins]
-        ys = [float(b) for _,b in bins]
-        x = float(res["confidence"])
-        if x <= xs[0]:         res["confidence"] = ys[0]
-        elif x >= xs[-1]:      res["confidence"] = ys[-1]
-        else:
-            i = bisect.bisect_left(xs, x)
-            x0,x1 = xs[i-1], xs[i]
-            y0,y1 = ys[i-1], ys[i]
-            t = (x - x0)/max(1e-9,(x1-x0))
-            res["confidence"] = (1-t)*y0 + t*y1
-except Exception:
-    pass
 
     except HTTPException:
         raise
