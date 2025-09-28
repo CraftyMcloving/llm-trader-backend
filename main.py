@@ -930,7 +930,14 @@ def signals(
         feats: Dict[str, Any] = res.get("features") or {}
         res["confidence"] = apply_feedback_bias(base_conf, feats)
         # optional calibration (piecewise linear through saved bins)
-try:
+
+        # Keep filter in sync with the threshold if provided
+        if isinstance(res.get("filters"), dict) and min_confidence is not None:
+            res["filters"]["confidence_ok"] = (res["confidence"] >= float(min_confidence))
+
+        return res
+        
+    try:
     cal = meta_get("calibration_map")
     if cal:
         import bisect
@@ -948,12 +955,6 @@ try:
             res["confidence"] = (1-t)*y0 + t*y1
 except Exception:
     pass
-
-        # Keep filter in sync with the threshold if provided
-        if isinstance(res.get("filters"), dict) and min_confidence is not None:
-            res["filters"]["confidence_ok"] = (res["confidence"] >= float(min_confidence))
-
-        return res
 
     except HTTPException:
         raise
