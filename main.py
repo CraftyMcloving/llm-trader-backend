@@ -1170,6 +1170,11 @@ def learning_resolve_one(body: ResolveOneIn, _: None = Depends(require_key)):
 @app.post("/learning/resolve-due")
 def learning_resolve_due(limit: int = Query(50, ge=1, le=500), _: None = Depends(require_key)):
     return resolve_due_offers(limit=limit)
+    
+# Add this wrapper so GET works too (calls the same function)
+@app.get("/learning/resolve-due")
+def learning_resolve_due_get(limit: int = Query(50, ge=1, le=500), _: None = Depends(require_key)):
+    return resolve_due_offers(limit=limit)
 
 @app.get("/learning/stats")
 def learning_stats(_: None = Depends(require_key)):
@@ -1270,16 +1275,15 @@ def tracked_post(body: TrackIn, x_user_id: Optional[int] = Header(None), _: None
     return _tracked_list_for(uid)
 
 @app.delete("/tracked")
-def tracked_delete(id: Optional[str] = None, x_user_id: Optional[int] = Header(None), req: Request = None, _: None = Depends(require_key)):
+async def tracked_delete(
+    id: Optional[str] = None,
+    x_user_id: Optional[int] = Header(None),
+    body: Optional[dict] = Body(None),
+    _: None = Depends(require_key)
+):
     uid = _uid_from_header(x_user_id)
-    # accept id in query or JSON body
-    if not id:
-        try:
-            data = req.json() if hasattr(req, "json") else None
-        except Exception:
-            data = None
-        if data and isinstance(data, dict):
-            id = data.get("id")
+    if not id and body and isinstance(body, dict):
+        id = body.get("id")
     if not id:
         raise HTTPException(400, detail="id required")
     with _db_lock:
