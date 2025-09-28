@@ -96,6 +96,8 @@ def _db():
         pass
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=5000;")     # wait up to 5s on lock
+    conn.execute("PRAGMA synchronous=NORMAL;")    # good tradeoff on Render
     return conn
 
 def init_feedback_db():
@@ -999,6 +1001,10 @@ class Instrument(BaseModel):
 @app.get("/healthz", include_in_schema=False)
 def healthz():
     return PlainTextResponse("ok")
+    
+@app.get("/", include_in_schema=False)
+def root():
+    return {"ok": True}
 
 @app.middleware("http")
 async def _log_requests(request, call_next):
@@ -1082,20 +1088,28 @@ def scan(
     top: int = Query(6, ge=1, le=12),
     min_confidence: Optional[float] = Query(None),
     allow_neutral: int = Query(1, ge=0, le=1),
-    ignore_trend: int = Query(0, ge=0, le=1),   # NEW
-    ignore_vol: int = Query(0, ge=0, le=1),     # NEW
+    ignore_trend: int = Query(0, ge=0, le=1),
+    ignore_vol: int = Query(0, ge=0, le=1),
     risk_pct: float = Query(1.0, ge=0.1, le=5.0),
     equity: Optional[float] = Query(None, ge=0.0),
-    leverage: float = Query(1.0, ge=1.0, le=100.0),   # raised cap
+    leverage: float = Query(1.0, ge=1.0, le=100.0),
     include_chart: int = Query(1, ge=0, le=1),
     vol_cap: Optional[float] = Query(None),
     vol_min: Optional[float] = Query(None),
+    budget_sec: float = Query(8.0, ge=2.0, le=30.0),   # NEW: default 8s budget
     _: None = Depends(require_key)
 ):
+    t0 = time.time()
     uni = get_universe(limit=limit)
     results, ok = [], []
 
+    def timed_out() -> bool:
+        return (time.time() - t0) >= float(budget_sec)
+
     for it in uni:
+        # stop early if we have enough winners and we’re out of time
+        if timed_out() and len(ok) >= max(3, top):
+            break
         try:
             s = evaluate_signal(
                 symbol=it["symbol"], tf=tf,
@@ -1106,16 +1120,11 @@ def scan(
                 allow_neutral=bool(allow_neutral),
                 vol_cap=vol_cap, vol_min=vol_min,
             )
-
-            # Apply learned bias so ranking prefers what historically worked
             base_conf = float(s.get("confidence", 0.0))
             feats_map = s.get("features") or {}
             s["confidence"] = apply_feedback_bias(base_conf, feats_map, tf=tf, symbol=s["symbol"])
-
-            # keep the filter gate consistent if threshold provided
             if isinstance(s.get("filters"), dict) and (min_confidence is not None):
                 s["filters"]["confidence_ok"] = (s["confidence"] >= float(min_confidence))
-
             s["market"] = it["market"]
             if s["advice"] == "Consider":
                 ok.append(s)
@@ -1136,17 +1145,19 @@ def scan(
                 "filters": {"trend_ok": False, "vol_ok": False, "confidence_ok": False, "reasons": [f"exception: {e}"]},
                 "advice": "Skip", "market": it["market"]
             })
-    # ... (rest of your /scan stays the same)
+        # Soft stop if we already have a comfortable pool
+        if len(ok) >= top and (timed_out() or len(results) >= max(top*2, 10)):
+            break
 
     # choose pool
     pool = ok if ok else results
     pool_sorted = sorted(pool, key=lambda s: abs(s.get("confidence") or 0.0), reverse=True)
     topK = pool_sorted[:top]
 
-    # attach chart data if requested
+    # attach chart data if requested and budget remains
     out: List[Dict[str, Any]] = []
     for s in topK:
-        if include_chart:
+        if include_chart and not timed_out():
             try:
                 df = fetch_ohlcv(s["symbol"], tf, bars=160)
                 s["chart"] = {"closes": df["close"].tail(120).astype(float).tolist()}
@@ -1154,11 +1165,14 @@ def scan(
                 s["chart"] = None
         out.append(s)
 
-    note = None
+    note_bits = []
     if not ok and allow_neutral:
-        note = "No high-confidence setups; returning best candidates by confidence."
+        note_bits.append("No high-confidence setups; best candidates by confidence.")
+    spent = time.time() - t0
+    if spent >= budget_sec:
+        note_bits.append(f"Time budget reached ({spent:.1f}s). Partial list shown.")
 
-    return {"universe": len(uni), "note": note, "results": out}
+    return {"universe": len(uni), "note": " · ".join(note_bits) or None, "results": out}
 
 # ========= FEEDBACK API =========
 class FeedbackIn(BaseModel):
