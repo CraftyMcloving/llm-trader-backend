@@ -322,7 +322,7 @@ def get_universe(quote=QUOTE, limit=TOP_N) -> List[Dict[str, Any]]:
     return out
 
 # ----- Market data -----
-TF_MAP = {"1h": "1h", "1d": "1d"}
+TF_MAP = {"5m":"5m","15m":"15m","1h":"1h","1d":"1d"}
 
 def fetch_ohlcv(symbol: str, tf: str, bars: int = 720) -> pd.DataFrame:
     ex = get_exchange()
@@ -348,8 +348,10 @@ def fetch_ohlcv(symbol: str, tf: str, bars: int = 720) -> pd.DataFrame:
 
 # ms per bar
 def tf_ms(tf: str) -> int:
-    if tf == "1h": return 60*60*1000
-    if tf == "1d": return 24*60*60*1000
+    if tf == "5m":  return 5*60*1000
+    if tf == "15m": return 15*60*1000
+    if tf == "1h":  return 60*60*1000
+    if tf == "1d":  return 24*60*60*1000
     raise HTTPException(400, detail=f"Unsupported tf for eval: {tf}")
 
 def fetch_ohlcv_window(symbol: str, tf: str, start_ms: int, end_ms: int) -> pd.DataFrame:
@@ -469,6 +471,54 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     out["bb_std"]  = out["close"].rolling(20).std().replace(0, np.nan)
     out["bb_pos"]  = ((out["close"] - out["bb_mid"]) / (2*out["bb_std"])).clip(-1,1)
     return out
+    
+def _mtf_gate(symbol: str, primary_direction: str) -> Dict[str, Any]:
+    """
+    Multi-timeframe gate:
+    - Confirms 1h signal with 15m alignment.
+    - Produces 5m management hint (tighten/abort/none) without blocking.
+    Simple heuristic, fast and stable.
+    """
+    try:
+        df15 = compute_features(fetch_ohlcv(symbol, "15m", bars=400)).dropna().iloc[-120:]
+        df5  = compute_features(fetch_ohlcv(symbol, "5m",  bars=400)).dropna().iloc[-120:]
+    except HTTPException:
+        # If lower TFs unavailable, be permissive but mark it
+        return {"has": False, "confirm15m": True, "reason15m": "lower TF unavailable", "manage5m": "none"}
+
+    def _side_ok(feats, direction):
+        slope = float(feats["slope20"].iloc[-1])
+        rsi14 = float(feats["rsi14"].iloc[-1])
+        bbpos = float(feats["bb_pos"].iloc[-1])
+        if direction == "Long":
+            return (slope >= 0) and (rsi14 >= 45) and (bbpos >= -0.15)
+        else:
+            return (slope <= 0) and (rsi14 <= 55) and (bbpos <= 0.15)
+
+    confirm = _side_ok(df15, primary_direction)
+
+    # 5m hint
+    slope5 = float(df5["slope20"].iloc[-1])
+    rsi5   = float(df5["rsi14"].iloc[-1])
+    if primary_direction == "Long":
+        if (slope5 < 0 and rsi5 < 40):   hint = "abort"
+        elif (slope5 < 0 and rsi5 < 47): hint = "tighten"
+        else:                            hint = "none"
+    else:
+        if (slope5 > 0 and rsi5 > 60):   hint = "abort"
+        elif (slope5 > 0 and rsi5 > 53): hint = "tighten"
+        else:                            hint = "none"
+
+    return {
+        "has": True,
+        "confirm15m": bool(confirm),
+        "reason15m": "15m aligned" if confirm else "15m contradicts",
+        "manage5m": hint,
+        "checks": {
+            "m15": {"slope20": float(df15["slope20"].iloc[-1]), "rsi14": float(df15["rsi14"].iloc[-1]), "bb_pos": float(df15["bb_pos"].iloc[-1])},
+            "m5":  {"slope20": float(df5["slope20"].iloc[-1]),  "rsi14": float(df5["rsi14"].iloc[-1])}
+        }
+    }
 
 # ---- Feature snapshot for learning/bias (add after compute_features) ----
 def last_features_snapshot(feats: pd.DataFrame) -> Dict[str, float]:
@@ -690,6 +740,19 @@ def evaluate_signal(
 
         trade = build_trade(symbol, feats, direction, risk_pct, equity, leverage)
         advice = "Consider"
+                # --- MTF gate (1h -> confirm on 15m; 5m manage hint) ---
+        mtf = None
+        if tf == "1h" and direction:
+            mtf = _mtf_gate(symbol, direction)
+            if mtf.get("has") and not mtf.get("confirm15m", True):
+                # veto entry; degrade to "Wait"
+                trade = None
+                advice = "Wait"
+                if "reasons" in filt:
+                    filt["reasons"] = (filt.get("reasons") or []) + ["15m contradicts"]
+            # attach MTF meta either way
+        else:
+            mtf = {"has": False}
 
     # stable feature snapshot for learning/bias
     feat_map = last_features_snapshot(feats)
@@ -704,6 +767,7 @@ def evaluate_signal(
         "filters": {**filt, "reasons": reasons},
         "advice": advice,
         "features": feat_map,
+        "mtf": mtf,
     }
 
 def resolve_offer_row(row: sqlite3.Row) -> dict:
@@ -1104,6 +1168,45 @@ def feedback_stats():
         W = {k: v for k, v in conn.execute("SELECT feature, w FROM weights ORDER BY ABS(w) DESC LIMIT 24")}
         conn.close()
     return {"total": total, "good": good, "bad": bad, "weights": W}
+    
+def _parse_window_to_seconds(window: str) -> int:
+    try:
+        window = (window or "30d").strip().lower()
+        if window.endswith("d"): return int(float(window[:-1]) * 86400)
+        if window.endswith("h"): return int(float(window[:-1]) * 3600)
+        if window.endswith("m"): return int(float(window[:-1]) * 60)
+        return int(window)
+    except Exception:
+        return 30*86400
+
+@app.get("/feedback/stats_series")
+def feedback_stats_series(window: str = Query("30d"), bucket: str = Query("day")):
+    """Rolling stats series for sparkline etc."""
+    secs = _parse_window_to_seconds(window)
+    cutoff = time.time() - secs
+    with _db_lock:
+        conn = _db()
+        rows = conn.execute(
+            "SELECT ts, outcome FROM feedback WHERE accepted=1 AND ts>=? ORDER BY ts ASC",
+            (cutoff,)
+        ).fetchall()
+        conn.close()
+    if not rows:
+        return {"by_day": []}
+    # bucket by day UTC
+    by = {}
+    for ts, outcome in rows:
+        d = time.strftime("%Y-%m-%d", time.gmtime(float(ts)))
+        x = by.setdefault(d, {"good":0,"bad":0,"n":0})
+        if (outcome or 0) > 0: x["good"] += 1
+        if (outcome or 0) < 0: x["bad"]  += 1
+        x["n"] += 1
+    series = []
+    for d in sorted(by.keys()):
+        g = by[d]["good"]; b = by[d]["bad"]; n = by[d]["n"]
+        wr = (g / n) if n else 0.0
+        series.append({"date": d, "good": g, "bad": b, "n": n, "win_rate": wr})
+    return {"by_day": series}
 
 @app.post("/learning/offered")
 def learning_offered(batch: OffersBatch, request: Request, _: None = Depends(require_key)):
