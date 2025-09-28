@@ -34,7 +34,7 @@ app.add_middleware(
     allow_origins=origins,
     allow_methods=["*"],
     allow_headers=["*"],
-    allow_credentials=True,
+    allow_credentials=(origins != ["*"]),
 )
 
 # ----- Security -----
@@ -57,11 +57,6 @@ def require_key(
     if token != API_KEY:
         raise HTTPException(status_code=403, detail="Bad token")
     return None
-
-# ----- Exchange (Kraken) -----
-EXCHANGE_ID = os.getenv("EXCHANGE", "kraken")
-QUOTE = os.getenv("QUOTE", "USD")
-TOP_N = int(os.getenv("TOP_N", "30"))
 
 _ex = None
 def get_exchange():
@@ -209,7 +204,7 @@ def ensure_feedback_migrations(conn):
     cur.execute("CREATE INDEX IF NOT EXISTS idx_fb_sym_tf_acc_ts ON feedback(symbol, tf, accepted, ts)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_fb_uid_ts ON feedback(uid, ts)")
     conn.commit()
-    
+
 def ensure_weights2(conn):
     conn.execute("""
         CREATE TABLE IF NOT EXISTS weights2(
@@ -290,7 +285,7 @@ def feedback_bias(features: Dict[str, Any], alpha: float = 0.15) -> float:
     # squish
     s = max(-1.0, min(1.0, s))
     return alpha * s
-    
+
 def _sigmoid(z: float) -> float:
     try:
         return 1.0 / (1.0 + math.exp(-float(z)))
@@ -582,7 +577,7 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     out["bb_std"]  = out["close"].rolling(20).std().replace(0, np.nan)
     out["bb_pos"]  = ((out["close"] - out["bb_mid"]) / (2*out["bb_std"])).clip(-1,1)
     return out
-    
+
 def _mtf_gate(symbol: str, primary_direction: str) -> Dict[str, Any]:
     """
     Multi-timeframe gate:
@@ -732,36 +727,54 @@ def build_trade(symbol: str, df: pd.DataFrame, direction: str,
         "precision": mkt.get("precision", {})
     }
 
-def infer_signal(feats: pd.DataFrame, min_conf: float) -> Tuple[str,float,Dict[str,bool],List[str]]:
-    last = feats.iloc[-1]; reasons=[]
-    trend_up = bool(last["sma20"]>last["sma50"] and feats["slope20"].iloc[-1]>0)
-    trend_dn = bool(last["sma20"]<last["sma50"] and feats["slope20"].iloc[-1]<0)
-    trend_ok = trend_up or trend_dn
-    if not trend_ok: reasons.append("no clear trend")
+def infer_signal(
+    feats: pd.DataFrame,
+    min_conf: float,
+    vol_cap: Optional[float] = None,
+    vol_min: Optional[float] = None
+) -> Tuple[str, float, Dict[str, bool], List[str]]:
+    last = feats.iloc[-1]
+    reasons: List[str] = []
 
+    trend_up = bool(last["sma20"] > last["sma50"] and feats["slope20"].iloc[-1] > 0)
+    trend_dn = bool(last["sma20"] < last["sma50"] and feats["slope20"].iloc[-1] < 0)
+    trend_ok = trend_up or trend_dn
+    if not trend_ok:
+        reasons.append("no clear trend")
+
+    # use UI-provided guardrails when present, else env defaults
+    cap = VOL_CAP_ATR_PCT if vol_cap is None else float(vol_cap)
+    floor = VOL_MIN_ATR_PCT if vol_min is None else float(vol_min)
     atr_pct = float(last["atr_pct"])
-    vol_ok = bool((atr_pct>=VOL_MIN_ATR_PCT) and (atr_pct<=VOL_CAP_ATR_PCT))
-    if not vol_ok: reasons.append("ATR% outside bounds")
+    vol_ok = bool((atr_pct >= floor) and (atr_pct <= cap))
+    if not vol_ok:
+        reasons.append("ATR% outside bounds")
 
     rsi14 = float(last["rsi14"])
-    bias_up = rsi14>=52; bias_dn = rsi14<=48
+    bias_up = rsi14 >= 52
+    bias_dn = rsi14 <= 48
 
-    conf=0.0
-    if trend_ok: conf += 0.45
-    if vol_ok:   conf += 0.25
-    if bias_up or bias_dn: conf += 0.15
-    conf += min(abs(float(feats["ret5"].iloc[-1] or 0.0))*2.0, 0.15)
-    conf = float(max(0.0, min(conf,1.0)))
+    conf = 0.0
+    if trend_ok:
+        conf += 0.45
+    if vol_ok:
+        conf += 0.25
+    if bias_up or bias_dn:
+        conf += 0.15
+    conf += min(abs(float(feats["ret5"].iloc[-1] or 0.0)) * 2.0, 0.15)
+    conf = float(max(0.0, min(conf, 1.0)))
 
-    if trend_up and bias_up:   sig="Bullish"
-    elif trend_dn and bias_dn: sig="Bearish"
-    else:                      sig="Neutral"
+    if trend_up and bias_up:
+        sig = "Bullish"
+    elif trend_dn and bias_dn:
+        sig = "Bearish"
+    else:
+        sig = "Neutral"
 
-    # explicit reason for threshold gate
     if conf < min_conf:
         reasons.append(f"Composite conf {conf:.2f} < {min_conf:.2f}")
 
-    return sig, conf, {"trend_ok":trend_ok,"vol_ok":vol_ok,"confidence_ok":conf>=min_conf}, reasons
+    return sig, conf, {"trend_ok": trend_ok, "vol_ok": vol_ok, "confidence_ok": conf >= min_conf}, reasons
 
 def _vote_matches_market(fb: FeedbackIn) -> Tuple[bool, str]:
     # Need direction+entry for any meaningful check
@@ -815,6 +828,8 @@ def evaluate_signal(
     ignore_trend: bool = False,
     ignore_vol: bool = False,
     allow_neutral: bool = False,
+    vol_cap: Optional[float] = None,
+    vol_min: Optional[float] = None,
 ) -> Dict[str, Any]:
     df = fetch_ohlcv(symbol, tf, bars=400)
     feats = compute_features(df).dropna().iloc[-200:]
@@ -822,7 +837,7 @@ def evaluate_signal(
         raise HTTPException(502, detail="insufficient features window")
 
     thresh = min_confidence if (min_confidence is not None) else MIN_CONFIDENCE
-    sig, conf, filt, reasons = infer_signal(feats, thresh)
+    sig, conf, filt, reasons = infer_signal(feats, thresh, vol_cap=vol_cap, vol_min=vol_min)
 
     # Apply client relax flags to filters/reasons
     if ignore_trend:
@@ -1070,6 +1085,8 @@ def scan(
     equity: Optional[float] = Query(None, ge=0.0),
     leverage: float = Query(1.0, ge=1.0, le=100.0),   # raised cap
     include_chart: int = Query(1, ge=0, le=1),
+    vol_cap: Optional[float] = Query(None),
+    vol_min: Optional[float] = Query(None),
     _: None = Depends(require_key)
 ):
     uni = get_universe(limit=limit)
@@ -1084,6 +1101,7 @@ def scan(
                 ignore_trend=bool(ignore_trend),
                 ignore_vol=bool(ignore_vol),
                 allow_neutral=bool(allow_neutral),
+                vol_cap=vol_cap, vol_min=vol_min,
             )
 
             # Apply learned bias so ranking prefers what historically worked
@@ -1278,14 +1296,14 @@ def feedback_summary(symbol: str, tf: str, direction: Optional[str] = None, wind
         params = [symbol, tf, cutoff]
         where = "symbol=? AND tf=? AND accepted=1 AND uid>0 AND ts>=?"
         if direction:
-            where += " AND (direction=? OR (direction IS NULL AND ?=''))"
-            params.extend([direction, direction])
+            # include matching direction + directionless rows
+            where += " AND (direction = ? OR direction IS NULL)"
+            params.append(direction)
         rows = conn.execute(f"SELECT outcome FROM feedback WHERE {where}", params).fetchall()
         conn.close()
-    up = sum(1 for r in rows if (r[0] or 0) > 0)
-    down = sum(1 for r in rows if (r[0] or 0) < 0)
-    total = len(rows)
-    return {"up": up, "down": down, "total": total}
+    up = sum(1 for (o,) in rows if (o or 0) > 0)
+    down = sum(1 for (o,) in rows if (o or 0) < 0)
+    return {"up": up, "down": down, "total": len(rows)}
 
 @app.get("/feedback/stats")
 def feedback_stats():
@@ -1308,6 +1326,23 @@ def feedback_stats():
         finally:
             conn.close()
     return {"total": total, "good": good, "bad": bad, "weights": W}
+
+def _parse_window_to_seconds(s: str) -> int:
+    """
+    Accepts strings like '30d', '24h', '60m' or raw seconds ('3600').
+    Falls back to 30d on parse issues.
+    """
+    s = (s or "30d").strip().lower()
+    try:
+        if s.endswith("d"):
+            return int(float(s[:-1]) * 86400)
+        if s.endswith("h"):
+            return int(float(s[:-1]) * 3600)
+        if s.endswith("m"):
+            return int(float(s[:-1]) * 60)
+        return int(float(s))  # raw seconds
+    except Exception:
+        return 30 * 86400
 
 @app.get("/feedback/stats_series")
 def feedback_stats_series(window: str = Query("30d"), bucket: str = Query("day")):
@@ -1503,16 +1538,15 @@ def tracked_post(body: TrackIn, x_user_id: Optional[int] = Header(None), _: None
     return _tracked_list_for(uid)
 
 @app.delete("/tracked")
-def tracked_delete(id: Optional[str] = None, x_user_id: Optional[int] = Header(None), req: Request = None, _: None = Depends(require_key)):
+def tracked_delete(
+    id: Optional[str] = None,
+    body: Optional[Dict[str, Any]] = Body(None),
+    x_user_id: Optional[int] = Header(None),
+    _: None = Depends(require_key)
+):
     uid = _uid_from_header(x_user_id)
-    # accept id in query or JSON body
-    if not id:
-        try:
-            data = req.json() if hasattr(req, "json") else None
-        except Exception:
-            data = None
-        if data and isinstance(data, dict):
-            id = data.get("id")
+    if not id and isinstance(body, dict):
+        id = body.get("id")
     if not id:
         raise HTTPException(400, detail="id required")
     with _db_lock:
@@ -1531,7 +1565,7 @@ def tracked_delete_path(id: str, x_user_id: Optional[int] = Header(None), _: Non
         conn.commit()
         conn.close()
     return _tracked_list_for(uid)
-    
+
 @app.post("/calibration/rebuild")
 def calibration_rebuild(min_samples:int=200, bins:int=10, _: None = Depends(require_key)):
     """Compute a simple isotonic-like reliability mapping."""
