@@ -754,49 +754,61 @@ def resolve_offer_row(row: sqlite3.Row) -> dict:
 
     return {"result": result, "pnl": float(pnl_frac), "outcome": int(outcome), "resolved_ts": time.time()}
 
+# --- REPLACE: resolve_due_offers with short, per-row lock usage ---
 def resolve_due_offers(limit: int = 50) -> dict:
     """
-    Resolve all due offers (expires_ts <= now) that are not yet resolved.
+    Resolve due offers with minimal lock time:
+      1) read list of rows/ids under lock,
+      2) compute outcome without lock,
+      3) write each result under lock,
+      4) (optionally) insert feedback outside existing locks.
     """
     now = time.time()
-    done = 0
-    good = 0
-    bad  = 0
+    done = good = bad = 0
 
+    # 1) Read candidates under lock
     with _db_lock:
         conn = _db()
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            "SELECT * FROM offers WHERE resolved=0 AND expires_ts<=? ORDER BY expires_ts ASC LIMIT ?",
+            "SELECT id, symbol, tf, market, direction, entry, stop, targets, confidence, advice, "
+            "features, equity, risk_pct, leverage, created_ts, expires_ts "
+            "FROM offers WHERE resolved=0 AND expires_ts<=? "
+            "ORDER BY expires_ts ASC LIMIT ?",
             (now, int(limit)),
         ).fetchall()
-
-        for row in rows:
-            try:
-                upd = resolve_offer_row(row)
-                conn.execute(
-                    "UPDATE offers SET resolved=1, result=?, pnl=?, resolved_ts=? WHERE id=?",
-                    (upd["result"], upd["pnl"], upd["resolved_ts"], row["id"])
-                )
-                # NEW: log a synthetic feedback row (only if outcome is non-neutral)
-                try:
-                    if int(upd.get("outcome", 0)) != 0:
-                        row_map = {k: row[k] for k in row.keys()}  # sqlite3.Row -> dict
-                        _record_feedback_from_offer(row_map, int(upd["outcome"]), float(upd["resolved_ts"]), pnl=float(upd["pnl"]))
-                except Exception:
-                    pass
-                done += 1
-                if upd["outcome"] > 0: good += 1
-                elif upd["outcome"] < 0: bad += 1
-            except Exception as e:
-                # mark resolved with NEITHER on hard failure to avoid blocking forever
-                conn.execute(
-                    "UPDATE offers SET resolved=1, result=?, pnl=?, resolved_ts=? WHERE id=?",
-                    ("NEITHER", 0.0, time.time(), row["id"])
-                )
-                done += 1
-        conn.commit()
         conn.close()
+
+    # 2..4) For each row, compute (no lock) then write (lock) then log feedback (locks internally)
+    for row in rows:
+        try:
+            upd = resolve_offer_row(row)  # network/CPU: NO DB LOCK HERE
+        except Exception:
+            upd = {"result": "NEITHER", "pnl": 0.0, "outcome": 0, "resolved_ts": time.time()}
+
+        # write outcome under lock
+        with _db_lock:
+            conn = _db()
+            conn.execute(
+                "UPDATE offers SET resolved=1, result=?, pnl=?, resolved_ts=? WHERE id=?",
+                (upd["result"], upd["pnl"], upd["resolved_ts"], row["id"])
+            )
+            conn.commit()
+            conn.close()
+
+        # insert synthetic feedback (helper has its own locking)
+        try:
+            if int(upd.get("outcome", 0)) != 0:
+                _record_feedback_from_offer(
+                    dict(row), int(upd["outcome"]), float(upd["resolved_ts"]), pnl=float(upd["pnl"])
+                )
+        except Exception:
+            pass
+
+        done += 1
+        if upd["outcome"] > 0:   good += 1
+        elif upd["outcome"] < 0: bad  += 1
+
     return {"resolved": done, "good": good, "bad": bad}
 
 # ----- Schemas (light) -----
@@ -1139,41 +1151,53 @@ def learning_offered(batch: OffersBatch, request: Request, _: None = Depends(req
 
     return {"ok": True, "stored": len(batch.items)}
 
+# --- REPLACE: resolve-one to avoid nested locks and long critical sections ---
 class ResolveOneIn(BaseModel):
     id: int
 
 @app.post("/learning/resolve-one")
 def learning_resolve_one(body: ResolveOneIn, _: None = Depends(require_key)):
+    # 1) Read the row under lock, then release
     with _db_lock:
         conn = _db()
         conn.row_factory = sqlite3.Row
         row = conn.execute("SELECT * FROM offers WHERE id=?", (body.id,)).fetchone()
-        if not row:
-            conn.close()
-            raise HTTPException(404, detail="offer not found")
-        upd = resolve_offer_row(row)
+        conn.close()
+    if not row:
+        raise HTTPException(404, detail="offer not found")
+
+    # 2) Do network-heavy work OUTSIDE the lock
+    upd = resolve_offer_row(row)
+
+    # 3) Write update under lock (short transaction)
+    with _db_lock:
+        conn = _db()
         conn.execute(
             "UPDATE offers SET resolved=1, result=?, pnl=?, resolved_ts=? WHERE id=?",
             (upd["result"], upd["pnl"], upd["resolved_ts"], row["id"])
         )
-        # NEW: log a synthetic feedback row (only if outcome is non-neutral)
-        try:
-            if int(upd.get("outcome", 0)) != 0:
-                row_map = {k: row[k] for k in row.keys()}  # sqlite3.Row -> dict
-                _record_feedback_from_offer(row_map, int(upd["outcome"]), float(upd["resolved_ts"]), pnl=float(upd["pnl"]))
-        except Exception:
-            pass  # never block resolution on logging
         conn.commit()
         conn.close()
+
+    # 4) Log synthetic feedback OUTSIDE existing lock (helper locks internally)
+    try:
+        if int(upd.get("outcome", 0)) != 0:
+            row_map = dict(row)  # sqlite3.Row -> dict
+            _record_feedback_from_offer(
+                row_map, int(upd["outcome"]), float(upd["resolved_ts"]), pnl=float(upd["pnl"])
+            )
+    except Exception:
+        pass  # never block resolution on logging
+
     return {"ok": True, "id": body.id, **upd}
 
 @app.post("/learning/resolve-due")
-def learning_resolve_due(limit: int = Query(50, ge=1, le=500), _: None = Depends(require_key)):
+def learning_resolve_due(limit: int = Query(25, ge=1, le=500), _: None = Depends(require_key)):
     return resolve_due_offers(limit=limit)
     
 # Add this wrapper so GET works too (calls the same function)
 @app.get("/learning/resolve-due")
-def learning_resolve_due_get(limit: int = Query(50, ge=1, le=500), _: None = Depends(require_key)):
+def learning_resolve_due_get(limit: int = Query(25, ge=1, le=500), _: None = Depends(require_key)):
     return resolve_due_offers(limit=limit)
 
 @app.get("/learning/stats")
