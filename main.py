@@ -141,6 +141,8 @@ def init_feedback_db():
 
 def ensure_feedback_migrations(conn):
     cur = conn.cursor()
+
+    # --- columns (safe, idempotent) ---
     cols = {r[1] for r in cur.execute("PRAGMA table_info(feedback)").fetchall()}
     if "uid" not in cols:
         cur.execute("ALTER TABLE feedback ADD COLUMN uid INTEGER DEFAULT 0")
@@ -148,30 +150,44 @@ def ensure_feedback_migrations(conn):
         cur.execute("ALTER TABLE feedback ADD COLUMN fingerprint TEXT")
     if "accepted" not in cols:
         cur.execute("ALTER TABLE feedback ADD COLUMN accepted INTEGER DEFAULT 1")
+    conn.commit()
 
-    # Pre-dedupe to allow unique index creation on legacy data
-    cur.execute("""
-        DELETE FROM feedback
-        WHERE id IN (
-          SELECT id FROM (
-            SELECT id,
-                   ROW_NUMBER() OVER(
-                     PARTITION BY COALESCE(uid,0), COALESCE(fingerprint,'')
-                     ORDER BY id DESC
-                   ) AS rn
-            FROM feedback
-            WHERE fingerprint IS NOT NULL
-          ) t
-          WHERE t.rn > 1
-        )
-    """)
+    # --- PRE-DEDupe (supports old SQLite w/o window functions) ---
+    try:
+        cur.execute("""
+            DELETE FROM feedback
+            WHERE id IN (
+              SELECT id FROM (
+                SELECT id,
+                       ROW_NUMBER() OVER(
+                         PARTITION BY COALESCE(uid,0), COALESCE(fingerprint,'')
+                         ORDER BY id DESC
+                       ) AS rn
+                FROM feedback
+                WHERE fingerprint IS NOT NULL
+              ) t
+              WHERE t.rn > 1
+            )
+        """)
+    except Exception:
+        # Fallback: keep the latest id per (uid,fingerprint)
+        cur.execute("""
+            DELETE FROM feedback
+            WHERE id NOT IN (
+              SELECT MAX(id) FROM feedback
+              WHERE fingerprint IS NOT NULL
+              GROUP BY COALESCE(uid,0), COALESCE(fingerprint,'')
+            )
+        """)
+    conn.commit()
 
-    # Safe to create indexes now that columns exist
+    # --- indexes (safe, idempotent) ---
     cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_feedback_uid_fp ON feedback(uid, fingerprint)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_fb_sym_tf_acc_ts ON feedback(symbol, tf, accepted, ts)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_fb_uid_ts ON feedback(uid, ts)")
     conn.commit()
-        # ---- model tables ----
+
+    # ---- model tables ----
     cur.execute("""
       CREATE TABLE IF NOT EXISTS calibrations(
         tf TEXT PRIMARY KEY,
@@ -190,7 +206,8 @@ def ensure_feedback_migrations(conn):
     """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_weights_ns_ns ON weights_ns(namespace)")
     conn.commit()
-        # ---- per-namespace (symbol|tf) performance counters ----
+
+    # ---- per-namespace (symbol|tf) performance counters ----
     cur.execute("""
       CREATE TABLE IF NOT EXISTS ns_stats(
         ns TEXT PRIMARY KEY,
@@ -1299,6 +1316,9 @@ def scan(
     market: Optional[str] = Query(None),
     _: None = Depends(require_key)
 ):
+    # Hard time budget so we don't exceed upstream proxy limits
+    SCAN_DEADLINE_MS = int(os.getenv("SCAN_DEADLINE_MS", "55000"))
+    t0 = time.time()
     # Per-market scan caps to keep ccxt routes under the WP 65s proxy timeout
     MARKET_SCAN_CAP = {
         "crypto":   int(os.getenv("TOP_N_CRYPTO",  "12")),
@@ -1312,6 +1332,9 @@ def scan(
 
     for it in uni:
         try:
+            # Respect time budget
+            if (time.time() - t0) * 1000 > SCAN_DEADLINE_MS:
+                break
             mc = (min_confidence if min_confidence is not None else MIN_CONFIDENCE)
             if precision:
                 mc = min(1.0, mc + 0.05)
@@ -1360,9 +1383,10 @@ def scan(
 
     out: List[Dict[str, Any]] = []
     for s in topK:
+        # [main.py] // SCAN: reuse same cached OHLCV to avoid a second ccxt call
         if include_chart:
             try:
-                df = fetch_ohlcv(s["symbol"], tf, bars=160, market_name=market or s.get("market"))
+                df = fetch_ohlcv(s["symbol"], tf, bars=400, market_name=market or s.get("market"))
                 s["chart"] = {"closes": pd.to_numeric(df["close"], errors="coerce").tail(120).dropna().astype(float).to_list()}
             except Exception:
                 s["chart"] = None
