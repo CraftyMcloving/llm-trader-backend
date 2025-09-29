@@ -1,4 +1,4 @@
-# main.py — AI Trade Advisor backend v3.0.4 (Kraken/USD)
+# main.py — AI Trade Advisor backend v3.1.0 (Kraken/USD)
 # FastAPI + ccxt + pandas (py3.12 recommended; see requirements.txt)
 from __future__ import annotations
 from fastapi import FastAPI, HTTPException, Depends, Header, Query, Request
@@ -167,6 +167,35 @@ def ensure_feedback_migrations(conn):
     cur.execute("CREATE INDEX IF NOT EXISTS idx_fb_sym_tf_acc_ts ON feedback(symbol, tf, accepted, ts)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_fb_uid_ts ON feedback(uid, ts)")
     conn.commit()
+        # ---- model tables ----
+    cur.execute("""
+      CREATE TABLE IF NOT EXISTS calibrations(
+        tf TEXT PRIMARY KEY,
+        a REAL NOT NULL,
+        b REAL NOT NULL,
+        updated_ts REAL NOT NULL
+      )
+    """)
+    cur.execute("""
+      CREATE TABLE IF NOT EXISTS weights_ns(
+        namespace TEXT NOT NULL,
+        feature   TEXT NOT NULL,
+        w         REAL NOT NULL,
+        PRIMARY KEY(namespace, feature)
+      )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_weights_ns_ns ON weights_ns(namespace)")
+    conn.commit()
+        # ---- per-namespace (symbol|tf) performance counters ----
+    cur.execute("""
+      CREATE TABLE IF NOT EXISTS ns_stats(
+        ns TEXT PRIMARY KEY,
+        wins INTEGER NOT NULL DEFAULT 0,
+        total INTEGER NOT NULL DEFAULT 0,
+        updated_ts REAL NOT NULL
+      )
+    """)
+    conn.commit()
 
 def get_weights() -> Dict[str, float]:
     with _db_lock:
@@ -219,26 +248,18 @@ def update_weights(features: Dict[str, Any], outcome: int, lr: float = 0.05):
         conn.commit()
         conn.close()
 
-def feedback_bias(features: Dict[str, Any], alpha: float = 0.15) -> float:
-    """
-    Compute a bias adjustment from learned weights; clamp to [-1..1] then scale by alpha.
-    """
-    ws = get_weights()
+def feedback_bias(features: Dict[str, Any], symbol: str = "", tf: str = "", alpha: float = 0.15) -> float:
+    ws = get_weights_ns(symbol, tf) if (symbol and tf) else get_weights()
     s = 0.0
     for k, v in (features or {}).items():
-        try:
-            x = float(v)
-        except Exception:
-            continue
-        # re-use the same crude normalization as in update_weights
+        try: x = float(v)
+        except: continue
         if "rsi" in k:          x = (x - 50.0) / 50.0
-        elif "macd" in k or "diff" in k or "ret" in k or "bb_pos" in k or "donch" in k:
-            x = max(-2.0, min(2.0, x))
+        elif any(t in k for t in ("macd","diff","ret","bb_pos","donch")): x = max(-2.0, min(2.0, x))
         elif "atr" in k:        x = max(-1.0, min(1.0, x))
         else:                   x = max(-3.0, min(3.0, x))
         w = ws.get(k, 0.0)
         s += w * x
-    # squish
     s = max(-1.0, min(1.0, s))
     return alpha * s
 
@@ -273,12 +294,168 @@ def _startup():
 
 # =====================================================
 
-def apply_feedback_bias(confidence: float, features: Dict[str, Any]) -> float:
-    """Return confidence nudged by learned weights; always safe."""
+def apply_feedback_bias(confidence: float, features: Dict[str, Any], symbol: str = "", tf: str = "") -> float:
     try:
-        return max(-1.0, min(1.0, float(confidence) + feedback_bias(features)))
+        return max(-1.0, min(1.0, float(confidence) + feedback_bias(features, symbol, tf)))
     except Exception:
         return float(confidence)
+        
+# ====== Platt calibration (per timeframe) ======
+CALIBRATION_ENABLED = bool(int(os.getenv("CALIBRATION_ENABLED", "1")))
+CALIBRATION_MIN_SAMPLES = int(os.getenv("CALIBRATION_MIN_SAMPLES", "60"))
+CALIBRATION_STALENESS_SEC = int(os.getenv("CALIBRATION_STALENESS_SEC", "21600"))  # 6h
+
+def _sigmoid(x): return 1.0/(1.0+math.exp(-x))
+def _logit(p):
+    p = min(max(p, 1e-6), 1-1e-6)
+    return math.log(p/(1.0-p))
+
+def _fit_platt(z, y, iters=400, lr=0.05):
+    # minimize log-loss of sigmoid(a*z + b) vs labels y in {0,1}
+    a, b = 1.0, 0.0
+    for _ in range(iters):
+        s = a*z + b
+        p = 1.0/(1.0+np.exp(-s))
+        grad_a = float(((p - y) * z).mean())
+        grad_b = float((p - y).mean())
+        a -= lr * grad_a
+        b -= lr * grad_b
+    return float(a), float(b)
+
+def _load_calib(tf: str):
+    with _db_lock:
+        conn = _db()
+        row = conn.execute("SELECT a,b,updated_ts FROM calibrations WHERE tf=?", (tf,)).fetchone()
+        conn.close()
+    return (float(row[0]), float(row[1]), float(row[2])) if row else (None,None,None)
+
+def _save_calib(tf: str, a: float, b: float):
+    with _db_lock:
+        conn = _db()
+        conn.execute("INSERT INTO calibrations(tf,a,b,updated_ts) VALUES(?,?,?,?) "
+                     "ON CONFLICT(tf) DO UPDATE SET a=excluded.a, b=excluded.b, updated_ts=excluded.updated_ts",
+                     (tf, float(a), float(b), time.time()))
+        conn.commit()
+        conn.close()
+
+def _maybe_fit_calibration(tf: str):
+    a,b,ts = _load_calib(tf)
+    if a is not None and (time.time() - ts) < CALIBRATION_STALENESS_SEC:
+        return a,b
+    # gather recent accepted votes w/ confidence
+    with _db_lock:
+        conn = _db()
+        rows = conn.execute(
+            "SELECT confidence, outcome FROM feedback "
+            "WHERE tf=? AND accepted=1 AND confidence IS NOT NULL AND outcome IN (1,-1) "
+            "AND ts >= ? ORDER BY ts DESC LIMIT 1000",
+            (tf, time.time() - 30*24*3600)
+        ).fetchall()
+        conn.close()
+    if not rows or len(rows) < CALIBRATION_MIN_SAMPLES:
+        # sensible default (identity)
+        _save_calib(tf, 1.0, 0.0)
+        return 1.0, 0.0
+    p = np.array([min(max(float(r[0]), 1e-6), 1-1e-6) for r in rows], dtype=float)
+    y = np.array([1 if int(r[1])>0 else 0 for r in rows], dtype=float)
+    z = np.array([_logit(x) for x in p], dtype=float)
+    # standardize z for stable fit
+    zm = z.mean(); zs = z.std() or 1.0
+    z_std = (z - zm)/zs
+    a, b = _fit_platt(z_std, y)
+    # store parameters to be used with standardized z
+    _save_calib(tf, a/ max(zs,1e-9), b - a*zm/ max(zs,1e-9))
+    return _load_calib(tf)[:2]
+
+def apply_calibration(tf: str, p: float) -> float:
+    if not CALIBRATION_ENABLED:
+        return float(p)
+    try:
+        a,b = _maybe_fit_calibration(tf)
+        z = _logit(float(p))
+        return float(max(0.0, min(1.0, _sigmoid(a*z + b))))
+    except Exception:
+        return float(p)
+
+# ====== Symbol-aware weights ======
+def _ns(symbol: str, tf: str) -> str:
+    return f"{symbol}|{tf}"
+
+def get_weights_ns(symbol: str, tf: str) -> Dict[str, float]:
+    ns_sym = _ns(symbol, tf)
+    ns_tf  = f"*|{tf}"
+    W = {}
+    with _db_lock:
+        conn = _db()
+        for ns in (ns_tf, ns_sym):
+            for k,v in conn.execute("SELECT feature, w FROM weights_ns WHERE namespace=?", (ns,)):
+                W.setdefault(k, float(v))   # keep more specific later if we flip order
+        # final fallback to global table if nothing yet
+        if not W:
+            for k,v in conn.execute("SELECT feature, w FROM weights"):
+                W[k] = float(v)
+        conn.close()
+    return W
+
+def update_weights_ns(features: Dict[str, Any], outcome: int, symbol: str, tf: str, lr: float = 0.05):
+    if not isinstance(features, dict): return
+    norm: Dict[str, float] = {}
+    for k, v in features.items():
+        if v is None: continue
+        try: x = float(v)
+        except: continue
+        if "rsi" in k: x = (x - 50.0) / 50.0
+        elif any(t in k for t in ("macd","diff","ret","bb_pos","donch")): x = max(-2.0,min(2.0,x))
+        elif "atr" in k: x = max(-1.0, min(1.0, x))
+        else: x = max(-3.0, min(3.0, x))
+        norm[k] = x
+    if not norm: return
+    with _db_lock:
+        conn = _db()
+        for ns in (_ns(symbol, tf), f"*|{tf}"):
+            for k, x in norm.items():
+                row = conn.execute("SELECT w FROM weights_ns WHERE namespace=? AND feature=?", (ns,k)).fetchone()
+                w = float(row[0]) if row else 0.0
+                w = w + lr * outcome * x
+                conn.execute("INSERT INTO weights_ns(namespace, feature, w) VALUES(?,?,?) "
+                             "ON CONFLICT(namespace,feature) DO UPDATE SET w=excluded.w",
+                             (ns, k, w))
+        conn.commit()
+        conn.close()
+
+def _ns(symbol: str, tf: str) -> str:
+    return f"{symbol}|{tf}"
+
+def ns_stats_get(symbol: str, tf: str) -> Tuple[int,int]:
+    with _db_lock:
+        conn = _db()
+        row = conn.execute("SELECT wins,total FROM ns_stats WHERE ns=?", (_ns(symbol, tf),)).fetchone()
+        conn.close()
+    if not row: return (0,0)
+    return (int(row[0]), int(row[1]))
+
+def ns_stats_update(symbol: str, tf: str, outcome: int):
+    if outcome == 0: return
+    with _db_lock:
+        conn = _db()
+        wins,total = ns_stats_get(symbol, tf)
+        wins  = wins + (1 if outcome>0 else 0)
+        total = total + 1
+        conn.execute(
+          "INSERT INTO ns_stats(ns,wins,total,updated_ts) VALUES(?,?,?,?) "
+          "ON CONFLICT(ns) DO UPDATE SET wins=?, total=?, updated_ts=?",
+          (_ns(symbol, tf), wins, total, time.time(), wins, total, time.time())
+        )
+        conn.commit(); conn.close()
+
+def wilson_lb(wins: int, total: int, z: float = 1.96) -> float:
+    if total <= 0: return 0.0
+    p = wins / total
+    denom = 1 + z*z/total
+    centre = p + z*z/(2*total)
+    adj = z * math.sqrt((p*(1-p) + z*z/(4*total))/total)
+    lb = (centre - adj) / denom
+    return max(0.0, min(1.0, lb))
 
 # ----- Cache -----
 CACHE: Dict[str, Tuple[float, Any]] = {}
@@ -322,7 +499,8 @@ def get_universe(quote=QUOTE, limit=TOP_N) -> List[Dict[str, Any]]:
     return out
 
 # ----- Market data -----
-TF_MAP = {"1h": "1h", "1d": "1d"}
+# Add lower timeframes (5m/15m) in addition to 1h/1d
+TF_MAP = {"5m":"5m","15m":"15m","1h": "1h", "1d": "1d"}
 
 def fetch_ohlcv(symbol: str, tf: str, bars: int = 720) -> pd.DataFrame:
     ex = get_exchange()
@@ -348,9 +526,34 @@ def fetch_ohlcv(symbol: str, tf: str, bars: int = 720) -> pd.DataFrame:
 
 # ms per bar
 def tf_ms(tf: str) -> int:
-    if tf == "1h": return 60*60*1000
-    if tf == "1d": return 24*60*60*1000
+    if tf == "5m":  return 5*60*1000
+    if tf == "15m": return 15*60*1000
+    if tf == "1h":  return 60*60*1000
+    if tf == "1d":  return 24*60*60*1000
     raise HTTPException(400, detail=f"Unsupported tf for eval: {tf}")
+
+from collections import OrderedDict
+_WINDOW_CACHE = OrderedDict()
+_WINDOW_TTL = 60  # seconds
+_WINDOW_MAX = 64  # entries
+
+def _wcache_get(key):
+    now = time.time()
+    v = _WINDOW_CACHE.get(key)
+    if not v: return None
+    ts, df = v
+    if (now - ts) > _WINDOW_TTL:
+        _WINDOW_CACHE.pop(key, None)
+        return None
+    # move to MRU
+    _WINDOW_CACHE.move_to_end(key)
+    return df.copy()
+
+def _wcache_set(key, df):
+    _WINDOW_CACHE[key] = (time.time(), df.copy())
+    _WINDOW_CACHE.move_to_end(key)
+    while len(_WINDOW_CACHE) > _WINDOW_MAX:
+        _WINDOW_CACHE.popitem(last=False)
 
 def fetch_ohlcv_window(symbol: str, tf: str, start_ms: int, end_ms: int) -> pd.DataFrame:
     """
@@ -360,15 +563,21 @@ def fetch_ohlcv_window(symbol: str, tf: str, start_ms: int, end_ms: int) -> pd.D
     per = tf_ms(tf)
     need = max(2, int((end_ms - start_ms) / per) + 4)
     since = max(0, start_ms - 2*per)
-    try:
-        data = ex.fetch_ohlcv(symbol, timeframe=TF_MAP[tf], since=since, limit=min(need+20, 2000))
-    except Exception as e:
-        raise HTTPException(502, detail=f"eval window fetch failed: {e}")
 
-    if not data:
-        raise HTTPException(502, detail="no candles for eval window")
+    ck = f"{symbol}|{tf}|{since}|{min(need+20,2000)}"
+    cached = _wcache_get(ck)
+    if cached is not None:
+        df = cached
+    else:
+        try:
+            data = ex.fetch_ohlcv(symbol, timeframe=TF_MAP[tf], since=since, limit=min(need+20, 2000))
+        except Exception as e:
+            raise HTTPException(502, detail=f"eval window fetch failed: {e}")
+        if not data:
+            raise HTTPException(502, detail="no candles for eval window")
+        df = pd.DataFrame(data, columns=["ts","open","high","low","close","volume"])
+        _wcache_set(ck, df)
 
-    df = pd.DataFrame(data, columns=["ts","open","high","low","close","volume"])
     # keep only overlap window (with one bar margin on each side)
     df = df[(df["ts"] >= (start_ms - per)) & (df["ts"] <= (end_ms + per))]
     if len(df) < 1:
@@ -378,13 +587,19 @@ def fetch_ohlcv_window(symbol: str, tf: str, start_ms: int, end_ms: int) -> pd.D
 EVAL_STOP_FIRST = bool(int(os.getenv("EVAL_STOP_FIRST", "0")))  # if 1: SL wins ties within same bar
 
 # --- Learning: default hold windows (env-overridable) ---
-HOLD_1H_SECS = int(os.getenv("HOLD_1H_SECS", "28800"))   # 8h default
-HOLD_1D_SECS = int(os.getenv("HOLD_1D_SECS", "604800"))  # 7d default
+HOLD_5M_SECS  = int(os.getenv("HOLD_5M_SECS",  "5400"))     # ~90m
+HOLD_15M_SECS = int(os.getenv("HOLD_15M_SECS", "10800"))    # ~3h
+HOLD_1H_SECS  = int(os.getenv("HOLD_1H_SECS",  "28800"))    # 8h
+HOLD_1D_SECS  = int(os.getenv("HOLD_1D_SECS",  "604800"))   # 7d
+
 
 def hold_secs_for(tf: str) -> int:
-    if tf == "1h": return HOLD_1H_SECS
-    if tf == "1d": return HOLD_1D_SECS
+    if tf == "5m":  return HOLD_5M_SECS
+    if tf == "15m": return HOLD_15M_SECS
+    if tf == "1h":  return HOLD_1H_SECS
+    if tf == "1d":  return HOLD_1D_SECS
     return HOLD_1H_SECS
+
 # --------------------------------------------------------
 
 def _tp_hit_first(entry, stop, tps, df, direction: str) -> Tuple[str, float]:
@@ -468,18 +683,19 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     out["bb_mid"]  = out["close"].rolling(20).mean()
     out["bb_std"]  = out["close"].rolling(20).std().replace(0, np.nan)
     out["bb_pos"]  = ((out["close"] - out["bb_mid"]) / (2*out["bb_std"])).clip(-1,1)
+
+    # ---- NEW: dollar turnover / liquidity proxy ----
+    out["turnover"] = (out["close"] * out["volume"]).replace([np.inf,-np.inf], np.nan)
+    # Smooth to per-hour comparable baseline: use 12 bars of 5m, 4 bars of 15m, 1 bar of 1h, 1/24 of 1d
+    # We will scale the threshold by timeframe later.
+    out["turnover_sma96"] = out["turnover"].rolling(96).mean()  # robust fallback average
+
     return out
 
 # ---- Feature snapshot for learning/bias (add after compute_features) ----
-def last_features_snapshot(feats: pd.DataFrame) -> Dict[str, float]:
-    """
-    Take the latest row of computed features and return a small, clean dict
-    of numeric values the learner can use. Keep names stable.
-    """
-    row = feats.iloc[-1]
     keys = [
-        "rsi14", "atr_pct", "ret5", "slope20", "bb_pos",
-        # you can add more later; keep them numeric and reasonably bounded
+        "rsi14","atr_pct","ret5","slope20","bb_pos",
+        "turnover","turnover_sma96",
     ]
     out: Dict[str, float] = {}
     for k in keys:
@@ -499,6 +715,12 @@ def last_features_snapshot(feats: pd.DataFrame) -> Dict[str, float]:
 MIN_CONFIDENCE     = float(os.getenv("MIN_CONFIDENCE", "0.14"))
 VOL_CAP_ATR_PCT    = float(os.getenv("VOL_CAP_ATR_PCT", "0.25"))
 VOL_MIN_ATR_PCT    = float(os.getenv("VOL_MIN_ATR_PCT", "0.001"))
+# ---- Precision Mode knobs (quality > quantity) ----
+PRECISION_DEFAULT = int(os.getenv("PRECISION_DEFAULT", "1"))  # 1=on by default
+TURNOVER_MIN_USD_PER_HR = float(os.getenv("TURNOVER_MIN_USD_PER_HR", "100000"))  # min $/hour
+EV_MIN            = float(os.getenv("EV_MIN", "0.05"))  # min expected value in R units
+WILSON_MIN_N      = int(os.getenv("WILSON_MIN_N", "50"))  # min samples before LB gate
+WILSON_LB_MIN     = float(os.getenv("WILSON_LB_MIN", "0.55"))  # min lower bound win rate
 
 def build_trade(symbol: str, df: pd.DataFrame, direction: str,
                 risk_pct: float = 1.0, equity: Optional[float] = None, leverage: float = 1.0) -> Dict[str, Any]:
@@ -571,36 +793,73 @@ def build_trade(symbol: str, df: pd.DataFrame, direction: str,
         "precision": mkt.get("precision", {})
     }
 
+def infer_regime(feats: pd.DataFrame) -> str:
+    """
+    Very light regime classifier:
+    - 'trend' when SMA20 vs SMA50 aligned with sustained slope
+    - 'chop' when bb_width is low (squeeze) and slopes near zero
+    - else 'mixed'
+    """
+    w = feats.tail(100)
+    sma20, sma50 = w["sma20"].iloc[-1], w["sma50"].iloc[-1]
+    slope = float(w["slope20"].iloc[-1])
+    bbw = (2*w["bb_std"]/w["bb_mid"]).replace([np.inf,-np.inf], np.nan).iloc[-20:].median()
+    if pd.isna(bbw): bbw = 0.0
+    if (sma20 > sma50 and slope > 0) or (sma20 < sma50 and slope < 0):
+        if bbw > 0.01:
+            return "trend"
+    if abs(slope) < 0.001 and bbw < 0.004:
+        return "chop"
+    return "mixed"
+
 def infer_signal(feats: pd.DataFrame, min_conf: float) -> Tuple[str,float,Dict[str,bool],List[str]]:
     last = feats.iloc[-1]; reasons=[]
+
+    # Regime & trend gates
+    regime = infer_regime(feats)
     trend_up = bool(last["sma20"]>last["sma50"] and feats["slope20"].iloc[-1]>0)
     trend_dn = bool(last["sma20"]<last["sma50"] and feats["slope20"].iloc[-1]<0)
     trend_ok = trend_up or trend_dn
     if not trend_ok: reasons.append("no clear trend")
+    if regime == "chop":
+        reasons.append("choppy regime")
 
+    # Volatility guardrails (plus extreme tail)
     atr_pct = float(last["atr_pct"])
-    vol_ok = bool((atr_pct>=VOL_MIN_ATR_PCT) and (atr_pct<=VOL_CAP_ATR_PCT))
-    if not vol_ok: reasons.append("ATR% outside bounds")
+    vol_ok  = bool((atr_pct>=VOL_MIN_ATR_PCT) and (atr_pct<=VOL_CAP_ATR_PCT))
+    try:
+        q98 = float(feats["atr_pct"].tail(300).quantile(0.98))
+        if math.isfinite(q98) and atr_pct >= q98 and atr_pct > 0:
+            vol_ok = False
+            reasons.append("ATR% extreme (top 2%)")
+    except Exception:
+        pass
+    if not vol_ok and "ATR% extreme" not in reasons:
+        reasons.append("ATR% outside bounds")
 
+    # Direction bias by RSI bands
     rsi14 = float(last["rsi14"])
     bias_up = rsi14>=52; bias_dn = rsi14<=48
 
+    # Base confidence (bounded)
     conf=0.0
-    if trend_ok: conf += 0.45
+    if trend_ok: conf += 0.40
     if vol_ok:   conf += 0.25
-    if bias_up or bias_dn: conf += 0.15
-    conf += min(abs(float(feats["ret5"].iloc[-1] or 0.0))*2.0, 0.15)
+    if (bias_up or bias_dn): conf += 0.15
+    try:
+        conf += min(abs(float(feats["ret5"].iloc[-1] or 0.0))*2.0, 0.15)
+    except Exception:
+        pass
     conf = float(max(0.0, min(conf,1.0)))
 
     if trend_up and bias_up:   sig="Bullish"
     elif trend_dn and bias_dn: sig="Bearish"
     else:                      sig="Neutral"
 
-    # explicit reason for threshold gate
     if conf < min_conf:
         reasons.append(f"Composite conf {conf:.2f} < {min_conf:.2f}")
 
-    return sig, conf, {"trend_ok":trend_ok,"vol_ok":vol_ok,"confidence_ok":conf>=min_conf}, reasons
+    return sig, conf, {"trend_ok":trend_ok,"vol_ok":vol_ok,"confidence_ok":conf>=min_conf,"regime":regime}, reasons
 
 def _vote_matches_market(fb: FeedbackIn) -> Tuple[bool, str]:
     # Need direction+entry for any meaningful check
@@ -655,7 +914,7 @@ def evaluate_signal(
     ignore_vol: bool = False,
     allow_neutral: bool = False,
 ) -> Dict[str, Any]:
-    df = fetch_ohlcv(symbol, tf, bars=400)
+        df = fetch_ohlcv(symbol, tf, bars=400)
     feats = compute_features(df).dropna().iloc[-200:]
     if len(feats) < 50:
         raise HTTPException(502, detail="insufficient features window")
@@ -663,7 +922,7 @@ def evaluate_signal(
     thresh = min_confidence if (min_confidence is not None) else MIN_CONFIDENCE
     sig, conf, filt, reasons = infer_signal(feats, thresh)
 
-    # Apply client relax flags to filters/reasons
+    # client relax flags
     if ignore_trend:
         filt["trend_ok"] = True
         reasons = [r for r in reasons if "trend" not in r.lower()]
@@ -671,18 +930,27 @@ def evaluate_signal(
         filt["vol_ok"] = True
         reasons = [r for r in reasons if "atr%" not in r.lower() and "vol" not in r.lower()]
 
+    # ---- Liquidity gate (per timeframe) ----
+    last = feats.iloc[-1]
+    turnover = float(last.get("turnover_sma96") or last.get("turnover") or 0.0)
+    # scale per-bar threshold to per-hour
+    tf_minutes = (60 if tf=="1h" else 1440 if tf=="1d" else 5 if tf=="5m" else 15 if tf=="15m" else 60)
+    min_turnover = TURNOVER_MIN_USD_PER_HR * (tf_minutes/60.0)
+    liquid_ok = bool(turnover >= min_turnover)
+    if not liquid_ok:
+        reasons.append(f"turnover ${turnover:,.0f} < ${min_turnover:,.0f} min")
+
     trade = None
     advice = "Skip"
 
-    # Direction gate: allow neutral if requested (choose side from slope/RSI/bb_pos)
+    # Direction gate (allow neutral choose side)
     directional_ok = (sig in ("Bullish", "Bearish")) or allow_neutral
-    if conf >= thresh and filt["vol_ok"] and directional_ok:
+    if conf >= thresh and filt["vol_ok"] and directional_ok and liquid_ok:
         if sig == "Bullish":
             direction = "Long"
         elif sig == "Bearish":
             direction = "Short"
         else:
-            # pick a side for neutral
             slope = float(feats["slope20"].iloc[-1])
             rsi14 = float(feats["rsi14"].iloc[-1])
             bbpos = float(feats["bb_pos"].iloc[-1])
@@ -691,7 +959,36 @@ def evaluate_signal(
         trade = build_trade(symbol, feats, direction, risk_pct, equity, leverage)
         advice = "Consider"
 
-    # stable feature snapshot for learning/bias
+        # ---- EV gate ----
+        try:
+            entry = float(trade["entry"]); stop = float(trade["stop"])
+            tps = trade.get("targets") or []
+            tp1 = float(tps[0]) if tps else None
+            if direction == "Long":
+                R = float((tp1 - entry) / max(1e-9, (entry - stop))) if tp1 else 1.2
+            else:
+                R = float((entry - tp1) / max(1e-9, (stop - entry))) if tp1 else 1.2
+            # final probability (if you added calibration elsewhere use it; here we use raw conf)
+            p = float(conf)
+            ev = p*R - (1-p)*1.0
+            if ev < EV_MIN:
+                advice = "Skip"
+                reasons.append(f"EV {ev:.2f} < {EV_MIN:.2f}")
+        except Exception:
+            pass
+
+        # ---- Reliability (Wilson LB) gate ----
+        try:
+            wins, total = ns_stats_get(symbol, tf)
+            if total >= WILSON_MIN_N:
+                lb = wilson_lb(wins, total, 1.96)
+                if lb < WILSON_LB_MIN:
+                    advice = "Skip"
+                    reasons.append(f"LB {lb:.2f} < {WILSON_LB_MIN:.2f} (n={total})")
+        except Exception:
+            pass
+
+    # Feature snapshot for learning/bias
     feat_map = last_features_snapshot(feats)
 
     return {
@@ -701,7 +998,7 @@ def evaluate_signal(
         "confidence": conf,
         "updated": pd.Timestamp.utcnow().isoformat(),
         "trade": trade,
-        "filters": {**filt, "reasons": reasons},
+        "filters": {**filt, "reasons": reasons, "liquid_ok": liquid_ok},
         "advice": advice,
         "features": feat_map,
     }
@@ -744,11 +1041,11 @@ def resolve_offer_row(row: sqlite3.Row) -> dict:
         outcome = 1 if (result == "TP" or (result == "PNL" and pnl_frac > 0)) else (
             -1 if (result == "SL" or (result == "PNL" and pnl_frac < 0)) else 0
         )
-
-    try:
+        try:
         feats = json.loads(row["features"] or "{}")
         if outcome != 0:
-            update_weights(feats, outcome)
+            update_weights(feats, outcome)           # keep legacy global weights
+            ns_stats_update(symbol, tf, outcome)     # NEW: reliability counters
     except Exception:
         pass
 
@@ -845,9 +1142,13 @@ def signals(
     equity: Optional[float] = Query(None, ge=0),
     leverage: float = Query(1.0, ge=1.0, le=100.0),
     min_confidence: Optional[float] = Query(None),
+    precision: int = Query(PRECISION_DEFAULT, ge=0, le=1),
     _: None = Depends(require_key),
 ):
     try:
+        mc = (min_confidence if min_confidence is not None else MIN_CONFIDENCE)
+        if precision:
+            mc = min(1.0, mc + 0.05)  # stricter threshold in precision mode
         # 1) get your base result (your existing function)
         res = evaluate_signal(
             symbol=symbol,
@@ -855,13 +1156,14 @@ def signals(
             risk_pct=risk_pct,
             equity=equity,
             leverage=leverage,
-            min_confidence=min_confidence,
+            min_confidence=mc,
         )
 
         # Nudge confidence by learned weights
-        base_conf = float(res.get("confidence", 0.0))
-        feats: Dict[str, Any] = res.get("features") or {}
-        res["confidence"] = apply_feedback_bias(base_conf, feats)
+            base_conf = float(res.get("confidence", 0.0))
+            feats: Dict[str, Any] = res.get("features") or {}
+            biased = apply_feedback_bias(base_conf, feats, symbol, tf)
+            res["confidence"] = apply_calibration(tf, biased)
 
         # Keep filter in sync with the threshold if provided
         if isinstance(res.get("filters"), dict) and min_confidence is not None:
@@ -876,17 +1178,17 @@ def signals(
 
 @app.get("/scan")
 def scan(
-    tf: str = "1h",
-    limit: int = Query(TOP_N, ge=3, le=50),
-    top: int = Query(6, ge=1, le=12),
-    min_confidence: Optional[float] = Query(None),
-    allow_neutral: int = Query(1, ge=0, le=1),
-    ignore_trend: int = Query(0, ge=0, le=1),   # NEW
-    ignore_vol: int = Query(0, ge=0, le=1),     # NEW
+    tf: str = Query("1h"),
+    limit: int = Query(6, ge=1, le=50),
+    allow_neutral: int = Query(0, ge=0, le=1),
+    ignore_trend: int = Query(0, ge=0, le=1),
+    ignore_vol: int = Query(0, ge=0, le=1),
     risk_pct: float = Query(1.0, ge=0.1, le=5.0),
     equity: Optional[float] = Query(None, ge=0.0),
-    leverage: float = Query(1.0, ge=1.0, le=100.0),   # raised cap
+    leverage: float = Query(1.0, ge=1.0, le=100.0),
     include_chart: int = Query(1, ge=0, le=1),
+    min_confidence: Optional[float] = Query(None),
+    precision: int = Query(PRECISION_DEFAULT, ge=0, le=1),
     _: None = Depends(require_key)
 ):
     uni = get_universe(limit=limit)
@@ -894,19 +1196,23 @@ def scan(
 
     for it in uni:
         try:
+            mc = (min_confidence if min_confidence is not None else MIN_CONFIDENCE)
+            if precision:
+                mc = min(1.0, mc + 0.05)
             s = evaluate_signal(
                 symbol=it["symbol"], tf=tf,
                 risk_pct=risk_pct, equity=equity, leverage=leverage,
-                min_confidence=min_confidence,
+                min_confidence=mc,
                 ignore_trend=bool(ignore_trend),
                 ignore_vol=bool(ignore_vol),
                 allow_neutral=bool(allow_neutral),
             )
 
             # Apply learned bias so ranking prefers what historically worked
-            base_conf = float(s.get("confidence", 0.0))
-            feats_map = s.get("features") or {}
-            s["confidence"] = apply_feedback_bias(base_conf, feats_map)
+                base_conf = float(s.get("confidence", 0.0))
+                feats_map = s.get("features") or {}
+                biased = apply_feedback_bias(base_conf, feats_map, s["symbol"], s["timeframe"])
+                s["confidence"] = apply_calibration(tf, biased)
 
             # keep the filter gate consistent if threshold provided
             if isinstance(s.get("filters"), dict) and (min_confidence is not None):
@@ -1082,7 +1388,7 @@ def post_feedback(fb: FeedbackIn, request: Request, x_user_id: Optional[int] = H
             conn.close()
 
     try:
-        update_weights(fb.features or {}, fb.outcome)
+        update_weights_ns(fb.features or {}, fb.outcome, fb.symbol, fb.tf)
     except Exception:
         pass
 
@@ -1217,7 +1523,12 @@ def learning_stats(_: None = Depends(require_key)):
 def learning_config(_: None = Depends(require_key)):
     """Small helper so the frontend knows how long to ‘hold’ before resolution."""
     return {
-        "hold_secs": {"1h": HOLD_1H_SECS, "1d": HOLD_1D_SECS},
+        "hold_secs": {
+            "5m": HOLD_5M_SECS,
+            "15m": HOLD_15M_SECS,
+            "1h": HOLD_1H_SECS,
+            "1d": HOLD_1D_SECS
+        },
         "bg_interval": BG_INTERVAL,
         "eval_stop_first": bool(EVAL_STOP_FIRST),
     }
