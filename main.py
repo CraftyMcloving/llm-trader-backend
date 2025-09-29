@@ -25,7 +25,7 @@ class UniverseItem:
 
 class BaseAdapter:
     name: str
-    def universe(self, top: int = 3) -> list[UniverseItem]: raise NotImplementedError
+    def universe(self, top: int = 6) -> list[UniverseItem]: raise NotImplementedError
     def fetch_ohlcv(self, symbol: str, tf: str, bars: int = 720) -> pd.DataFrame: raise NotImplementedError
     def fetch_window(self, symbol: str, tf: str, start_ms: int, end_ms: int) -> pd.DataFrame:  # optional fast path
         # default: fetch wider range and slice
@@ -47,9 +47,12 @@ class CryptoCCXTAdapter(BaseAdapter):
     def _ex(self):
         ex = get_exchange()  # you already have this singleton
         return ex
-    def universe(self, top: int = 3) -> list[UniverseItem]:
+    def universe(self, top: int = 6) -> list[UniverseItem]:
         # keep your curated list; take top 3
-        bases = ["BTC","ETH","SOL","XRP","ADA","DOGE"]
+        bases = ["BTC","ETH","XRP","SOL","ADA","DOGE","LINK","LTC","BCH","TRX",
+                 "DOT","ATOM","XLM","ETC","MATIC","UNI","APT","ARB","OP","AVAX",
+                 "NEAR","ALGO","FIL","SUI","SHIB","USDC","USDT","XMR","AAVE"
+                ,"PAXG","ONDO","PEPE","SEI","IMX","TIA"]
         syms = []
         markets = load_markets()
         for b in bases:
@@ -105,7 +108,7 @@ class YFAdapter(BaseAdapter):
         self.name = name
         self.tickers = tickers
         self.price_decimals = price_decimals
-    def universe(self, top: int = 3) -> list[UniverseItem]:
+    def universe(self, top: int = 6) -> list[UniverseItem]:
         syms = self.tickers[:top]
         return [UniverseItem(s, s.replace("=F","").replace("^",""), self.name, ["15m","1h","1d"]) for s in syms]
     def _interval(self, tf: str) -> str:
@@ -608,7 +611,7 @@ def get_universe(quote=QUOTE, limit=TOP_N, market_name: Optional[str] = None) ->
     key = f"uni:{ad.name}:{limit}"
     u = cache_get(key, 1800)
     if u is not None: return u
-    items = ad.universe(top=min( max(3, limit), 50))
+    items = ad.universe(top=min( max(6, limit), 50))
     out = [{"symbol": it.symbol, "name": it.name, "market": it.market, "tf_supported": it.tf_supported} for it in items]
     cache_set(key, out)
     return out
