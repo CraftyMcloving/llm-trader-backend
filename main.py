@@ -1046,8 +1046,8 @@ def resolve_offer_row(row: sqlite3.Row) -> dict:
         if outcome != 0:
             update_weights(feats, outcome)           # keep legacy global weights
             ns_stats_update(symbol, tf, outcome)     # NEW: reliability counters
-    except Exception:
-        pass
+        except Exception:
+            pass
 
     return {"result": result, "pnl": float(pnl_frac), "outcome": int(outcome), "resolved_ts": time.time()}
 
