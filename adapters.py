@@ -81,7 +81,7 @@ class CryptoCCXT(BaseAdapter):
 
     def _exh(self):
         if self._ex is None:
-            self._ex = getattr(ccxt, self.exchange_id)({"enableRateLimit": True, "timeout": 20000})
+            self._ex = getattr(ccxt, self.exchange_id)({"enableRateLimit": True, "timeout": 12000})
             try:
                 self._ex.load_markets()
             except Exception:
@@ -98,22 +98,31 @@ class CryptoCCXT(BaseAdapter):
         if top is not None and limit is None:
             limit = top
         limit = int(limit or 20)
+
+        # Optional hard cap from env (keeps scans snappy)
+        hard_cap = int(os.getenv("CRYPTO_UNIVERSE_CAP", "10"))
+
         m = self._load_markets()
         avail: List[str] = []
-        # curated first
+
+        # curated first (preferred)
         for base in (self.curated or []):
             sym = f"{base}/{self.quote}"
             if sym in m and m[sym].get("active"):
                 avail.append(sym)
-        # fill remainder
-        if len(avail) < limit:
+
+        # by default DO NOT fill remainder for CCXT (too slow in bulk)
+        # flip on with CCXT_FILL_REMAINDER=1 if you really want a bigger list
+        if not avail and bool(int(os.getenv("CCXT_FILL_REMAINDER", "0"))):
             for sym, info in m.items():
-                if info.get("quote")==self.quote and info.get("active"):
-                    if sym not in avail:
-                        avail.append(sym)
-                        if len(avail) >= limit: break
+                if info.get("quote") == self.quote and info.get("active"):
+                    avail.append(sym)
+                    if len(avail) >= limit:
+                        break
+
+        avail = avail[:min(limit, hard_cap)]
         return [{"symbol": s, "name": s.split('/')[0], "market": self.name,
-                 "tf_supported": ["5m","15m","1h","1d"]} for s in avail[:limit]]
+                 "tf_supported": ["5m","15m","1h","1d"]} for s in avail]
 
     def _cache_get(self, key:str) -> Optional[pd.DataFrame]:
         v = self._cache.get(key)
@@ -181,7 +190,7 @@ class BinancePerpsUSDT(BaseAdapter):
         if self._ex is None:
             self._ex = ccxt.binance({
                 "enableRateLimit": True,
-                "timeout": 20000,
+                "timeout": 12000,
                 "options": {"defaultType": "future"}  # USDT-M perpetuals
             })
             self._ex.load_markets()
@@ -346,15 +355,21 @@ ADAPTERS: Dict[str, Callable[[], BaseAdapter]] = {
     "stocks": StocksAdapter,
 }
 
-def register_adapter(key:str, factory:Callable[[], BaseAdapter]):
+# SINGLETON CACHE for adapters (so ccxt/yf clients + in-adapter caches are reused)
+_ADAPTER_INSTANCES: Dict[str, BaseAdapter] = {}
+
+def register_adapter(key: str, factory: Callable[[], BaseAdapter]):
     ADAPTERS[key.lower()] = factory
 
-# --- replace your current get_adapter with this normalized version ---
+# --- replace your current get_adapter with this normalized + cached version ---
 def get_adapter(name: Optional[str] = None) -> BaseAdapter:
-    """Select adapter by query param or env ADAPTER; accept long-form names like 'crypto:kraken:usd'."""
+    """
+    Select adapter by query param or env ADAPTER; accept long-form names like 'crypto:kraken:usd'.
+    Returns a singleton instance per logical adapter (crypto, binance_perps, forex, ...).
+    """
     raw = (name or os.getenv("ADAPTER", "crypto")).lower().strip()
     key = raw.split(":", 1)[0]  # 'crypto:kraken:usd' -> 'crypto'
-    # simple aliases
+
     aliases = {
         "crypto": "crypto",
         "binance_perps": "binance_perps",
@@ -365,5 +380,10 @@ def get_adapter(name: Optional[str] = None) -> BaseAdapter:
         "stocks": "stocks",
     }
     key = aliases.get(key, key)
-    factory = ADAPTERS.get(key) or ADAPTERS["crypto"]
-    return factory()
+
+    inst = _ADAPTER_INSTANCES.get(key)
+    if inst is None:
+        factory = ADAPTERS.get(key) or ADAPTERS["crypto"]
+        inst = factory()
+        _ADAPTER_INSTANCES[key] = inst
+    return inst

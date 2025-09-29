@@ -1283,7 +1283,8 @@ def signals(
 @app.get("/scan")
 def scan(
     tf: str = Query("1h"),
-    limit: int = Query(6, ge=1, le=50),
+    limit: int = Query(6, ge=1, le=50),                # universe size to scan
+    top: int = Query(6, ge=1, le=12),                  # how many results to return
     allow_neutral: int = Query(0, ge=0, le=1),
     ignore_trend: int = Query(0, ge=0, le=1),
     ignore_vol: int = Query(0, ge=0, le=1),
@@ -1296,7 +1297,15 @@ def scan(
     market: Optional[str] = Query(None),
     _: None = Depends(require_key)
 ):
-    uni = get_universe(limit=limit, market_name=market)
+    # Per-market scan caps to keep ccxt routes under the WP 65s proxy timeout
+    MARKET_SCAN_CAP = {
+        "crypto":   int(os.getenv("TOP_N_CRYPTO",  "12")),
+        "futures":  int(os.getenv("TOP_N_FUTURES", "12")),   # binance_perps is treated as 'futures'
+    }
+    mkey = (market or "crypto").split(":", 1)[0]
+    eff_limit = min(limit, MARKET_SCAN_CAP.get(mkey, limit))
+
+    uni = get_universe(limit=eff_limit, market_name=market)
     results, ok = [], []
 
     for it in uni:
@@ -1314,14 +1323,11 @@ def scan(
                 market_name=market or it.get("market"),
             )
 
-            # Apply learned bias so ranking prefers what historically worked
             base_conf = float(s.get("confidence", 0.0))
             feats_map = s.get("features") or {}
             biased = apply_feedback_bias(base_conf, feats_map, s["symbol"], s["timeframe"])
             s["confidence"] = apply_calibration(tf, biased)
 
-
-            # keep the filter gate consistent if threshold provided
             if isinstance(s.get("filters"), dict) and (min_confidence is not None):
                 s["filters"]["confidence_ok"] = (s["confidence"] >= float(min_confidence))
 
@@ -1346,30 +1352,16 @@ def scan(
                 "advice": "Skip", "market": it["market"]
             })
 
-    # choose pool
     pool = ok if ok else results
     pool_sorted = sorted(pool, key=lambda s: abs(s.get("confidence") or 0.0), reverse=True)
-    topK = pool_sorted[:limit]
+    topK = pool_sorted[:top]   # <-- separate “top” from “limit”
 
-    # attach chart data if requested
     out: List[Dict[str, Any]] = []
     for s in topK:
         if include_chart:
             try:
                 df = fetch_ohlcv(s["symbol"], tf, bars=160, market_name=market or s.get("market"))
-                # squeeze 'close' to a Series even if duplicate column names produce a DataFrame
-                if "close" not in df.columns:
-                    cols_lower = {str(c).lower(): c for c in df.columns}
-                    if "close" in cols_lower:
-                        close_obj = df[cols_lower["close"]]
-                    else:
-                        raise KeyError("no 'close' column")
-                else:
-                    close_obj = df["close"]
-                if isinstance(close_obj, pd.DataFrame):
-                    close_obj = close_obj.iloc[:, 0]
-                closes = pd.to_numeric(close_obj, errors="coerce").tail(120).dropna().astype(float).to_list()
-                s["chart"] = {"closes": closes}
+                s["chart"] = {"closes": pd.to_numeric(df["close"], errors="coerce").tail(120).dropna().astype(float).to_list()}
             except Exception:
                 s["chart"] = None
         out.append(s)
