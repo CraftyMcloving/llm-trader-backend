@@ -423,9 +423,6 @@ def update_weights_ns(features: Dict[str, Any], outcome: int, symbol: str, tf: s
         conn.commit()
         conn.close()
 
-def _ns(symbol: str, tf: str) -> str:
-    return f"{symbol}|{tf}"
-
 def ns_stats_get(symbol: str, tf: str) -> Tuple[int,int]:
     with _db_lock:
         conn = _db()
@@ -494,7 +491,8 @@ def get_universe(quote=QUOTE, limit=TOP_N) -> List[Dict[str, Any]]:
                 if len(available) >= limit:
                     break
 
-    out = [{"symbol": s, "name": s.split('/')[0], "market": EXCHANGE_ID, "tf_supported": ["1h","1d"]} for s in available[:limit]]
+    out = [{"symbol": s, "name": s.split('/')[0], "market": EXCHANGE_ID,
+            "tf_supported": ["5m","15m","1h","1d"]} for s in available[:limit]]
     cache_set(key, out)
     return out
 
@@ -692,21 +690,26 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
 
     return out
 
-# ---- Feature snapshot for learning/bias (add after compute_features) ----
+def last_features_snapshot(feats: pd.DataFrame) -> Dict[str, float]:
+    """
+    Take the latest row of computed features and return a small numeric dict
+    the learner/bias can use. Keep names stable.
+    """
+    row = feats.iloc[-1]
     keys = [
         "rsi14","atr_pct","ret5","slope20","bb_pos",
         "turnover","turnover_sma96",
     ]
     out: Dict[str, float] = {}
     for k in keys:
-        v = row.get(k)
-        try:
-            x = float(v)
-            if math.isfinite(x):
-                out[k] = x
-        except Exception:
-            pass
-    # Back-compat: your frontend used `atr14_pct`; duplicate the value
+        if k in row.index:
+            try:
+                x = float(row[k])
+                if math.isfinite(x):
+                    out[k] = x
+            except Exception:
+                pass
+    # Back-compat alias some front-ends use
     if "atr_pct" in out and "atr14_pct" not in out:
         out["atr14_pct"] = out["atr_pct"]
     return out
@@ -1043,11 +1046,12 @@ def resolve_offer_row(row: sqlite3.Row) -> dict:
         )
         try:
             feats = json.loads(row["features"] or "{}")
+        except Exception:
+            feats = {}
+
         if outcome != 0:
             update_weights(feats, outcome)           # keep legacy global weights
             ns_stats_update(symbol, tf, outcome)     # NEW: reliability counters
-        except Exception:
-            pass
 
     return {"result": result, "pnl": float(pnl_frac), "outcome": int(outcome), "resolved_ts": time.time()}
 
@@ -1160,10 +1164,11 @@ def signals(
         )
 
         # Nudge confidence by learned weights
-            base_conf = float(res.get("confidence", 0.0))
-            feats: Dict[str, Any] = res.get("features") or {}
-            biased = apply_feedback_bias(base_conf, feats, symbol, tf)
-            res["confidence"] = apply_calibration(tf, biased)
+        base_conf = float(res.get("confidence", 0.0))
+        feats: Dict[str, Any] = res.get("features") or {}
+        biased = apply_feedback_bias(base_conf, feats, symbol, tf)
+        res["confidence"] = apply_calibration(tf, biased)
+
 
         # Keep filter in sync with the threshold if provided
         if isinstance(res.get("filters"), dict) and min_confidence is not None:
@@ -1209,10 +1214,11 @@ def scan(
             )
 
             # Apply learned bias so ranking prefers what historically worked
-                base_conf = float(s.get("confidence", 0.0))
-                feats_map = s.get("features") or {}
-                biased = apply_feedback_bias(base_conf, feats_map, s["symbol"], s["timeframe"])
-                s["confidence"] = apply_calibration(tf, biased)
+            base_conf = float(s.get("confidence", 0.0))
+            feats_map = s.get("features") or {}
+            biased = apply_feedback_bias(base_conf, feats_map, s["symbol"], s["timeframe"])
+            s["confidence"] = apply_calibration(tf, biased)
+
 
             # keep the filter gate consistent if threshold provided
             if isinstance(s.get("filters"), dict) and (min_confidence is not None):
@@ -1243,7 +1249,7 @@ def scan(
     # choose pool
     pool = ok if ok else results
     pool_sorted = sorted(pool, key=lambda s: abs(s.get("confidence") or 0.0), reverse=True)
-    topK = pool_sorted[:top]
+    topK = pool_sorted[:limit]
 
     # attach chart data if requested
     out: List[Dict[str, Any]] = []
