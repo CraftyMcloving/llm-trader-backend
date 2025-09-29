@@ -11,6 +11,139 @@ import math
 import pandas as pd
 import numpy as np
 import ccxt
+# ===== Adapters: market-specific data sources =====
+from dataclasses import dataclass
+
+class AdapterError(Exception): ...
+
+@dataclass
+class UniverseItem:
+    symbol: str
+    name: str
+    market: str
+    tf_supported: list[str]
+
+class BaseAdapter:
+    name: str
+    def universe(self, top: int = 3) -> list[UniverseItem]: raise NotImplementedError
+    def fetch_ohlcv(self, symbol: str, tf: str, bars: int = 720) -> pd.DataFrame: raise NotImplementedError
+    def fetch_window(self, symbol: str, tf: str, start_ms: int, end_ms: int) -> pd.DataFrame:  # optional fast path
+        # default: fetch wider range and slice
+        per = tf_ms(tf)
+        need = max(2, int((end_ms - start_ms)/per) + 8)
+        df = self.fetch_ohlcv(symbol, tf, bars=min(2000, max(need, 240)))
+        ms = df["ts"].astype("int64")//10**6 if np.issubdtype(df["ts"].dtype, np.datetime64) else df["ts"]
+        return df[(ms >= (start_ms - per)) & (ms <= (end_ms + per))].reset_index(drop=True)
+    # precision helpers used by build_trade
+    def price_to_precision(self, symbol: str, price: float) -> float: return float(round(price, 2))
+    def amount_to_precision(self, symbol: str, qty: float) -> float:  return float(qty)
+
+# --- Crypto via ccxt (your current flow) ---
+class CryptoCCXTAdapter(BaseAdapter):
+    def __init__(self, exchange_id: str, quote: str):
+        self.name = "crypto"
+        self.exchange_id = exchange_id
+        self.quote = quote
+    def _ex(self):
+        ex = get_exchange()  # you already have this singleton
+        return ex
+    def universe(self, top: int = 3) -> list[UniverseItem]:
+        # keep your curated list; take top 3
+        bases = ["BTC","ETH","SOL","XRP","ADA","DOGE"]
+        syms = []
+        markets = load_markets()
+        for b in bases:
+            s = f"{b}/{self.quote}"
+            if s in markets and markets[s].get("active"):
+                syms.append(s)
+            if len(syms) >= top: break
+        return [UniverseItem(s, s.split("/")[0], self.exchange_id, ["5m","15m","1h","1d"]) for s in syms]
+    def fetch_ohlcv(self, symbol: str, tf: str, bars: int = 720) -> pd.DataFrame:
+        ex = self._ex()
+        tf_ex = TF_MAP.get(tf); 
+        if tf_ex is None: raise HTTPException(400, detail=f"Unsupported timeframe: {tf}")
+        key = f"ohlcv:{self.name}:{symbol}:{tf_ex}:{bars}"
+        cached = cache_get(key, 900)
+        if cached is not None: return cached.copy()
+        try:
+            data = ex.fetch_ohlcv(symbol, timeframe=tf_ex, limit=bars)
+        except Exception as e:
+            raise HTTPException(502, detail=f"{self.name} fetch_ohlcv failed: {e}")
+        if not data or len(data) < 50: raise HTTPException(502, detail="insufficient candles")
+        df = pd.DataFrame(data, columns=["ts","open","high","low","close","volume"])
+        df["ts"] = pd.to_datetime(df["ts"], unit="ms")
+        cache_set(key, df); 
+        return df.copy()
+    def fetch_window(self, symbol: str, tf: str, start_ms: int, end_ms: int) -> pd.DataFrame:
+        # your existing ccxt window logic (fast)
+        ex = self._ex()
+        per = tf_ms(tf)
+        need = max(2, int((end_ms - start_ms)/per) + 4)
+        since = max(0, start_ms - 2*per)
+        try:
+            data = ex.fetch_ohlcv(symbol, timeframe=TF_MAP[tf], since=since, limit=min(need+20,2000))
+        except Exception as e:
+            raise HTTPException(502, detail=f"eval window fetch failed: {e}")
+        if not data: raise HTTPException(502, detail="no candles for eval window")
+        df = pd.DataFrame(data, columns=["ts","open","high","low","close","volume"])
+        return df[(df["ts"] >= (start_ms - per)) & (df["ts"] <= (end_ms + per))].reset_index(drop=True)
+    def price_to_precision(self, symbol: str, price: float) -> float:
+        ex = self._ex()
+        return float(ex.price_to_precision(symbol, price))
+    def amount_to_precision(self, symbol: str, qty: float) -> float:
+        ex = self._ex()
+        return float(ex.amount_to_precision(symbol, qty))
+
+# --- Generic yfinance adapter family ---
+try:
+    import yfinance as yf
+except Exception:
+    yf = None
+
+class YFAdapter(BaseAdapter):
+    def __init__(self, name: str, tickers: list[str], price_decimals: int = 2):
+        self.name = name
+        self.tickers = tickers
+        self.price_decimals = price_decimals
+    def universe(self, top: int = 3) -> list[UniverseItem]:
+        syms = self.tickers[:top]
+        return [UniverseItem(s, s.replace("=F","").replace("^",""), self.name, ["15m","1h","1d"]) for s in syms]
+    def _interval(self, tf: str) -> str:
+        return {"5m":"5m","15m":"15m","1h":"60m","1d":"1d"}.get(tf, "60m")
+    def fetch_ohlcv(self, symbol: str, tf: str, bars: int = 720) -> pd.DataFrame:
+        if yf is None:
+            raise HTTPException(501, detail="yfinance not installed; add yfinance>=0.2.44 to requirements.txt")
+        try:
+            df = yf.download(symbol, period="60d", interval=self._interval(tf), progress=False, prepost=False, threads=False)
+        except Exception as e:
+            raise HTTPException(502, detail=f"{self.name} fetch_ohlcv failed: {e}")
+        if df is None or df.empty: raise HTTPException(502, detail="no candles")
+        df = df.rename(columns={"Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"})
+        df = df.reset_index(names="ts").tail(bars)
+        return df[["ts","open","high","low","close","volume"]].copy()
+    def price_to_precision(self, symbol: str, price: float) -> float:
+        return float(round(price, self.price_decimals))
+    def amount_to_precision(self, symbol: str, qty: float) -> float:
+        return float(qty)
+
+# Specific YF adapters with top-3 symbols
+ForexAdapter        = lambda: YFAdapter("forex",       ["EURUSD=X","GBPUSD=X","USDJPY=X"], price_decimals=5)
+CommoditiesAdapter  = lambda: YFAdapter("commodities", ["GC=F","CL=F","SI=F"],             price_decimals=2)
+StocksAdapter       = lambda: YFAdapter("stocks",      ["AAPL","MSFT","NVDA"],             price_decimals=2)
+
+# Registry
+def get_adapter(name: Optional[str] = None) -> BaseAdapter:
+    selected = (name or os.getenv("ADAPTER", "") or "").lower()
+    if selected in ("", "crypto"):
+        return CryptoCCXTAdapter(EXCHANGE_ID, QUOTE)
+    if selected == "forex":
+        return ForexAdapter()
+    if selected == "commodities":
+        return CommoditiesAdapter()
+    if selected == "stocks":
+        return StocksAdapter()
+    # unknown -> fallback to crypto
+    return CryptoCCXTAdapter(EXCHANGE_ID, QUOTE)
 
 app = FastAPI(title="AI Trade Advisor API", version="2025.09")
 
@@ -470,29 +603,13 @@ CURATED = [
     "NEAR","ALGO","FIL","SUI","SHIB","USDC","USDT","XMR","AAVE"
     ,"PAXG","ONDO","PEPE","SEI","IMX","TIA"
 ]
-def get_universe(quote=QUOTE, limit=TOP_N) -> List[Dict[str, Any]]:
-    key = f"uni:{EXCHANGE_ID}:{quote}:{limit}"
+def get_universe(quote=QUOTE, limit=TOP_N, market_name: Optional[str] = None) -> List[Dict[str, Any]]:
+    ad = get_adapter(market_name)
+    key = f"uni:{ad.name}:{limit}"
     u = cache_get(key, 1800)
     if u is not None: return u
-    markets = load_markets()
-
-    available: List[str] = []
-    for base in CURATED:
-        sym = f"{base}/{quote}"
-        if sym in markets and markets[sym].get("active"):
-            available.append(sym)
-
-    if len(available) < limit:
-        # Fallback: fill with other active {quote} tickers
-        for m, info in markets.items():
-            if info.get("quote") == quote and info.get("active"):
-                if m not in available:
-                    available.append(m)
-                if len(available) >= limit:
-                    break
-
-    out = [{"symbol": s, "name": s.split('/')[0], "market": EXCHANGE_ID,
-            "tf_supported": ["5m","15m","1h","1d"]} for s in available[:limit]]
+    items = ad.universe(top=min( max(3, limit), 50))
+    out = [{"symbol": it.symbol, "name": it.name, "market": it.market, "tf_supported": it.tf_supported} for it in items]
     cache_set(key, out)
     return out
 
@@ -500,7 +617,9 @@ def get_universe(quote=QUOTE, limit=TOP_N) -> List[Dict[str, Any]]:
 # Add lower timeframes (5m/15m) in addition to 1h/1d
 TF_MAP = {"5m":"5m","15m":"15m","1h": "1h", "1d": "1d"}
 
-def fetch_ohlcv(symbol: str, tf: str, bars: int = 720) -> pd.DataFrame:
+def fetch_ohlcv(symbol: str, tf: str, bars: int = 720, market_name: Optional[str] = None) -> pd.DataFrame:
+    ad = get_adapter(market_name)
+    return ad.fetch_ohlcv(symbol, tf, bars)
     ex = get_exchange()
     tf_ex = TF_MAP.get(tf)
     if tf_ex is None:
@@ -553,7 +672,9 @@ def _wcache_set(key, df):
     while len(_WINDOW_CACHE) > _WINDOW_MAX:
         _WINDOW_CACHE.popitem(last=False)
 
-def fetch_ohlcv_window(symbol: str, tf: str, start_ms: int, end_ms: int) -> pd.DataFrame:
+def fetch_ohlcv_window(symbol: str, tf: str, start_ms: int, end_ms: int, market_name: Optional[str] = None) -> pd.DataFrame:
+    ad = get_adapter(market_name)
+    return ad.fetch_window(symbol, tf, start_ms, end_ms)
     """
     Fetch enough OHLCV to cover [start_ms, end_ms]. We use ccxt 'since' + 'limit' with a small buffer.
     """
@@ -726,10 +847,10 @@ WILSON_MIN_N      = int(os.getenv("WILSON_MIN_N", "50"))  # min samples before L
 WILSON_LB_MIN     = float(os.getenv("WILSON_LB_MIN", "0.55"))  # min lower bound win rate
 
 def build_trade(symbol: str, df: pd.DataFrame, direction: str,
-                risk_pct: float = 1.0, equity: Optional[float] = None, leverage: float = 1.0) -> Dict[str, Any]:
-    ex = get_exchange()
-    markets = load_markets()
-    mkt = markets.get(symbol, {})
+                risk_pct: float = 1.0, equity: Optional[float] = None, leverage: float = 1.0,
+                market_name: Optional[str] = None) -> Dict[str, Any]:
+    ad = get_adapter(market_name)
+    mkt = {}  # only used for ccxt precision metadata in UI; safe empty for yfinance
 
     last  = df.iloc[-1]
     price = float(last["close"])
@@ -745,9 +866,9 @@ def build_trade(symbol: str, df: pd.DataFrame, direction: str,
         stop_raw = price + mult * a
         targets_raw = [price - k * a for k in (1.5, 2.5, 3.5)]
 
-    price_p = float(ex.price_to_precision(symbol, price))
-    stop    = float(ex.price_to_precision(symbol, stop_raw))
-    targets = [float(ex.price_to_precision(symbol, t)) for t in targets_raw]
+    price_p = float(ad.price_to_precision(symbol, price))
+    stop    = float(ad.price_to_precision(symbol, stop_raw))
+    targets = [float(ad.price_to_precision(symbol, t)) for t in targets_raw]
 
     denom = (price_p - stop)
     rr = [round(abs((t - price_p) / denom), 2) if denom else 0.0 for t in targets]
@@ -760,7 +881,7 @@ def build_trade(symbol: str, df: pd.DataFrame, direction: str,
         # risk-based size: leverage should NOT change risk_per_unit
         risk_per_unit = abs(denom)
         qty_raw = risk_amt / max(risk_per_unit, 1e-8)
-        qty = float(ex.amount_to_precision(symbol, qty_raw))
+        qty = float(ad.amount_to_precision(symbol, qty_raw))
         notional = qty * price_p
 
         # margin uses leverage; risk does not
@@ -916,8 +1037,9 @@ def evaluate_signal(
     ignore_trend: bool = False,
     ignore_vol: bool = False,
     allow_neutral: bool = False,
+    market_name: Optional[str] = None,
 ) -> Dict[str, Any]:
-    df = fetch_ohlcv(symbol, tf, bars=400)
+    df = fetch_ohlcv(symbol, tf, bars=400, market_name=market_name)
     feats = compute_features(df).dropna().iloc[-200:]
     if len(feats) < 50:
         raise HTTPException(502, detail="insufficient features window")
@@ -959,7 +1081,7 @@ def evaluate_signal(
             bbpos = float(feats["bb_pos"].iloc[-1])
             direction = "Long" if (slope >= 0 or rsi14 >= 50 or bbpos >= 0) else "Short"
 
-        trade = build_trade(symbol, feats, direction, risk_pct, equity, leverage)
+        trade = build_trade(symbol, feats, direction, risk_pct, equity, leverage, market_name=market_name)
         advice = "Consider"
 
         # ---- EV gate ----
@@ -1027,7 +1149,7 @@ def resolve_offer_row(row: sqlite3.Row) -> dict:
         direction and isinstance(entry, (int, float)) and isinstance(stop, (int, float))
     )
 
-    df = fetch_ohlcv_window(symbol, tf, created_ts * 1000, expires_ts * 1000)
+    df = fetch_ohlcv_window(symbol, tf, created_ts * 1000, expires_ts * 1000, market_name=row.get("market"))
 
     if fallback_only:
         created_close = float(df.iloc[0]["close"])
@@ -1129,8 +1251,8 @@ async def _log_requests(request, call_next):
     return await call_next(request)
 
 @app.get("/instruments", response_model=List[Instrument])
-def instruments(_: None = Depends(require_key)):
-    return get_universe()
+def instruments(market: Optional[str] = None, _: None = Depends(require_key)):
+    return get_universe(market_name=market)
 
 @app.get("/chart")
 def chart(symbol: str, tf: str = "1h", n: int = 120, _: None = Depends(require_key)):
@@ -1147,6 +1269,7 @@ def signals(
     leverage: float = Query(1.0, ge=1.0, le=100.0),
     min_confidence: Optional[float] = Query(None),
     precision: int = Query(PRECISION_DEFAULT, ge=0, le=1),
+    market: Optional[str] = Query(None),
     _: None = Depends(require_key),
 ):
     try:
@@ -1161,6 +1284,7 @@ def signals(
             equity=equity,
             leverage=leverage,
             min_confidence=mc,
+            market_name=market,
         )
 
         # Nudge confidence by learned weights
@@ -1194,9 +1318,10 @@ def scan(
     include_chart: int = Query(1, ge=0, le=1),
     min_confidence: Optional[float] = Query(None),
     precision: int = Query(PRECISION_DEFAULT, ge=0, le=1),
+    market: Optional[str] = Query(None),
     _: None = Depends(require_key)
 ):
-    uni = get_universe(limit=limit)
+    uni = get_universe(limit=limit, market_name=market)
     results, ok = [], []
 
     for it in uni:
@@ -1211,6 +1336,7 @@ def scan(
                 ignore_trend=bool(ignore_trend),
                 ignore_vol=bool(ignore_vol),
                 allow_neutral=bool(allow_neutral),
+                market_name=market or it.get("market"),
             )
 
             # Apply learned bias so ranking prefers what historically worked
@@ -1257,7 +1383,7 @@ def scan(
         if include_chart:
             try:
                 df = fetch_ohlcv(s["symbol"], tf, bars=160)
-                s["chart"] = {"closes": df["close"].tail(120).astype(float).tolist()}
+                df = fetch_ohlcv(s["symbol"], tf, bars=160, market_name=market or s.get("market"))
             except Exception:
                 s["chart"] = None
         out.append(s)

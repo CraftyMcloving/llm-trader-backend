@@ -10,6 +10,7 @@ pandas==2.2.2
 
 # exchange
 ccxt==4.4.43
+yfinance>=0.2.44
 
 # utils
 python-dateutil==2.9.0.post0
