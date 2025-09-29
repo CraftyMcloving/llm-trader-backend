@@ -219,7 +219,7 @@ class YFAdapter(BaseAdapter):
         return {"5m":"5m", "15m":"15m", "1h":"60m", "1d":"1d"}.get(tf, "60m")
 
     def fetch_ohlcv(self, symbol:str, tf:str, bars:int) -> pd.DataFrame:
-        df = yf.download(symbol, period="60d", interval=self._interval(tf), progress=False, prepost=False, threads=False)
+        df = yf.download(symbol, period="60d", interval=self._interval(tf), progress=False, prepost=False, threads=False, auto_adjust=True, actions=False)
         if df is None or df.empty:
             raise AdapterError("no candles from yfinance")
         df = df.rename(columns={"Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"})
@@ -253,7 +253,11 @@ def register_adapter(key:str, factory:Callable[[], BaseAdapter]):
     ADAPTERS[key.lower()] = factory
 
 def get_adapter(name: Optional[str] = None) -> BaseAdapter:
-    """Select adapter by query param or env ADAPTER, else fallback to crypto."""
-    key = (name or os.getenv("ADAPTER","crypto")).lower().strip()
+    raw = (name or os.getenv("ADAPTER","crypto")).lower().strip()
+    key = raw
+    # accept descriptive variants
+    if raw.startswith("crypto:"):            key = "crypto"
+    elif raw.startswith("futures:binance"):  key = "binance_perps"
+    # fallback
     factory = ADAPTERS.get(key) or ADAPTERS.get("crypto")
     return factory()
