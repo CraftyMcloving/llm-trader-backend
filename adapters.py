@@ -120,13 +120,20 @@ class CryptoCCXT(BaseAdapter):
 
     def fetch_ohlcv(self, symbol:str, tf:str, bars:int) -> pd.DataFrame:
         ex = self._exh()
-        tf_ex = TF_MAP.get(tf); 
-        if tf_ex is None: raise AdapterError(f"Unsupported tf: {tf}")
+        tf_ex = TF_MAP.get(tf)
+        if tf_ex is None:
+            raise AdapterError(f"Unsupported tf: {tf}")
         key = f"ohlcv:{self.name}:{symbol}:{tf_ex}:{bars}"
         c = self._cache_get(key)
-        if c is not None: return c
-        data = ex.fetch_ohlcv(symbol, timeframe=tf_ex, limit=min(bars+40, 2000))
-        if not data: raise AdapterError("no candles")
+        if c is not None:
+            return c
+        try:
+            data = ex.fetch_ohlcv(symbol, timeframe=tf_ex, limit=min(bars + 40, 2000))
+        except Exception as e:
+            # Wrap ccxt errors so main.py can respond 502 cleanly with context
+            raise AdapterError(f"{self.exchange_id} fetch_ohlcv({symbol},{tf_ex}) failed: {e}") from e
+        if not data:
+            raise AdapterError("no candles")
         df = pd.DataFrame(data, columns=["ts","open","high","low","close","volume"])
         df["ts"] = pd.to_datetime(df["ts"], unit="ms")
         self._cache_set(key, df)
@@ -134,15 +141,19 @@ class CryptoCCXT(BaseAdapter):
 
     def fetch_window(self, symbol:str, tf:str, start_ms:int, end_ms:int) -> pd.DataFrame:
         ex = self._exh()
-        tf_ex = TF_MAP.get(tf); 
-        if tf_ex is None: raise AdapterError(f"Unsupported tf: {tf}")
+        tf_ex = TF_MAP.get(tf)
+        if tf_ex is None:
+            raise AdapterError(f"Unsupported tf: {tf}")
         per = tf_ms(tf)
-        need = max(2, int((end_ms - start_ms)/per) + 4)
-        since = max(0, start_ms - 2*per)
-        data = ex.fetch_ohlcv(symbol, timeframe=tf_ex, since=since, limit=min(need+20, 2000))
-        if not data: raise AdapterError("no candles for window")
+        need = max(2, int((end_ms - start_ms) / per) + 4)
+        since = max(0, start_ms - 2 * per)
+        try:
+            data = ex.fetch_ohlcv(symbol, timeframe=tf_ex, since=since, limit=min(need + 20, 2000))
+        except Exception as e:
+            raise AdapterError(f"{self.exchange_id} fetch_window({symbol},{tf_ex}) failed: {e}") from e
+        if not data:
+            raise AdapterError("no candles for window")
         df = pd.DataFrame(data, columns=["ts","open","high","low","close","volume"])
-        # NOTE: window path keeps numeric ms (faster slicing downstream)
         return df[(df["ts"] >= (start_ms - per)) & (df["ts"] <= (end_ms + per))].reset_index(drop=True)
 
     def price_to_precision(self, symbol:str, price:float) -> float:
@@ -204,28 +215,57 @@ class BinancePerpsUSDT(BaseAdapter):
 
 # ---------- yfinance generic + thin wrappers ----------
 class YFAdapter(BaseAdapter):
-    def __init__(self, name:str, tickers:List[str], price_decimals:int=4):
+    def __init__(self, name:str, tickers:List[str], price_decimals:int=4, cache_ttl:int=300):
         _ensure(yf is not None, "yfinance not installed; add yfinance>=0.2.44")
         self.name = name
         self.tickers = tickers
         self.price_decimals = price_decimals
+        self.cache_ttl = cache_ttl
+        self._cache: Dict[str, Tuple[float, pd.DataFrame]] = {}
+
+    def _cache_get(self, key:str) -> Optional[pd.DataFrame]:
+        v = self._cache.get(key)
+        if not v: return None
+        ts, df = v
+        return df.copy() if (time.time() - ts) <= self.cache_ttl else None
+
+    def _cache_set(self, key:str, df:pd.DataFrame):
+        self._cache[key] = (time.time(), df.copy())
 
     def list_universe(self, limit:int) -> List[Dict[str,Any]]:
         syms = self.tickers[:max(1, limit)]
+        # 5m is supported by Yahoo for ~60 days; you already pull 60d below.
         return [{"symbol": s, "name": s.replace("=F","").replace("^",""), "market": self.name,
-                 "tf_supported": ["15m","1h","1d"]} for s in syms]
+                 "tf_supported": ["5m","15m","1h","1d"]} for s in syms]
 
     def _interval(self, tf:str) -> str:
         return {"5m":"5m", "15m":"15m", "1h":"60m", "1d":"1d"}.get(tf, "60m")
 
     def fetch_ohlcv(self, symbol:str, tf:str, bars:int) -> pd.DataFrame:
-        df = yf.download(symbol, period="60d", interval=self._interval(tf), progress=False, prepost=False, threads=False, auto_adjust=True, actions=False)
-        if df is None or df.empty:
-            raise AdapterError("no candles from yfinance")
-        df = df.rename(columns={"Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"})
-        df = df.reset_index(names="ts").tail(bars)
-        return df[["ts","open","high","low","close","volume"]].copy()
-
+        key = f"yf:{self.name}:{symbol}:{tf}"
+        cached = self._cache_get(key)
+        if cached is not None:
+            df = cached
+        else:
+            df_raw = yf.download(
+                symbol,
+                period="60d",
+                interval=self._interval(tf),
+                progress=False,
+                prepost=False,
+                threads=False,
+                auto_adjust=False,
+                actions=False
+            )
+            if df_raw is None or df_raw.empty:
+                raise AdapterError("no candles from yfinance")
+            df_raw = df_raw.rename(columns={
+                "Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"
+            }).reset_index(names="ts")
+            df = df_raw[["ts","open","high","low","close","volume"]].copy()
+            self._cache_set(key, df)
+        return df.tail(bars).reset_index(drop=True)
+    
     def price_to_precision(self, symbol:str, price:float) -> float:
         return float(round(price, self.price_decimals))
 
@@ -241,8 +281,11 @@ def StocksAdapter() -> BaseAdapter:
 
 # ---------- Registry & dynamic loading ----------
 ADAPTERS: Dict[str, Callable[[], BaseAdapter]] = {
-    "crypto": lambda: CryptoCCXT(os.getenv("EXCHANGE","kraken"), os.getenv("QUOTE","USD"),
-                                 curated=os.getenv("CURATED","BTC,ETH,SOL,XRP,ADA,DOGE").split(",")),
+    "crypto": lambda: CryptoCCXT(
+        os.getenv("EXCHANGE", "kraken"),
+        os.getenv("QUOTE", "USD"),
+        curated=[s.strip().upper() for s in os.getenv("CURATED","BTC,ETH,SOL,XRP,ADA,DOGE").split(",") if s.strip()]
+    ),
     "binance_perps": lambda: BinancePerpsUSDT(),
     "forex": ForexAdapter,
     "commodities": CommoditiesAdapter,
@@ -252,12 +295,21 @@ ADAPTERS: Dict[str, Callable[[], BaseAdapter]] = {
 def register_adapter(key:str, factory:Callable[[], BaseAdapter]):
     ADAPTERS[key.lower()] = factory
 
+# --- replace your current get_adapter with this normalized version ---
 def get_adapter(name: Optional[str] = None) -> BaseAdapter:
-    raw = (name or os.getenv("ADAPTER","crypto")).lower().strip()
-    key = raw
-    # accept descriptive variants
-    if raw.startswith("crypto:"):            key = "crypto"
-    elif raw.startswith("futures:binance"):  key = "binance_perps"
-    # fallback
-    factory = ADAPTERS.get(key) or ADAPTERS.get("crypto")
+    """Select adapter by query param or env ADAPTER; accept long-form names like 'crypto:kraken:usd'."""
+    raw = (name or os.getenv("ADAPTER", "crypto")).lower().strip()
+    key = raw.split(":", 1)[0]  # 'crypto:kraken:usd' -> 'crypto'
+    # simple aliases
+    aliases = {
+        "crypto": "crypto",
+        "binance_perps": "binance_perps",
+        "futures": "binance_perps",
+        "binance": "binance_perps",
+        "forex": "forex",
+        "commodities": "commodities",
+        "stocks": "stocks",
+    }
+    key = aliases.get(key, key)
+    factory = ADAPTERS.get(key) or ADAPTERS["crypto"]
     return factory()

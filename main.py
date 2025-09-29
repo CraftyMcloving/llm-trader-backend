@@ -456,6 +456,22 @@ def wilson_lb(wins: int, total: int, z: float = 1.96) -> float:
     lb = (centre - adj) / denom
     return max(0.0, min(1.0, lb))
 
+def _auto_adapter(symbol: str, market_name: Optional[str]):
+    # honor explicit market (normalized by adapters.get_adapter)
+    if market_name:
+        return get_adapter(market_name)
+
+    # heuristic routing when market is omitted
+    s = symbol.upper()
+    if "/" in s:                # e.g. BTC/USD, ETH/USDT
+        return get_adapter("crypto")
+    if s.endswith("=X"):        # e.g. EURUSD=X, USDJPY=X
+        return get_adapter("forex")
+    if s.endswith("=F"):        # e.g. GC=F, CL=F
+        return get_adapter("commodities")
+    # default guess for single-word tickers: stocks
+    return get_adapter("stocks")
+
 # ----- Cache -----
 CACHE: Dict[str, Tuple[float, Any]] = {}
 def cache_get(key, ttl):
@@ -477,12 +493,12 @@ def get_universe(quote=QUOTE, limit=TOP_N, market_name: Optional[str] = None) ->
     else:
         adapter_key = ad.__class__.__name__
 
-    key = f"uni:{adapter_key}:{limit}"
+    # cache key should reflect the effective (clamped) limit
+    lim = min(max(6, limit), 50)
+    key = f"uni:{adapter_key}:{lim}"
     u = cache_get(key, 1800)
     if u is not None:
         return u
-
-    lim = min(max(6, limit), 50)
 
     # tolerate different adapter signatures
     try:
@@ -496,12 +512,17 @@ def get_universe(quote=QUOTE, limit=TOP_N, market_name: Optional[str] = None) ->
     def _get(it, k, default=None):
         return it.get(k, default) if isinstance(it, dict) else getattr(it, k, default)
 
-    out = [{
-        "symbol": _get(it, "symbol"),
-        "name": _get(it, "name"),
-        "market": _get(it, "market", "crypto"),        # see note below
-        "tf_supported": _get(it, "tf_supported", ["5m","15m","1h","1d"]),
-    } for it in items]
+    out = []
+    for it in items:
+        sym = _get(it, "symbol")
+        if not sym:
+            continue
+        out.append({
+            "symbol": sym,
+            "name": _get(it, "name", sym.split("/")[0]),
+            "market": _get(it, "market", adapter_key),          # ← default to the adapter you used
+            "tf_supported": _get(it, "tf_supported", ["5m","15m","1h","1d"]),
+        })
 
     cache_set(key, out)
     return out
@@ -511,11 +532,45 @@ def get_universe(quote=QUOTE, limit=TOP_N, market_name: Optional[str] = None) ->
 TF_MAP = {"5m":"5m","15m":"15m","1h": "1h", "1d": "1d"}
 
 def fetch_ohlcv(symbol: str, tf: str, bars: int = 720, market_name: Optional[str] = None) -> pd.DataFrame:
-    ad = get_adapter(market_name)
+    ad = _auto_adapter(symbol, market_name)
     try:
         return ad.fetch_ohlcv(symbol, tf, bars)
     except AdapterError as e:
+        # try second-chance heuristics if market was missing
+        if not market_name:
+            for alt in ("forex","commodities","stocks","crypto"):
+                try:
+                    if alt != ad.name.split(":",1)[0]:
+                        return get_adapter(alt).fetch_ohlcv(symbol, tf, bars)
+                except Exception:
+                    pass
         raise HTTPException(502, detail=str(e))
+    except Exception as e:
+        raise HTTPException(502, detail=f"{ad.name} fetch_ohlcv error: {e}")
+
+def fetch_ohlcv_window(symbol: str, tf: str, start_ms: int, end_ms: int, market_name: Optional[str] = None) -> pd.DataFrame:
+    ad = _auto_adapter(symbol, market_name)
+    k = f"w:{ad.name}:{symbol}:{tf}:{start_ms}:{end_ms}"
+    c = _wcache_get(k)
+    if c is not None:
+        return c
+    try:
+        df = ad.fetch_window(symbol, tf, start_ms, end_ms)
+        _wcache_set(k, df)
+        return df
+    except AdapterError as e:
+        if not market_name:
+            for alt in ("forex","commodities","stocks","crypto"):
+                try:
+                    if alt != ad.name.split(":",1)[0]:
+                        df = get_adapter(alt).fetch_window(symbol, tf, start_ms, end_ms)
+                        _wcache_set(k, df)
+                        return df
+                except Exception:
+                    pass
+        raise HTTPException(502, detail=str(e))
+    except Exception as e:
+        raise HTTPException(502, detail=f"{ad.name} fetch_window error: {e}")
 
 # ms per bar
 def tf_ms(tf: str) -> int:
@@ -547,13 +602,6 @@ def _wcache_set(key, df):
     _WINDOW_CACHE.move_to_end(key)
     while len(_WINDOW_CACHE) > _WINDOW_MAX:
         _WINDOW_CACHE.popitem(last=False)
-
-def fetch_ohlcv_window(symbol: str, tf: str, start_ms: int, end_ms: int, market_name: Optional[str] = None) -> pd.DataFrame:
-    ad = get_adapter(market_name)
-    try:
-        return ad.fetch_window(symbol, tf, start_ms, end_ms)
-    except AdapterError as e:
-        raise HTTPException(502, detail=str(e))
 
 EVAL_STOP_FIRST = bool(int(os.getenv("EVAL_STOP_FIRST", "0")))  # if 1: SL wins ties within same bar
 
@@ -1164,6 +1212,10 @@ def signals(
         if isinstance(res.get("filters"), dict) and min_confidence is not None:
             res["filters"]["confidence_ok"] = (res["confidence"] >= float(min_confidence))
 
+        # Include market for convenient round-trip to /chart
+        resolved_market = market or _auto_adapter(symbol, market).name.split(":", 1)[0]
+        res["market"] = resolved_market
+
         return res
 
     except HTTPException:
@@ -1311,8 +1363,6 @@ class OffersBatch(BaseModel):
     items: List[OfferIn]
     universe: Optional[int] = None
     note: Optional[str] = None
-
-from fastapi import Request
 
 @app.post("/feedback", response_model=FeedbackAck, dependencies=[Depends(require_key)])
 def post_feedback(fb: FeedbackIn, request: Request, x_user_id: Optional[int] = Header(None)):
