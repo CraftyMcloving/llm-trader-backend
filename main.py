@@ -914,7 +914,7 @@ def evaluate_signal(
     ignore_vol: bool = False,
     allow_neutral: bool = False,
 ) -> Dict[str, Any]:
-        df = fetch_ohlcv(symbol, tf, bars=400)
+    df = fetch_ohlcv(symbol, tf, bars=400)
     feats = compute_features(df).dropna().iloc[-200:]
     if len(feats) < 50:
         raise HTTPException(502, detail="insufficient features window")
