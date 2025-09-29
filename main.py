@@ -299,7 +299,7 @@ def apply_feedback_bias(confidence: float, features: Dict[str, Any], symbol: str
         return max(-1.0, min(1.0, float(confidence) + feedback_bias(features, symbol, tf)))
     except Exception:
         return float(confidence)
-        
+
 # ====== Platt calibration (per timeframe) ======
 CALIBRATION_ENABLED = bool(int(os.getenv("CALIBRATION_ENABLED", "1")))
 CALIBRATION_MIN_SAMPLES = int(os.getenv("CALIBRATION_MIN_SAMPLES", "60"))
@@ -1313,7 +1313,7 @@ class OffersBatch(BaseModel):
     items: List[OfferIn]
     universe: Optional[int] = None
     note: Optional[str] = None
-    
+
 from fastapi import Request, Header
 
 @app.post("/feedback", response_model=FeedbackAck, dependencies=[Depends(require_key)])
@@ -1500,7 +1500,7 @@ def learning_resolve_one(body: ResolveOneIn, _: None = Depends(require_key)):
 @app.post("/learning/resolve-due")
 def learning_resolve_due(limit: int = Query(25, ge=1, le=500), _: None = Depends(require_key)):
     return resolve_due_offers(limit=limit)
-    
+
 # Add this wrapper so GET works too (calls the same function)
 @app.get("/learning/resolve-due")
 def learning_resolve_due_get(limit: int = Query(25, ge=1, le=500), _: None = Depends(require_key)):
