@@ -886,18 +886,19 @@ def evaluate_signal(
     liquid_ok = bool(turnover >= min_turnover)
     if not liquid_ok:
         reasons.append(f"turnover ${turnover:,.0f} < ${min_turnover:,.0f} min")
-# For markets where yfinance volume is unreliable (e.g., forex),
-# if recent volume is missing/zero, bypass the turnover gate.
-try:
-    if market_name in ("forex", "commodities", "stocks"):
-        vol_sum = float(pd.to_numeric(feats["volume"].tail(200), errors="coerce").fillna(0).sum())
-        if vol_sum <= 0:
-            liquid_ok = True
-            reasons = [r for r in reasons if "turnover" not in r.lower()]
-except Exception:
-    # If we can't assess volume reliably, don't block the signal on liquidity.
-    liquid_ok = True
-    reasons = [r for r in reasons if "turnover" not in r.lower()]
+
+    # For markets where yfinance volume is unreliable (e.g., forex),
+    # if recent volume is missing/zero, bypass the turnover gate.
+    try:
+        if market_name in ("forex", "commodities", "stocks"):
+            vol_sum = float(pd.to_numeric(feats["volume"].tail(200), errors="coerce").fillna(0).sum())
+            if vol_sum <= 0:
+                liquid_ok = True
+                reasons = [r for r in reasons if "turnover" not in r.lower()]
+    except Exception:
+        # If we can't assess volume reliably, don't block the signal on liquidity.
+        liquid_ok = True
+        reasons = [r for r in reasons if "turnover" not in r.lower()]
 
     trade = None
     advice = "Skip"
@@ -927,7 +928,6 @@ except Exception:
                 R = float((tp1 - entry) / max(1e-9, (entry - stop))) if tp1 else 1.2
             else:
                 R = float((entry - tp1) / max(1e-9, (stop - entry))) if tp1 else 1.2
-            # final probability (if you added calibration elsewhere use it; here we use raw conf)
             p = float(conf)
             ev = p*R - (1-p)*1.0
             if ev < EV_MIN:
