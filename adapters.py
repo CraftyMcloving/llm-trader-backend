@@ -337,7 +337,7 @@ def ForexAdapter() -> BaseAdapter:
     return YFAdapter("forex", ["EURUSD=X","GBPUSD=X","USDJPY=X","AUDUSD=X","USDCAD=X","USDCHF=X","NZDUSD=X","EURGBP=X","EURJPY=X","GBPJPY=X","AUDJPY=X","EURAUD=X","EURCAD=X","EURCHF=X","GBPCHF=X","AUDCAD=X","CHFJPY=X","AUDNZD=X","CADJPY=X","NZDJPY=X"], price_decimals=5)
 
 def CommoditiesAdapter() -> BaseAdapter:
-    return YFAdapter("commodities", ["GC=F","CL=F","SI=F","BZ=F","LCO=F","NG=F","HO=F","RB=F","HG=F","AH=F","PL=F","TIO=F","ZC=F","ZS=F","ZW=F","KC=F","SB=F","CC=F","CT=F","LBS=F"], price_decimals=2)
+    return YFAdapter("commodities", ["GC=F","CL=F","SI=F","BZ=F","NG=F","HO=F","RB=F","HG=F","ALI=F","PL=F","TIO=F","ZC=F","ZS=F","ZW=F","KC=F","SB=F","CC=F","CT=F","LBS=F"], price_decimals=2)
 
 def StocksAdapter() -> BaseAdapter:
     return YFAdapter("stocks", ["AAPL","MSFT","NVDA","TSLA","SPY","QQQ","AMZN","INTC","PLTR","META","ORCL","AVGO","TQQQ","AMD","GOOGL","COST","IWM","MU","APP","GOOG"], price_decimals=2)
@@ -347,7 +347,7 @@ ADAPTERS: Dict[str, Callable[[], BaseAdapter]] = {
     "crypto": lambda: CryptoCCXT(
         os.getenv("EXCHANGE", "kraken"),
         os.getenv("QUOTE", "USD"),
-        curated=[s.strip().upper() for s in os.getenv("CURATED","BTC,ETH,SOL,XRP,ADA,DOGE").split(",") if s.strip()]
+        curated=[s.strip().upper() for s in os.getenv("CURATED","BTC,ETH,SOL,XRP,ADA,DOGE,LINK,LTC,BCH,TRX,DOT,ATOM,XLM,ETC,MATIC,UNI,APT,ARB,OP,AVAX,NEAR,ALGO,FIL,SUI,SHIB,USDC,USDT,XMR,AAVE,PAXG,ONDO,PEPE,SEI,IMX,TIA").split(",") if s.strip()]
     ),
     "binance_perps": lambda: BinancePerpsUSDT(),
     "forex": ForexAdapter,

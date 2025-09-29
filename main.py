@@ -16,9 +16,6 @@ from adapters import get_adapter, BaseAdapter, UniverseItem, AdapterError
 
 app = FastAPI(title="AI Trade Advisor API", version="2025.09")
 
-
-RESOLVE_DUE_MAX = int(os.getenv("RESOLVE_DUE_MAX", "20"))
-RESOLVE_BUDGET_SEC = float(os.getenv("RESOLVE_BUDGET_SEC", "12"))
 origins_env = os.getenv("ALLOWED_ORIGINS", "*")
 origins = ["*"] if origins_env == "*" else [o.strip() for o in origins_env.split(",") if o.strip()]
 app.add_middleware(
@@ -476,20 +473,6 @@ def _auto_adapter(symbol: str, market_name: Optional[str]):
     return get_adapter("stocks")
 
 # ----- Cache -----
-
-# --- tiny per-call cache (piggyback on CACHE)
-def _sc_key(symbol, tf, rp, eq, lev, market):
-    return f"sc:{symbol}:{tf}:{round(rp,2)}:{round(float(eq or 0),2)}:{round(lev,2)}:{market or ''}"
-
-def _sc_get(key, ttl=15):
-    v = CACHE.get(key)
-    if not v: return None
-    ts, data = v
-    return data if (time.time() - ts) <= ttl else None
-
-def _sc_set(key, data):
-    CACHE[key] = (time.time(), data)
-
 CACHE: Dict[str, Tuple[float, Any]] = {}
 def cache_get(key, ttl):
     v = CACHE.get(key)
@@ -1146,7 +1129,6 @@ def resolve_due_offers(limit: int = 50) -> dict:
     """
     now = time.time()
     done = good = bad = 0
-    start = now
 
     # 1) Read candidates under lock
     with _db_lock:
@@ -1163,8 +1145,6 @@ def resolve_due_offers(limit: int = 50) -> dict:
 
     # 2..4) For each row, compute (no lock) then write (lock) then log feedback (locks internally)
     for row in rows:
-        if (time.time() - start) > RESOLVE_BUDGET_SEC:   # <--- bail out safely
-            break
         try:
             upd = resolve_offer_row(row)  # network/CPU: NO DB LOCK HERE
         except Exception:
@@ -1342,7 +1322,7 @@ def scan(
                 allow_neutral=bool(allow_neutral),
                 market_name=market or it.get("market"),
             )
-            _sc_set(key, s)
+
             base_conf = float(s.get("confidence", 0.0))
             feats_map = s.get("features") or {}
             biased = apply_feedback_bias(base_conf, feats_map, s["symbol"], s["timeframe"])
@@ -1625,11 +1605,9 @@ def learning_resolve_one(body: ResolveOneIn, _: None = Depends(require_key)):
 
     return {"ok": True, "id": body.id, **upd}
 
-# --- replace the endpoint wrapper in main.py
 @app.post("/learning/resolve-due")
 def learning_resolve_due(limit: int = Query(25, ge=1, le=500), _: None = Depends(require_key)):
-    safe_limit = min(int(limit), RESOLVE_DUE_MAX)
-    return resolve_due_offers(limit=safe_limit)
+    return resolve_due_offers(limit=limit)
 
 # Add this wrapper so GET works too (calls the same function)
 @app.get("/learning/resolve-due")
