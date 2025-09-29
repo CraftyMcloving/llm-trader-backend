@@ -76,6 +76,8 @@ _db_lock = threading.Lock()
 def _db():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA busy_timeout=3000;")  # wait up to 3s for read locks
     return conn
 
 def init_feedback_db():
