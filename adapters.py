@@ -47,16 +47,17 @@ class BaseAdapter:
     def list_universe(self, limit:int) -> List[Dict[str,Any]]: raise NotImplementedError
     def fetch_ohlcv(self, symbol:str, tf:str, bars:int) -> pd.DataFrame: raise NotImplementedError
 
-    # Optional fast path: fetch by time window (ms); default falls back to fetch_ohlcv + slicing
     def fetch_window(self, symbol:str, tf:str, start_ms:int, end_ms:int) -> pd.DataFrame:
         per = tf_ms(tf)
         need = max(2, int((end_ms - start_ms)/per) + 8)
         df = self.fetch_ohlcv(symbol, tf, bars=min(2000, max(need, 240)))
-        # normalize 'ts' to ms
-        if np.issubdtype(df["ts"].dtype, np.datetime64):
-            ms = df["ts"].astype("int64") // 10**6
+        # normalize 'ts' to ms (handle tz-aware safely)
+        ts_col = df["ts"]
+        if np.issubdtype(ts_col.dtype, np.datetime64):
+            ts_col = pd.to_datetime(ts_col, utc=True)
+            ms = (ts_col.view("int64") // 10**6)
         else:
-            ms = df["ts"].astype("int64")
+            ms = pd.to_numeric(ts_col, errors="coerce").astype("int64")
         keep = (ms >= (start_ms - per)) & (ms <= (end_ms + per))
         return df.loc[keep].reset_index(drop=True)
 
@@ -81,6 +82,11 @@ class CryptoCCXT(BaseAdapter):
     def _exh(self):
         if self._ex is None:
             self._ex = getattr(ccxt, self.exchange_id)({"enableRateLimit": True, "timeout": 20000})
+            try:
+                self._ex.load_markets()
+            except Exception:
+                # if this fails now, methods that need it will retry via _load_markets()
+                pass
         return self._ex
 
     def _load_markets(self):
@@ -130,7 +136,6 @@ class CryptoCCXT(BaseAdapter):
         try:
             data = ex.fetch_ohlcv(symbol, timeframe=tf_ex, limit=min(bars + 40, 2000))
         except Exception as e:
-            # Wrap ccxt errors so main.py can respond 502 cleanly with context
             raise AdapterError(f"{self.exchange_id} fetch_ohlcv({symbol},{tf_ex}) failed: {e}") from e
         if not data:
             raise AdapterError("no candles")
@@ -156,9 +161,12 @@ class CryptoCCXT(BaseAdapter):
         df = pd.DataFrame(data, columns=["ts","open","high","low","close","volume"])
         return df[(df["ts"] >= (start_ms - per)) & (df["ts"] <= (end_ms + per))].reset_index(drop=True)
 
+
     def price_to_precision(self, symbol:str, price:float) -> float:
+        self._load_markets()  # ensure market metadata loaded
         return float(self._exh().price_to_precision(symbol, price))
     def amount_to_precision(self, symbol:str, qty:float) -> float:
+        self._load_markets()
         return float(self._exh().amount_to_precision(symbol, qty))
 
 # ---------- Binance Perps (USDT-M futures) via ccxt ----------
@@ -190,21 +198,33 @@ class BinancePerpsUSDT(BaseAdapter):
 
     def fetch_ohlcv(self, symbol:str, tf:str, bars:int) -> pd.DataFrame:
         ex = self._exh()
-        tf_ex = TF_MAP.get(tf); 
-        if tf_ex is None: raise AdapterError(f"Unsupported tf: {tf}")
-        data = ex.fetch_ohlcv(symbol, timeframe=tf_ex, limit=min(bars+40, 1500))
-        if not data: raise AdapterError("no candles")
+        tf_ex = TF_MAP.get(tf)
+        if tf_ex is None:
+            raise AdapterError(f"Unsupported tf: {tf}")
+        try:
+            data = ex.fetch_ohlcv(symbol, timeframe=tf_ex, limit=min(bars+40, 1500))
+        except Exception as e:
+            raise AdapterError(f"binance fetch_ohlcv({symbol},{tf_ex}) failed: {e}") from e
+        if not data:
+            raise AdapterError("no candles")
         df = pd.DataFrame(data, columns=["ts","open","high","low","close","volume"])
         df["ts"] = pd.to_datetime(df["ts"], unit="ms")
         return df
 
     def fetch_window(self, symbol:str, tf:str, start_ms:int, end_ms:int) -> pd.DataFrame:
         ex = self._exh()
+        tf_ex = TF_MAP.get(tf)
+        if tf_ex is None:
+            raise AdapterError(f"Unsupported tf: {tf}")
         per = tf_ms(tf)
         need = max(2, int((end_ms - start_ms)/per) + 4)
         since = max(0, start_ms - 2*per)
-        data = ex.fetch_ohlcv(symbol, timeframe=TF_MAP[tf], since=since, limit=min(need+20, 1500))
-        if not data: raise AdapterError("no candles for window")
+        try:
+            data = ex.fetch_ohlcv(symbol, timeframe=tf_ex, since=since, limit=min(need+20, 1500))
+        except Exception as e:
+            raise AdapterError(f"binance fetch_window({symbol},{tf_ex}) failed: {e}") from e
+        if not data:
+            raise AdapterError("no candles for window")
         df = pd.DataFrame(data, columns=["ts","open","high","low","close","volume"])
         return df[(df["ts"] >= (start_ms - per)) & (df["ts"] <= (end_ms + per))].reset_index(drop=True)
 

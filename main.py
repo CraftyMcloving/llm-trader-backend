@@ -1170,8 +1170,28 @@ def instruments(market: Optional[str] = None, _: None = Depends(require_key)):
 
 @app.get("/chart")
 def chart(symbol: str, tf: str = "1h", n: int = 120, market: Optional[str] = None, _: None = Depends(require_key)):
-    df = fetch_ohlcv(symbol, tf, bars=max(200, n+20), market_name=market)
-    closes = df["close"].tail(n).astype(float).tolist()
+    df = fetch_ohlcv(symbol, tf, bars=max(200, n + 20), market_name=market)
+
+    # Ensure we have a usable "close" series even if columns are duplicated or MI
+    if "close" not in df.columns:
+        # try case-insensitive fallback
+        cols_lower = {str(c).lower(): c for c in df.columns}
+        if "close" not in cols_lower:
+            raise HTTPException(502, detail="no 'close' column in data")
+        close_obj = df[cols_lower["close"]]
+    else:
+        close_obj = df["close"]
+
+    # If it's a DataFrame (duplicate column names), squeeze to the first column
+    if isinstance(close_obj, pd.DataFrame):
+        if close_obj.shape[1] == 0:
+            raise HTTPException(502, detail="'close' column is empty")
+        close_obj = close_obj.iloc[:, 0]
+
+    closes = pd.to_numeric(close_obj, errors="coerce").tail(n).dropna().astype(float).to_list()
+    if not closes:
+        raise HTTPException(502, detail="no numeric close data")
+
     return {"symbol": symbol, "tf": tf, "closes": closes}
 
 @app.get("/signals")
@@ -1288,7 +1308,6 @@ def scan(
                 "filters": {"trend_ok": False, "vol_ok": False, "confidence_ok": False, "reasons": [f"exception: {e}"]},
                 "advice": "Skip", "market": it["market"]
             })
-    # ... (rest of your /scan stays the same)
 
     # choose pool
     pool = ok if ok else results
@@ -1301,7 +1320,19 @@ def scan(
         if include_chart:
             try:
                 df = fetch_ohlcv(s["symbol"], tf, bars=160, market_name=market or s.get("market"))
-                s["chart"] = {"closes": df["close"].tail(120).astype(float).tolist()}
+                # squeeze 'close' to a Series even if duplicate column names produce a DataFrame
+                if "close" not in df.columns:
+                    cols_lower = {str(c).lower(): c for c in df.columns}
+                    if "close" in cols_lower:
+                        close_obj = df[cols_lower["close"]]
+                    else:
+                        raise KeyError("no 'close' column")
+                else:
+                    close_obj = df["close"]
+                if isinstance(close_obj, pd.DataFrame):
+                    close_obj = close_obj.iloc[:, 0]
+                closes = pd.to_numeric(close_obj, errors="coerce").tail(120).dropna().astype(float).to_list()
+                s["chart"] = {"closes": closes}
             except Exception:
                 s["chart"] = None
         out.append(s)
