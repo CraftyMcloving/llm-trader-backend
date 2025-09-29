@@ -690,24 +690,51 @@ def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
     return ema(tr,n)
 
 def compute_features(df: pd.DataFrame) -> pd.DataFrame:
+    # defensive normalization – make sure OHLCV are numeric Series (not DataFrames)
     out = df.copy()
+
+    # Ensure expected columns exist
+    need = ["open","high","low","close","volume"]
+    # some sources may send capitalized keys; map them once
+    lower_map = {str(c).lower(): c for c in out.columns}
+    for k in need:
+        if k not in out.columns and k in lower_map:
+            out.rename(columns={lower_map[k]: k}, inplace=True)
+
+    for k in need:
+        if k in out.columns:
+            col = out[k]
+            if isinstance(col, pd.DataFrame):
+                col = col.iloc[:, 0]
+            out[k] = pd.to_numeric(col, errors="coerce")
+        else:
+            # if truly missing, create a safe default
+            out[k] = np.nan if k != "volume" else 0.0
+
+    # basic NA drop to stabilize rolling calcs (keep enough history)
+    out = out.dropna(subset=["open","high","low","close"]).copy()
+
+    # Core features
     out["sma20"]   = out["close"].rolling(20).mean()
     out["sma50"]   = out["close"].rolling(50).mean()
     out["sma200"]  = out["close"].rolling(200).mean()
     out["rsi14"]   = rsi(out["close"], 14)
     out["atr14"]   = atr(out, 14)
-    out["atr_pct"] = (out["atr14"]/out["close"]).clip(lower=0, upper=2.0)
+
+    # guard against div-by-zero and multi-col ops
+    safe_close = out["close"].replace(0, np.nan)
+    out["atr_pct"] = (out["atr14"] / safe_close).clip(lower=0, upper=2.0)
+
     out["ret5"]    = out["close"].pct_change(5)
     out["slope20"] = out["sma20"] - out["sma20"].shift(5)
+
     out["bb_mid"]  = out["close"].rolling(20).mean()
     out["bb_std"]  = out["close"].rolling(20).std().replace(0, np.nan)
-    out["bb_pos"]  = ((out["close"] - out["bb_mid"]) / (2*out["bb_std"])).clip(-1,1)
+    out["bb_pos"]  = ((out["close"] - out["bb_mid"]) / (2 * out["bb_std"])).clip(-1, 1)
 
-    # ---- NEW: dollar turnover / liquidity proxy ----
-    out["turnover"] = (out["close"] * out["volume"]).replace([np.inf,-np.inf], np.nan)
-    # Smooth to per-hour comparable baseline: use 12 bars of 5m, 4 bars of 15m, 1 bar of 1h, 1/24 of 1d
-    # We will scale the threshold by timeframe later.
-    out["turnover_sma96"] = out["turnover"].rolling(96).mean()  # robust fallback average
+    # Dollar turnover proxy (will be bypassed later for FX if volume is unreliable)
+    out["turnover"] = (out["close"] * out["volume"]).replace([np.inf, -np.inf], np.nan)
+    out["turnover_sma96"] = out["turnover"].rolling(96).mean()
 
     return out
 
@@ -749,7 +776,7 @@ WILSON_LB_MIN     = float(os.getenv("WILSON_LB_MIN", "0.55"))  # min lower bound
 def build_trade(symbol: str, df: pd.DataFrame, direction: str,
                 risk_pct: float = 1.0, equity: Optional[float] = None, leverage: float = 1.0,
                 market_name: Optional[str] = None) -> Dict[str, Any]:
-    ad = get_adapter(market_name)
+    ad = _auto_adapter(symbol, market_name)
     mkt = {}  # only used for ccxt precision metadata in UI; safe empty for yfinance
 
     last  = df.iloc[-1]
@@ -1220,6 +1247,16 @@ def signals(
             min_confidence=mc,
             market_name=market,
         )
+        
+        # include market for UI parity with /scan
+        if market:
+            res["market"] = market
+        else:
+            try:
+                # infer from adapter used for routing
+                res["market"] = _auto_adapter(symbol, market).name.split(":")[0]
+            except Exception:
+                pass
 
         # Nudge confidence by learned weights
         base_conf = float(res.get("confidence", 0.0))

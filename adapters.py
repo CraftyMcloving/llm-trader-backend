@@ -275,15 +275,49 @@ class YFAdapter(BaseAdapter):
                 prepost=False,
                 threads=False,
                 auto_adjust=False,
-                actions=False
+                actions=False,
             )
             if df_raw is None or df_raw.empty:
                 raise AdapterError("no candles from yfinance")
+
+            # --- flatten possible MultiIndex columns (common with some FX/indices) ---
+            if isinstance(df_raw.columns, pd.MultiIndex):
+                # if only one symbol level, drop it; else try to slice by our symbol
+                try:
+                    if df_raw.columns.nlevels >= 2:
+                        lvl1 = df_raw.columns.get_level_values(-1)
+                        if getattr(lvl1, "nunique", lambda: 1)() == 1:
+                            df_raw.columns = df_raw.columns.droplevel(-1)
+                        else:
+                            # slice by symbol if present
+                            try:
+                                df_raw = df_raw.xs(symbol, axis=1, level=-1, drop_level=True)
+                            except Exception:
+                                df_raw.columns = [c[0] for c in df_raw.columns]
+                except Exception:
+                    # last resort: flatten by taking top-level name
+                    df_raw.columns = [c[0] if isinstance(c, tuple) else c for c in df_raw.columns]
+
+            # standardize columns
             df_raw = df_raw.rename(columns={
-                "Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"
+                "Open": "open",
+                "High": "high",
+                "Low": "low",
+                "Close": "close",
+                "Volume": "volume",
             }).reset_index(names="ts")
-            df = df_raw[["ts","open","high","low","close","volume"]].copy()
+
+            # keep just the fields we use
+            cols = ["ts", "open", "high", "low", "close", "volume"]
+            df = df_raw[[c for c in cols if c in df_raw.columns]].copy()
+
+            # ensure scalar Series (never DataFrames)
+            for c in ("open","high","low","close","volume"):
+                if c in df.columns and isinstance(df[c], pd.DataFrame):
+                    df[c] = df[c].iloc[:, 0]
+
             self._cache_set(key, df)
+
         return df.tail(bars).reset_index(drop=True)
     
     def price_to_precision(self, symbol:str, price:float) -> float:
