@@ -468,7 +468,7 @@ def cache_set(key, data): CACHE[key] = (time.time(), data)
 def get_universe(quote=QUOTE, limit=TOP_N, market_name: Optional[str] = None) -> List[Dict[str, Any]]:
     ad = get_adapter(market_name)
 
-    # robust adapter name (supports attr or method; falls back to class name)
+    # adapter key for cache
     ad_name_attr = getattr(ad, "name", None)
     if callable(ad_name_attr):
         adapter_key = ad_name_attr()
@@ -478,7 +478,6 @@ def get_universe(quote=QUOTE, limit=TOP_N, market_name: Optional[str] = None) ->
         adapter_key = ad.__class__.__name__
 
     key = f"uni:{adapter_key}:{limit}"
-
     u = cache_get(key, 1800)
     if u is not None:
         return u
@@ -494,21 +493,15 @@ def get_universe(quote=QUOTE, limit=TOP_N, market_name: Optional[str] = None) ->
         except TypeError:
             items = ad.list_universe(lim)
 
-    # tolerate dicts or objects
     def _get(it, k, default=None):
-        if isinstance(it, dict):
-            return it.get(k, default)
-        return getattr(it, k, default)
+        return it.get(k, default) if isinstance(it, dict) else getattr(it, k, default)
 
-    out = [
-        {
-            "symbol": _get(it, "symbol"),
-            "name": _get(it, "name"),
-            "market": _get(it, "market", market_name or "crypto"),
-            "tf_supported": _get(it, "tf_supported", ["5m","15m","1h","1d"]),
-        }
-        for it in items
-    ]
+    out = [{
+        "symbol": _get(it, "symbol"),
+        "name": _get(it, "name"),
+        "market": _get(it, "market", "crypto"),        # see note below
+        "tf_supported": _get(it, "tf_supported", ["5m","15m","1h","1d"]),
+    } for it in items]
 
     cache_set(key, out)
     return out
