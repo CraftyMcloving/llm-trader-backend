@@ -11,142 +11,8 @@ import math
 import pandas as pd
 import numpy as np
 import ccxt
-# ===== Adapters: market-specific data sources =====
-from dataclasses import dataclass
-
-class AdapterError(Exception): ...
-
-@dataclass
-class UniverseItem:
-    symbol: str
-    name: str
-    market: str
-    tf_supported: list[str]
-
-class BaseAdapter:
-    name: str
-    def universe(self, top: int = 6) -> list[UniverseItem]: raise NotImplementedError
-    def fetch_ohlcv(self, symbol: str, tf: str, bars: int = 720) -> pd.DataFrame: raise NotImplementedError
-    def fetch_window(self, symbol: str, tf: str, start_ms: int, end_ms: int) -> pd.DataFrame:  # optional fast path
-        # default: fetch wider range and slice
-        per = tf_ms(tf)
-        need = max(2, int((end_ms - start_ms)/per) + 8)
-        df = self.fetch_ohlcv(symbol, tf, bars=min(2000, max(need, 240)))
-        ms = df["ts"].astype("int64")//10**6 if np.issubdtype(df["ts"].dtype, np.datetime64) else df["ts"]
-        return df[(ms >= (start_ms - per)) & (ms <= (end_ms + per))].reset_index(drop=True)
-    # precision helpers used by build_trade
-    def price_to_precision(self, symbol: str, price: float) -> float: return float(round(price, 2))
-    def amount_to_precision(self, symbol: str, qty: float) -> float:  return float(qty)
-
-# --- Crypto via ccxt (your current flow) ---
-class CryptoCCXTAdapter(BaseAdapter):
-    def __init__(self, exchange_id: str, quote: str):
-        self.name = "crypto"
-        self.exchange_id = exchange_id
-        self.quote = quote
-    def _ex(self):
-        ex = get_exchange()  # you already have this singleton
-        return ex
-    def universe(self, top: int = 6) -> list[UniverseItem]:
-        # keep your curated list; take top 3
-        bases = ["BTC","ETH","XRP","SOL","ADA","DOGE","LINK","LTC","BCH","TRX",
-                 "DOT","ATOM","XLM","ETC","MATIC","UNI","APT","ARB","OP","AVAX",
-                 "NEAR","ALGO","FIL","SUI","SHIB","USDC","USDT","XMR","AAVE"
-                ,"PAXG","ONDO","PEPE","SEI","IMX","TIA"]
-        syms = []
-        markets = load_markets()
-        for b in bases:
-            s = f"{b}/{self.quote}"
-            if s in markets and markets[s].get("active"):
-                syms.append(s)
-            if len(syms) >= top: break
-        return [UniverseItem(s, s.split("/")[0], self.exchange_id, ["5m","15m","1h","1d"]) for s in syms]
-    def fetch_ohlcv(self, symbol: str, tf: str, bars: int = 720) -> pd.DataFrame:
-        ex = self._ex()
-        tf_ex = TF_MAP.get(tf); 
-        if tf_ex is None: raise HTTPException(400, detail=f"Unsupported timeframe: {tf}")
-        key = f"ohlcv:{self.name}:{symbol}:{tf_ex}:{bars}"
-        cached = cache_get(key, 900)
-        if cached is not None: return cached.copy()
-        try:
-            data = ex.fetch_ohlcv(symbol, timeframe=tf_ex, limit=bars)
-        except Exception as e:
-            raise HTTPException(502, detail=f"{self.name} fetch_ohlcv failed: {e}")
-        if not data or len(data) < 50: raise HTTPException(502, detail="insufficient candles")
-        df = pd.DataFrame(data, columns=["ts","open","high","low","close","volume"])
-        df["ts"] = pd.to_datetime(df["ts"], unit="ms")
-        cache_set(key, df); 
-        return df.copy()
-    def fetch_window(self, symbol: str, tf: str, start_ms: int, end_ms: int) -> pd.DataFrame:
-        # your existing ccxt window logic (fast)
-        ex = self._ex()
-        per = tf_ms(tf)
-        need = max(2, int((end_ms - start_ms)/per) + 4)
-        since = max(0, start_ms - 2*per)
-        try:
-            data = ex.fetch_ohlcv(symbol, timeframe=TF_MAP[tf], since=since, limit=min(need+20,2000))
-        except Exception as e:
-            raise HTTPException(502, detail=f"eval window fetch failed: {e}")
-        if not data: raise HTTPException(502, detail="no candles for eval window")
-        df = pd.DataFrame(data, columns=["ts","open","high","low","close","volume"])
-        return df[(df["ts"] >= (start_ms - per)) & (df["ts"] <= (end_ms + per))].reset_index(drop=True)
-    def price_to_precision(self, symbol: str, price: float) -> float:
-        ex = self._ex()
-        return float(ex.price_to_precision(symbol, price))
-    def amount_to_precision(self, symbol: str, qty: float) -> float:
-        ex = self._ex()
-        return float(ex.amount_to_precision(symbol, qty))
-
-# --- Generic yfinance adapter family ---
-try:
-    import yfinance as yf
-except Exception:
-    yf = None
-
-class YFAdapter(BaseAdapter):
-    def __init__(self, name: str, tickers: list[str], price_decimals: int = 2):
-        self.name = name
-        self.tickers = tickers
-        self.price_decimals = price_decimals
-    def universe(self, top: int = 6) -> list[UniverseItem]:
-        syms = self.tickers[:top]
-        return [UniverseItem(s, s.replace("=F","").replace("^",""), self.name, ["15m","1h","1d"]) for s in syms]
-    def _interval(self, tf: str) -> str:
-        return {"5m":"5m","15m":"15m","1h":"60m","1d":"1d"}.get(tf, "60m")
-    def fetch_ohlcv(self, symbol: str, tf: str, bars: int = 720) -> pd.DataFrame:
-        if yf is None:
-            raise HTTPException(501, detail="yfinance not installed; add yfinance>=0.2.44 to requirements.txt")
-        try:
-            df = yf.download(symbol, period="60d", interval=self._interval(tf), progress=False, prepost=False, threads=False)
-        except Exception as e:
-            raise HTTPException(502, detail=f"{self.name} fetch_ohlcv failed: {e}")
-        if df is None or df.empty: raise HTTPException(502, detail="no candles")
-        df = df.rename(columns={"Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"})
-        df = df.reset_index(names="ts").tail(bars)
-        return df[["ts","open","high","low","close","volume"]].copy()
-    def price_to_precision(self, symbol: str, price: float) -> float:
-        return float(round(price, self.price_decimals))
-    def amount_to_precision(self, symbol: str, qty: float) -> float:
-        return float(qty)
-
-# Specific YF adapters with top-3 symbols
-ForexAdapter        = lambda: YFAdapter("forex",       ["EURUSD=X","GBPUSD=X","USDJPY=X"], price_decimals=5)
-CommoditiesAdapter  = lambda: YFAdapter("commodities", ["GC=F","CL=F","SI=F"],             price_decimals=2)
-StocksAdapter       = lambda: YFAdapter("stocks",      ["AAPL","MSFT","NVDA"],             price_decimals=2)
-
-# Registry
-def get_adapter(name: Optional[str] = None) -> BaseAdapter:
-    selected = (name or os.getenv("ADAPTER", "") or "").lower()
-    if selected in ("", "crypto"):
-        return CryptoCCXTAdapter(EXCHANGE_ID, QUOTE)
-    if selected == "forex":
-        return ForexAdapter()
-    if selected == "commodities":
-        return CommoditiesAdapter()
-    if selected == "stocks":
-        return StocksAdapter()
-    # unknown -> fallback to crypto
-    return CryptoCCXTAdapter(EXCHANGE_ID, QUOTE)
+# NEW: external adapters
+from adapters import get_adapter, BaseAdapter, UniverseItem, AdapterError
 
 app = FastAPI(title="AI Trade Advisor API", version="2025.09")
 
@@ -599,22 +465,16 @@ def cache_get(key, ttl):
     return data if (time.time() - ts) <= ttl else None
 def cache_set(key, data): CACHE[key] = (time.time(), data)
 
-# ----- Universe -----
-CURATED = [
-    "BTC","ETH","XRP","SOL","ADA","DOGE","LINK","LTC","BCH","TRX",
-    "DOT","ATOM","XLM","ETC","MATIC","UNI","APT","ARB","OP","AVAX",
-    "NEAR","ALGO","FIL","SUI","SHIB","USDC","USDT","XMR","AAVE"
-    ,"PAXG","ONDO","PEPE","SEI","IMX","TIA"
-]
 def get_universe(quote=QUOTE, limit=TOP_N, market_name: Optional[str] = None) -> List[Dict[str, Any]]:
     ad = get_adapter(market_name)
     key = f"uni:{ad.name}:{limit}"
     u = cache_get(key, 1800)
     if u is not None: return u
-    items = ad.universe(top=min( max(6, limit), 50))
-    out = [{"symbol": it.symbol, "name": it.name, "market": it.market, "tf_supported": it.tf_supported} for it in items]
+    items = ad.list_universe(top=min( max(6, limit), 50))
+    out = [{"symbol": it["symbol"], "name": it["name"], "market": it["market"], "tf_supported": it["tf_supported"]} for it in items]
     cache_set(key, out)
     return out
+
 
 # ----- Market data -----
 # Add lower timeframes (5m/15m) in addition to 1h/1d
@@ -622,27 +482,10 @@ TF_MAP = {"5m":"5m","15m":"15m","1h": "1h", "1d": "1d"}
 
 def fetch_ohlcv(symbol: str, tf: str, bars: int = 720, market_name: Optional[str] = None) -> pd.DataFrame:
     ad = get_adapter(market_name)
-    return ad.fetch_ohlcv(symbol, tf, bars)
-    ex = get_exchange()
-    tf_ex = TF_MAP.get(tf)
-    if tf_ex is None:
-        raise HTTPException(400, detail=f"Unsupported timeframe: {tf}")
-    key = f"ohlcv:{symbol}:{tf_ex}:{bars}"
-    cached = cache_get(key, 900)
-    if cached is not None:
-        return cached.copy()
     try:
-        data = ex.fetch_ohlcv(symbol, timeframe=tf_ex, limit=bars)
-    except ccxt.BadSymbol:
-        raise HTTPException(502, detail=f"Symbol not available on {EXCHANGE_ID}: {symbol}")
-    except Exception as e:
-        raise HTTPException(502, detail=f"fetch_ohlcv failed: {e}")
-    if not data or len(data) < 50:
-        raise HTTPException(502, detail="insufficient candles")
-    df = pd.DataFrame(data, columns=["ts","open","high","low","close","volume"])
-    df["ts"] = pd.to_datetime(df["ts"], unit="ms")
-    cache_set(key, df)
-    return df.copy()
+        return ad.fetch_ohlcv(symbol, tf, bars)
+    except AdapterError as e:
+        raise HTTPException(502, detail=str(e))
 
 # ms per bar
 def tf_ms(tf: str) -> int:
@@ -677,34 +520,10 @@ def _wcache_set(key, df):
 
 def fetch_ohlcv_window(symbol: str, tf: str, start_ms: int, end_ms: int, market_name: Optional[str] = None) -> pd.DataFrame:
     ad = get_adapter(market_name)
-    return ad.fetch_window(symbol, tf, start_ms, end_ms)
-    """
-    Fetch enough OHLCV to cover [start_ms, end_ms]. We use ccxt 'since' + 'limit' with a small buffer.
-    """
-    ex = get_exchange()
-    per = tf_ms(tf)
-    need = max(2, int((end_ms - start_ms) / per) + 4)
-    since = max(0, start_ms - 2*per)
-
-    ck = f"{symbol}|{tf}|{since}|{min(need+20,2000)}"
-    cached = _wcache_get(ck)
-    if cached is not None:
-        df = cached
-    else:
-        try:
-            data = ex.fetch_ohlcv(symbol, timeframe=TF_MAP[tf], since=since, limit=min(need+20, 2000))
-        except Exception as e:
-            raise HTTPException(502, detail=f"eval window fetch failed: {e}")
-        if not data:
-            raise HTTPException(502, detail="no candles for eval window")
-        df = pd.DataFrame(data, columns=["ts","open","high","low","close","volume"])
-        _wcache_set(ck, df)
-
-    # keep only overlap window (with one bar margin on each side)
-    df = df[(df["ts"] >= (start_ms - per)) & (df["ts"] <= (end_ms + per))]
-    if len(df) < 1:
-        raise HTTPException(502, detail="empty eval slice")
-    return df.reset_index(drop=True)
+    try:
+        return ad.fetch_window(symbol, tf, start_ms, end_ms)
+    except AdapterError as e:
+        raise HTTPException(502, detail=str(e))
 
 EVAL_STOP_FIRST = bool(int(os.getenv("EVAL_STOP_FIRST", "0")))  # if 1: SL wins ties within same bar
 
@@ -895,7 +714,7 @@ def build_trade(symbol: str, df: pd.DataFrame, direction: str,
         if equity and margin > float(equity):
             cap_notional = float(equity) * levf
             scale = cap_notional / max(notional, 1e-8)
-            qty = float(ex.amount_to_precision(symbol, qty * scale))
+            qty = float(ad.amount_to_precision(symbol, qty * scale))
             notional = qty * price_p
             margin = notional / levf
 
@@ -1003,7 +822,7 @@ def _vote_matches_market(fb: FeedbackIn) -> Tuple[bool, str]:
     except Exception:
         pass
     if px is None:
-        df = fetch_ohlcv(fb.symbol, fb.tf, bars=2)
+        df = fetch_ohlcv(fb.symbol, fb.tf, bars=2, market_name=fb.market)
         px = float(df["close"].iloc[-1])
 
     is_long = fb.direction.lower().startswith("long")
@@ -1067,6 +886,18 @@ def evaluate_signal(
     liquid_ok = bool(turnover >= min_turnover)
     if not liquid_ok:
         reasons.append(f"turnover ${turnover:,.0f} < ${min_turnover:,.0f} min")
+# For markets where yfinance volume is unreliable (e.g., forex),
+# if recent volume is missing/zero, bypass the turnover gate.
+try:
+    if market_name in ("forex", "commodities", "stocks"):
+        vol_sum = float(pd.to_numeric(feats["volume"].tail(200), errors="coerce").fillna(0).sum())
+        if vol_sum <= 0:
+            liquid_ok = True
+            reasons = [r for r in reasons if "turnover" not in r.lower()]
+except Exception:
+    # If we can't assess volume reliably, don't block the signal on liquidity.
+    liquid_ok = True
+    reasons = [r for r in reasons if "turnover" not in r.lower()]
 
     trade = None
     advice = "Skip"
@@ -1152,7 +983,9 @@ def resolve_offer_row(row: sqlite3.Row) -> dict:
         direction and isinstance(entry, (int, float)) and isinstance(stop, (int, float))
     )
 
-    df = fetch_ohlcv_window(symbol, tf, created_ts * 1000, expires_ts * 1000, market_name=row.get("market"))
+    row_map = dict(row)
+    df = fetch_ohlcv_window(symbol, tf, created_ts * 1000, expires_ts * 1000, market_name=row_map.get("market"))
+
 
     if fallback_only:
         created_close = float(df.iloc[0]["close"])
@@ -1258,8 +1091,8 @@ def instruments(market: Optional[str] = None, _: None = Depends(require_key)):
     return get_universe(market_name=market)
 
 @app.get("/chart")
-def chart(symbol: str, tf: str = "1h", n: int = 120, _: None = Depends(require_key)):
-    df = fetch_ohlcv(symbol, tf, bars=max(200, n+20))
+def chart(symbol: str, tf: str = "1h", n: int = 120, market: Optional[str] = None, _: None = Depends(require_key)):
+    df = fetch_ohlcv(symbol, tf, bars=max(200, n+20), market_name=market)
     closes = df["close"].tail(n).astype(float).tolist()
     return {"symbol": symbol, "tf": tf, "closes": closes}
 
@@ -1385,8 +1218,8 @@ def scan(
     for s in topK:
         if include_chart:
             try:
-                df = fetch_ohlcv(s["symbol"], tf, bars=160)
                 df = fetch_ohlcv(s["symbol"], tf, bars=160, market_name=market or s.get("market"))
+                s["chart"] = {"closes": df["close"].tail(120).astype(float).tolist()}
             except Exception:
                 s["chart"] = None
         out.append(s)
