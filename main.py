@@ -467,34 +467,51 @@ def cache_set(key, data): CACHE[key] = (time.time(), data)
 
 def get_universe(quote=QUOTE, limit=TOP_N, market_name: Optional[str] = None) -> List[Dict[str, Any]]:
     ad = get_adapter(market_name)
-    key = f"uni:{ad.name()}:{limit}"   # call the method, not the function object
+
+    # robust adapter name (supports attr or method; falls back to class name)
+    ad_name_attr = getattr(ad, "name", None)
+    if callable(ad_name_attr):
+        adapter_key = ad_name_attr()
+    elif isinstance(ad_name_attr, str) and ad_name_attr:
+        adapter_key = ad_name_attr
+    else:
+        adapter_key = ad.__class__.__name__
+
+    key = f"uni:{adapter_key}:{limit}"
+
     u = cache_get(key, 1800)
     if u is not None:
         return u
 
     lim = min(max(6, limit), 50)
 
-    # compatibility with adapters that use either `limit` or `top`
+    # tolerate different adapter signatures
     try:
         items = ad.list_universe(limit=lim)
     except TypeError:
         try:
-            items = ad.list_universe(top=lim)   # fallback for older signature
+            items = ad.list_universe(top=lim)
         except TypeError:
-            items = ad.list_universe(lim)       # positional fallback
+            items = ad.list_universe(lim)
+
+    # tolerate dicts or objects
+    def _get(it, k, default=None):
+        if isinstance(it, dict):
+            return it.get(k, default)
+        return getattr(it, k, default)
 
     out = [
         {
-            "symbol": it["symbol"],
-            "name": it["name"],
-            "market": it["market"],
-            "tf_supported": it["tf_supported"],
+            "symbol": _get(it, "symbol"),
+            "name": _get(it, "name"),
+            "market": _get(it, "market", market_name or "crypto"),
+            "tf_supported": _get(it, "tf_supported", ["5m","15m","1h","1d"]),
         }
         for it in items
     ]
+
     cache_set(key, out)
     return out
-
 
 # ----- Market data -----
 # Add lower timeframes (5m/15m) in addition to 1h/1d
