@@ -88,7 +88,10 @@ class CryptoCCXT(BaseAdapter):
             self._markets = self._exh().load_markets()
         return self._markets
 
-    def list_universe(self, limit:int) -> List[Dict[str,Any]]:
+    def list_universe(self, limit: int = None, top: int = None) -> List[Dict[str, Any]]:
+        if top is not None and limit is None:
+            limit = top
+        limit = int(limit or 20)
         m = self._load_markets()
         avail: List[str] = []
         # curated first

@@ -467,11 +467,31 @@ def cache_set(key, data): CACHE[key] = (time.time(), data)
 
 def get_universe(quote=QUOTE, limit=TOP_N, market_name: Optional[str] = None) -> List[Dict[str, Any]]:
     ad = get_adapter(market_name)
-    key = f"uni:{ad.name}:{limit}"
+    key = f"uni:{ad.name()}:{limit}"   # call the method, not the function object
     u = cache_get(key, 1800)
-    if u is not None: return u
-    items = ad.list_universe(top=min( max(6, limit), 50))
-    out = [{"symbol": it["symbol"], "name": it["name"], "market": it["market"], "tf_supported": it["tf_supported"]} for it in items]
+    if u is not None:
+        return u
+
+    lim = min(max(6, limit), 50)
+
+    # compatibility with adapters that use either `limit` or `top`
+    try:
+        items = ad.list_universe(limit=lim)
+    except TypeError:
+        try:
+            items = ad.list_universe(top=lim)   # fallback for older signature
+        except TypeError:
+            items = ad.list_universe(lim)       # positional fallback
+
+    out = [
+        {
+            "symbol": it["symbol"],
+            "name": it["name"],
+            "market": it["market"],
+            "tf_supported": it["tf_supported"],
+        }
+        for it in items
+    ]
     cache_set(key, out)
     return out
 
@@ -1282,7 +1302,7 @@ class OffersBatch(BaseModel):
     universe: Optional[int] = None
     note: Optional[str] = None
 
-from fastapi import Request, Header
+from fastapi import Request
 
 @app.post("/feedback", response_model=FeedbackAck, dependencies=[Depends(require_key)])
 def post_feedback(fb: FeedbackIn, request: Request, x_user_id: Optional[int] = Header(None)):
