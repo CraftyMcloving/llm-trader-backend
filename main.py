@@ -1042,7 +1042,7 @@ def resolve_offer_row(row: sqlite3.Row) -> dict:
             -1 if (result == "SL" or (result == "PNL" and pnl_frac < 0)) else 0
         )
         try:
-        feats = json.loads(row["features"] or "{}")
+            feats = json.loads(row["features"] or "{}")
         if outcome != 0:
             update_weights(feats, outcome)           # keep legacy global weights
             ns_stats_update(symbol, tf, outcome)     # NEW: reliability counters
