@@ -76,7 +76,7 @@ def load_markets():
 
 
 # ========= FEEDBACK STORAGE & ONLINE WEIGHTS =========
-DB_PATH = os.getenv("FEEDBACK_DB", "/tmp/ai_trade_feedback.db")
+DB_PATH = os.getenv("FEEDBACK_DB", "/var/lib/render/data/ai_trade_feedback.db")
 _db_lock = threading.Lock()
 
 def _db():
@@ -1608,33 +1608,31 @@ def feedback_summary(symbol: str, tf: str, direction: Optional[str] = None, wind
 
 @app.get("/feedback/stats")
 def feedback_stats():
+    """
+    Faster, single-pass aggregates + defensive casting.
+    Avoids multiple table scans and is resilient if tables are empty.
+    """
     try:
         with _db_lock:
             conn = _db()
             try:
-                # Single pass: total, good, bad
-                r = conn.execute(
-                    """
+                r = conn.execute("""
                     SELECT
-                      COUNT(*) AS total,
-                      SUM(CASE WHEN outcome = 1  THEN 1 ELSE 0 END) AS good,
-                      SUM(CASE WHEN outcome = -1 THEN 1 ELSE 0 END) AS bad
+                      COUNT(*)                                        AS total,
+                      SUM(CASE WHEN outcome= 1 THEN 1 ELSE 0 END)     AS good,
+                      SUM(CASE WHEN outcome=-1 THEN 1 ELSE 0 END)     AS bad
                     FROM feedback
-                    """
-                ).fetchone()
+                """).fetchone()
+                total = int(r[0] or 0)
+                good  = int(r[1] or 0)
+                bad   = int(r[2] or 0)
 
-                if r:
-                    total = int(r[0] or 0)
-                    good  = int(r[1] or 0)
-                    bad   = int(r[2] or 0)
-                else:
-                    total = good = bad = 0
-
-                rows = conn.execute(
-                    "SELECT feature, w FROM weights ORDER BY ABS(w) DESC LIMIT 24"
-                ).fetchall()
-
-                # Cast for JSON safety
+                rows = conn.execute("""
+                  SELECT feature, w
+                  FROM weights
+                  ORDER BY ABS(w) DESC
+                  LIMIT 24
+                """).fetchall()
                 W = {}
                 for k, v in rows or []:
                     if k is not None and v is not None:
@@ -1646,7 +1644,7 @@ def feedback_stats():
                 conn.close()
         return {"total": total, "good": good, "bad": bad, "weights": W}
     except Exception as e:
-        # Never 500 here—return a safe payload and log the error
+        # Never hard-fail this endpoint; return safe defaults
         print("FEEDBACK_STATS_ERROR:", repr(e))
         return {"total": 0, "good": 0, "bad": 0, "weights": {}}
 
@@ -1865,6 +1863,52 @@ def tracked_delete_path(id: str, x_user_id: Optional[int] = Header(None), _: Non
         conn.commit()
         conn.close()
     return _tracked_list_for(uid)
+
+# ----- Admin / maintenance (secure) -----
+
+@app.post("/admin/feedback/purge")
+def admin_feedback_purge(_: None = Depends(require_key)):
+    """
+    Hard-delete all learning data (feedback + weights) and VACUUM.
+    Use sparingly. Returns counts deleted.
+    """
+    with _db_lock:
+        conn = _db()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM feedback")
+            n_fb = int(cur.fetchone()[0] or 0)
+            cur.execute("SELECT COUNT(*) FROM weights")
+            n_wt = int(cur.fetchone()[0] or 0)
+
+            cur.execute("DELETE FROM feedback")
+            cur.execute("DELETE FROM weights")
+            conn.commit()
+        finally:
+            conn.close()
+
+    # Separate VACUUM (outside the open connection)
+    with _db_lock:
+        conn2 = _db()
+        try:
+            conn2.execute("VACUUM")
+        finally:
+            conn2.close()
+
+    return {"ok": True, "deleted_feedback": n_fb, "deleted_weights": n_wt}
+
+@app.post("/admin/feedback/vacuum")
+def admin_feedback_vacuum(_: None = Depends(require_key)):
+    """
+    Compact the DB without deleting rows. Safe to run anytime.
+    """
+    with _db_lock:
+        conn = _db()
+        try:
+            conn.execute("VACUUM")
+        finally:
+            conn.close()
+    return {"ok": True}
 
 @app.on_event("startup")
 def warmup_markets():
