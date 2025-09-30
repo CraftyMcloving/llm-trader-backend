@@ -1155,19 +1155,22 @@ def resolve_offer_row(row: sqlite3.Row) -> dict:
 
     return {"result": result, "pnl": float(pnl_frac), "outcome": int(outcome), "resolved_ts": time.time()}
 
-# --- REPLACE: resolve_due_offers with short, per-row lock usage ---
 def resolve_due_offers(limit: int = 50) -> dict:
     """
-    Resolve due offers with minimal lock time:
+    Resolve due offers with minimal lock time and an overall deadline:
       1) read list of rows/ids under lock,
       2) compute outcome without lock,
       3) write each result under lock,
       4) (optionally) insert feedback outside existing locks.
     """
+    t0 = time.time()
+    deadline_ms = int(os.getenv("RESOLVE_DEADLINE_MS", "50000"))  # ~50s (stay under WP 65s)
+    hard_cap    = int(os.getenv("RESOLVE_LIMIT_MAX", "15"))       # clamp per call
     now = time.time()
     done = good = bad = 0
 
-    # 1) Read candidates under lock
+    # 1) Read candidates under lock (respect cap)
+    lim = min(int(limit), hard_cap)
     with _db_lock:
         conn = _db()
         conn.row_factory = sqlite3.Row
@@ -1176,12 +1179,16 @@ def resolve_due_offers(limit: int = 50) -> dict:
             "features, equity, risk_pct, leverage, created_ts, expires_ts "
             "FROM offers WHERE resolved=0 AND expires_ts<=? "
             "ORDER BY expires_ts ASC LIMIT ?",
-            (now, int(limit)),
+            (now, lim),
         ).fetchall()
         conn.close()
 
     # 2..4) For each row, compute (no lock) then write (lock) then log feedback (locks internally)
     for row in rows:
+        # Respect overall deadline
+        if (time.time() - t0) * 1000 > deadline_ms:
+            break
+
         try:
             upd = resolve_offer_row(row)  # network/CPU: NO DB LOCK HERE
         except Exception:
