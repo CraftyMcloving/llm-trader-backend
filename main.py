@@ -707,7 +707,8 @@ def _tp_hit_first(entry, stop, tps, df, direction: str) -> Tuple[str, float]:
     return first_event, event_pnl
 
 # ----- Indicators -----
-def ema(s: pd.Series, n: int) -> pd.Series: return s.ewm(span=n, adjust=False).mean()
+def ema(s: pd.Series, n: int) -> pd.Series:
+    return s.ewm(span=n, adjust=False).mean()
 def rsi(s: pd.Series, n: int = 14) -> pd.Series:
     d = s.diff(); up = d.clip(lower=0); dn = -d.clip(upper=0)
     rs = ema(up,n) / (ema(dn,n) + 1e-12)
@@ -1017,25 +1018,25 @@ def evaluate_signal(
     last = feats.iloc[-1]
     turnover = float(last.get("turnover_sma96") or last.get("turnover") or 0.0)
     # scale per-bar threshold to per-hour
-    tf_minutes = (60 if tf=="1h" else 1440 if tf=="1d" else 5 if tf=="5m" else 15 if tf=="15m" else 60)
-    min_turnover = TURNOVER_MIN_USD_PER_HR * (tf_minutes/60.0)
+    tf_minutes = 60 if tf == "1h" else 1440 if tf == "1d" else 5 if tf == "5m" else 15 if tf == "15m" else 60
+    min_turnover = TURNOVER_MIN_USD_PER_HR * (tf_minutes / 60.0)
     liquid_ok = bool(turnover >= min_turnover)
     if not liquid_ok:
         reasons.append(f"turnover ${turnover:,.0f} < ${min_turnover:,.0f} min")
 
-    # For markets where yfinance volume is unreliable (e.g., forex),
-# if recent volume is missing/zero, bypass the turnover gate.
-try:
-    eff_market = (market_name or _auto_adapter(symbol, market_name).name.split(":", 1)[0])
-    if eff_market in ("forex", "commodities", "stocks"):
-        vol_sum = float(pd.to_numeric(feats["volume"].tail(200), errors="coerce").fillna(0).sum())
-        if vol_sum <= 0:
-            liquid_ok = True
-            reasons = [r for r in reasons if "turnover" not in r.lower()]
-except Exception:
-    # If we can't assess volume reliably, don't block the signal on liquidity.
-    liquid_ok = True
-    reasons = [r for r in reasons if "turnover" not in r.lower()]
+    # For markets where yfinance volume is unreliable (e.g., forex/commodities/stocks),
+    # if recent volume is missing/zero, bypass the turnover gate.
+    try:
+        eff_market = (market_name or _auto_adapter(symbol, market_name).name.split(":", 1)[0])
+        if eff_market in ("forex", "commodities", "stocks"):
+            vol_sum = float(pd.to_numeric(feats["volume"].tail(200), errors="coerce").fillna(0).sum())
+            if vol_sum <= 0:
+                liquid_ok = True
+                reasons = [r for r in reasons if "turnover" not in r.lower()]
+    except Exception:
+        # If we can't assess volume reliably, don't block the signal on liquidity.
+        liquid_ok = True
+        reasons = [r for r in reasons if "turnover" not in r.lower()]
 
     trade = None
     advice = "Skip"
@@ -1066,7 +1067,7 @@ except Exception:
             else:
                 R = float((entry - tp1) / max(1e-9, (stop - entry))) if tp1 else 1.2
             p = float(conf)
-            ev = p*R - (1-p)*1.0
+            ev = p * R - (1 - p) * 1.0
             if ev < EV_MIN:
                 advice = "Skip"
                 reasons.append(f"EV {ev:.2f} < {EV_MIN:.2f}")
@@ -1084,20 +1085,20 @@ except Exception:
         except Exception:
             pass
 
-        # Feature snapshot for learning/bias
-        feat_map = last_features_snapshot(feats)
+    # Feature snapshot for learning/bias
+    feat_map = last_features_snapshot(feats)
 
-        return {
-            "symbol": symbol,
-            "timeframe": tf,
-            "signal": sig,
-            "confidence": conf,
-            "updated": pd.Timestamp.utcnow().isoformat(),
-            "trade": trade,
-            "filters": {**filt, "reasons": reasons, "liquid_ok": liquid_ok},
-            "advice": advice,
-            "features": feat_map,
-        }
+    return {
+        "symbol": symbol,
+        "timeframe": tf,
+        "signal": sig,
+        "confidence": conf,
+        "updated": pd.Timestamp.utcnow().isoformat(),
+        "trade": trade,
+        "filters": {**filt, "reasons": reasons, "liquid_ok": liquid_ok},
+        "advice": advice,
+        "features": feat_map,
+    }
 
 def resolve_offer_row(row: sqlite3.Row) -> dict:
     symbol     = row["symbol"]
@@ -1122,13 +1123,13 @@ def resolve_offer_row(row: sqlite3.Row) -> dict:
 
     row_map = dict(row)
     df = fetch_ohlcv_window(symbol, tf, created_ts * 1000, expires_ts * 1000, market_name=row_map.get("market"))
+
     # Guard: if window returned no data, mark as NEITHER to avoid index errors
-if df is None or df.empty:
-    return {"result": "NEITHER", "pnl": 0.0, "outcome": 0, "resolved_ts": time.time()}
-
-
+    if df is None or df.empty:
+        return {"result": "NEITHER", "pnl": 0.0, "outcome": 0, "resolved_ts": time.time()}
 
     if fallback_only:
+
         created_close = float(df.iloc[0]["close"])
         close = float(df.iloc[-1]["close"])
         if not direction:
@@ -1705,17 +1706,18 @@ def learning_stats(_: None = Depends(require_key)):
 
 @app.get("/learning/config")
 def learning_config(_: None = Depends(require_key)):
-    """Small helper so the frontend knows how long to ‘hold’ before resolution."""
-    return {
+    # Small helper so the frontend knows how long to 'hold' before resolution.
+    cfg = {
         "hold_secs": {
             "5m": HOLD_5M_SECS,
             "15m": HOLD_15M_SECS,
             "1h": HOLD_1H_SECS,
-            "1d": HOLD_1D_SECS
+            "1d": HOLD_1D_SECS,
         },
         "bg_interval": BG_INTERVAL,
         "eval_stop_first": bool(EVAL_STOP_FIRST),
     }
+    return cfg
 
 # ========= TRACKED TRADES (for mobile app) =========
 from fastapi import Body

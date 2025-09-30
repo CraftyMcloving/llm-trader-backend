@@ -51,11 +51,11 @@ class BaseAdapter:
         per = tf_ms(tf)
         need = max(2, int((end_ms - start_ms)/per) + 8)
         df = self.fetch_ohlcv(symbol, tf, bars=min(2000, max(need, 240)))
-                # normalize 'ts' to ms (handle tz-aware safely)
+        # normalize 'ts' to ms (handle tz-aware safely)
         ts_col = df["ts"]
-        if pd.api.types.is_datetime64_any_dtype(ts_col):
+        if np.issubdtype(ts_col.dtype, np.datetime64):
             ts_col = pd.to_datetime(ts_col, utc=True)
-            ms = (ts_col.astype("int64") // 10**6)
+            ms = (ts_col.view("int64") // 10**6)
         else:
             ms = pd.to_numeric(ts_col, errors="coerce").astype("int64")
         keep = (ms >= (start_ms - per)) & (ms <= (end_ms + per))
