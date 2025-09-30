@@ -1606,14 +1606,37 @@ def feedback_summary(symbol: str, tf: str, direction: Optional[str] = None, wind
 
 @app.get("/feedback/stats")
 def feedback_stats():
-    with _db_lock:
-        conn = _db()
-        total = conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0]
-        good  = conn.execute("SELECT COUNT(*) FROM feedback WHERE outcome=1").fetchone()[0]
-        bad   = conn.execute("SELECT COUNT(*) FROM feedback WHERE outcome=-1").fetchone()[0]
-        W = {k: v for k, v in conn.execute("SELECT feature, w FROM weights ORDER BY ABS(w) DESC LIMIT 24")}
-        conn.close()
-    return {"total": total, "good": good, "bad": bad, "weights": W}
+    try:
+        with _db_lock:
+            conn = _db()
+            try:
+                r = conn.execute("SELECT COUNT(*) FROM feedback").fetchone()
+                total = int(r[0]) if r and r[0] is not None else 0
+
+                r = conn.execute("SELECT COUNT(*) FROM feedback WHERE outcome=1").fetchone()
+                good = int(r[0]) if r and r[0] is not None else 0
+
+                r = conn.execute("SELECT COUNT(*) FROM feedback WHERE outcome=-1").fetchone()
+                bad = int(r[0]) if r and r[0] is not None else 0
+
+                rows = conn.execute(
+                    "SELECT feature, w FROM weights ORDER BY ABS(w) DESC LIMIT 24"
+                ).fetchall()
+                # Cast for JSON safety
+                W = {}
+                for k, v in rows or []:
+                    if k is not None and v is not None:
+                        try:
+                            W[str(k)] = float(v)
+                        except Exception:
+                            continue
+            finally:
+                conn.close()
+        return {"total": total, "good": good, "bad": bad, "weights": W}
+    except Exception as e:
+        # Never 500 here—return a safe payload and log the error
+        print("FEEDBACK_STATS_ERROR:", repr(e))
+        return {"total": 0, "good": 0, "bad": 0, "weights": {}}
 
 @app.post("/learning/offered")
 def learning_offered(batch: OffersBatch, request: Request, _: None = Depends(require_key)):
