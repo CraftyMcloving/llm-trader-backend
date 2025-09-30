@@ -1084,20 +1084,20 @@ except Exception:
         except Exception:
             pass
 
-    # Feature snapshot for learning/bias
-    feat_map = last_features_snapshot(feats)
+        # Feature snapshot for learning/bias
+        feat_map = last_features_snapshot(feats)
 
-    return {
-        "symbol": symbol,
-        "timeframe": tf,
-        "signal": sig,
-        "confidence": conf,
-        "updated": pd.Timestamp.utcnow().isoformat(),
-        "trade": trade,
-        "filters": {**filt, "reasons": reasons, "liquid_ok": liquid_ok},
-        "advice": advice,
-        "features": feat_map,
-    }
+        return {
+            "symbol": symbol,
+            "timeframe": tf,
+            "signal": sig,
+            "confidence": conf,
+            "updated": pd.Timestamp.utcnow().isoformat(),
+            "trade": trade,
+            "filters": {**filt, "reasons": reasons, "liquid_ok": liquid_ok},
+            "advice": advice,
+            "features": feat_map,
+        }
 
 def resolve_offer_row(row: sqlite3.Row) -> dict:
     symbol     = row["symbol"]
