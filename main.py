@@ -76,7 +76,7 @@ def load_markets():
 
 
 # ========= FEEDBACK STORAGE & ONLINE WEIGHTS =========
-DB_PATH = os.getenv("FEEDBACK_DB", "/var/lib/render/data/ai_trade_feedback.db")
+DB_PATH = os.getenv("FEEDBACK_DB", "/var/data/ai_trade_feedback.db")
 _db_lock = threading.Lock()
 
 def _db():
