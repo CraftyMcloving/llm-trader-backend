@@ -65,10 +65,6 @@ class BaseAdapter:
     def price_to_precision(self, symbol:str, price:float) -> float: return float(round(price, 2))
     def amount_to_precision(self, symbol:str, qty:float) -> float:  return float(qty)
 
-    def precision_for(self, symbol: str) -> dict:
-        return {}
-
-
 # ---------- Crypto (CCXT / Kraken default) ----------
 class CryptoCCXT(BaseAdapter):
     def __init__(self, exchange_id:str="kraken", quote:str="USD",
@@ -104,7 +100,7 @@ class CryptoCCXT(BaseAdapter):
         limit = int(limit or 20)
 
         # Optional hard cap from env (keeps scans snappy)
-        hard_cap = int(os.getenv("CRYPTO_UNIVERSE_CAP", "12"))
+        hard_cap = int(os.getenv("CRYPTO_UNIVERSE_CAP", "10"))
 
         m = self._load_markets()
         avail: List[str] = []
@@ -181,13 +177,6 @@ class CryptoCCXT(BaseAdapter):
     def amount_to_precision(self, symbol:str, qty:float) -> float:
         self._load_markets()
         return float(self._exh().amount_to_precision(symbol, qty))
-    def precision_for(self, symbol: str) -> dict:
-        try:
-            self._load_markets()
-            m = self._exh().markets.get(symbol) or {}
-            return m.get("precision", {}) or {}
-        except Exception:
-            return {}
 
 # ---------- Binance Perps (USDT-M futures) via ccxt ----------
 class BinancePerpsUSDT(BaseAdapter):
@@ -252,14 +241,6 @@ class BinancePerpsUSDT(BaseAdapter):
         return float(self._exh().price_to_precision(symbol, price))
     def amount_to_precision(self, symbol:str, qty:float) -> float:
         return float(self._exh().amount_to_precision(symbol, qty))
-    def precision_for(self, symbol: str) -> dict:
-        try:
-            ex = self._exh()
-            m = ex.markets.get(symbol) or {}
-            return m.get("precision", {}) or {}
-        except Exception:
-            return {}
-
 
 # ---------- yfinance generic + thin wrappers ----------
 class YFAdapter(BaseAdapter):
@@ -271,7 +252,6 @@ class YFAdapter(BaseAdapter):
         self.cache_ttl = cache_ttl
         self._cache: Dict[str, Tuple[float, pd.DataFrame]] = {}
 
-
     def _cache_get(self, key:str) -> Optional[pd.DataFrame]:
         v = self._cache.get(key)
         if not v: return None
@@ -280,19 +260,6 @@ class YFAdapter(BaseAdapter):
 
     def _cache_set(self, key:str, df:pd.DataFrame):
         self._cache[key] = (time.time(), df.copy())
-
-    def _period_and_interval(self, tf: str, bars: int) -> tuple[str, str]:
-        # Yahoo limits: 5m/15m ~60d; 60m (1h) ~730d; 1d can be years ('max' ok)
-        headroom = int(bars * 0.3) + 50
-        if tf == "5m":
-            return "60d", "5m"
-        if tf == "15m":
-            return "60d", "15m"
-        if tf == "1h":
-            return "730d", "60m"
-        if tf == "1d":
-            return "max", "1d"
-        return "730d", "60m"
 
     def list_universe(self, limit:int) -> List[Dict[str,Any]]:
         syms = self.tickers[:max(1, limit)]
@@ -309,11 +276,10 @@ class YFAdapter(BaseAdapter):
         if cached is not None:
             df = cached
         else:
-            period, interval = self._period_and_interval(tf, bars)
             df_raw = yf.download(
                 symbol,
-                period=period,
-                interval=interval,
+                period="60d",
+                interval=self._interval(tf),
                 progress=False,
                 prepost=False,
                 threads=False,
@@ -323,32 +289,38 @@ class YFAdapter(BaseAdapter):
             if df_raw is None or df_raw.empty:
                 raise AdapterError("no candles from yfinance")
 
-            # Normalize multi-index and columns
+            # --- flatten possible MultiIndex columns (common with some FX/indices) ---
             if isinstance(df_raw.columns, pd.MultiIndex):
+                # if only one symbol level, drop it; else try to slice by our symbol
                 try:
-                    # If symbol level present, slice it; else flatten
-                    try:
-                        df_raw = df_raw.xs(symbol, axis=1, level=-1, drop_level=True)
-                    except Exception:
-                        df_raw.columns = [c[0] if isinstance(c, tuple) else c for c in df_raw.columns]
+                    if df_raw.columns.nlevels >= 2:
+                        lvl1 = df_raw.columns.get_level_values(-1)
+                        if getattr(lvl1, "nunique", lambda: 1)() == 1:
+                            df_raw.columns = df_raw.columns.droplevel(-1)
+                        else:
+                            # slice by symbol if present
+                            try:
+                                df_raw = df_raw.xs(symbol, axis=1, level=-1, drop_level=True)
+                            except Exception:
+                                df_raw.columns = [c[0] for c in df_raw.columns]
                 except Exception:
+                    # last resort: flatten by taking top-level name
                     df_raw.columns = [c[0] if isinstance(c, tuple) else c for c in df_raw.columns]
 
-            # Ensure datetime index and flatten to 'ts'
-            df_raw.index = pd.to_datetime(df_raw.index, utc=True)
+            # standardize columns
             df_raw = df_raw.rename(columns={
                 "Open": "open",
                 "High": "high",
                 "Low": "low",
                 "Close": "close",
-                "Adj Close": "adj_close",
                 "Volume": "volume",
-            }).reset_index().rename(columns={"Date": "ts", "Datetime": "ts"})
+            }).reset_index(names="ts")
 
+            # keep just the fields we use
             cols = ["ts", "open", "high", "low", "close", "volume"]
             df = df_raw[[c for c in cols if c in df_raw.columns]].copy()
 
-            # Ensure scalar Series (never DataFrames)
+            # ensure scalar Series (never DataFrames)
             for c in ("open","high","low","close","volume"):
                 if c in df.columns and isinstance(df[c], pd.DataFrame):
                     df[c] = df[c].iloc[:, 0]
@@ -356,7 +328,7 @@ class YFAdapter(BaseAdapter):
             self._cache_set(key, df)
 
         return df.tail(bars).reset_index(drop=True)
-
+    
     def price_to_precision(self, symbol:str, price:float) -> float:
         return float(round(price, self.price_decimals))
 

@@ -10,7 +10,7 @@ import os, json, sqlite3, threading, time
 import math
 import pandas as pd
 import numpy as np
-import ccxt
+
 # NEW: external adapters
 from adapters import get_adapter, BaseAdapter, UniverseItem, AdapterError
 
@@ -18,15 +18,9 @@ app = FastAPI(title="AI Trade Advisor API", version="2025.09")
 
 origins_env = os.getenv("ALLOWED_ORIGINS", "*")
 origins = ["*"] if origins_env == "*" else [o.strip() for o in origins_env.split(",") if o.strip()]
-allowed = [
-    "https://craftyalpha.com",
-    "https://www.craftyalpha.com",
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed,
+    allow_origins=origins,
     allow_methods=["*"],
     allow_headers=["*"],
     allow_credentials=True,
@@ -62,7 +56,16 @@ _ex = None
 def get_exchange():
     global _ex
     if _ex is None:
-        _ex = getattr(ccxt, EXCHANGE_ID)({
+        try:
+            import ccxt as _ccxt  # import here to avoid ImportError at module load time
+        except Exception:
+            # Surface a clear error so callers know why the exchange features are unavailable
+            raise HTTPException(status_code=500, detail="ccxt is not installed. Install ccxt to use the exchange features.")
+        # Look up the exchange class dynamically; fail early if unsupported
+        exchange_cls = getattr(_ccxt, EXCHANGE_ID, None)
+        if not exchange_cls:
+            raise HTTPException(status_code=500, detail=f"Exchange '{EXCHANGE_ID}' not supported by ccxt.")
+        _ex = exchange_cls({
             "enableRateLimit": True,
             "timeout": 20000,
         })
@@ -76,14 +79,12 @@ def load_markets():
 
 
 # ========= FEEDBACK STORAGE & ONLINE WEIGHTS =========
-DB_PATH = os.getenv("FEEDBACK_DB", "/var/data/ai_trade_feedback.db")
+DB_PATH = os.getenv("FEEDBACK_DB", "/tmp/ai_trade_feedback.db")
 _db_lock = threading.Lock()
 
 def _db():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    conn.execute("PRAGMA busy_timeout=3000;")  # wait up to 3s for read locks
     return conn
 
 def init_feedback_db():
@@ -142,14 +143,11 @@ def init_feedback_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_offers_created ON offers(created_ts);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_offers_resolved ON offers(resolved, expires_ts);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_offers_exp ON offers(expires_ts);")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_fb_outcome ON feedback(outcome)")
         conn.commit()
         conn.close()
 
 def ensure_feedback_migrations(conn):
     cur = conn.cursor()
-
-    # --- columns (safe, idempotent) ---
     cols = {r[1] for r in cur.execute("PRAGMA table_info(feedback)").fetchall()}
     if "uid" not in cols:
         cur.execute("ALTER TABLE feedback ADD COLUMN uid INTEGER DEFAULT 0")
@@ -157,45 +155,30 @@ def ensure_feedback_migrations(conn):
         cur.execute("ALTER TABLE feedback ADD COLUMN fingerprint TEXT")
     if "accepted" not in cols:
         cur.execute("ALTER TABLE feedback ADD COLUMN accepted INTEGER DEFAULT 1")
-    conn.commit()
 
-    # --- PRE-DEDupe (supports old SQLite w/o window functions) ---
-    try:
-        cur.execute("""
-            DELETE FROM feedback
-            WHERE id IN (
-              SELECT id FROM (
-                SELECT id,
-                       ROW_NUMBER() OVER(
-                         PARTITION BY COALESCE(uid,0), COALESCE(fingerprint,'')
-                         ORDER BY id DESC
-                       ) AS rn
-                FROM feedback
-                WHERE fingerprint IS NOT NULL
-              ) t
-              WHERE t.rn > 1
-            )
-        """)
-    except Exception:
-        # Fallback: keep the latest id per (uid,fingerprint)
-        cur.execute("""
-            DELETE FROM feedback
-            WHERE id NOT IN (
-              SELECT MAX(id) FROM feedback
-              WHERE fingerprint IS NOT NULL
-              GROUP BY COALESCE(uid,0), COALESCE(fingerprint,'')
-            )
-        """)
-    conn.commit()
+    # Pre-dedupe to allow unique index creation on legacy data
+    cur.execute("""
+        DELETE FROM feedback
+        WHERE id IN (
+          SELECT id FROM (
+            SELECT id,
+                   ROW_NUMBER() OVER(
+                     PARTITION BY COALESCE(uid,0), COALESCE(fingerprint,'')
+                     ORDER BY id DESC
+                   ) AS rn
+            FROM feedback
+            WHERE fingerprint IS NOT NULL
+          ) t
+          WHERE t.rn > 1
+        )
+    """)
 
-    # --- indexes (safe, idempotent) ---
+    # Safe to create indexes now that columns exist
     cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_feedback_uid_fp ON feedback(uid, fingerprint)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_fb_sym_tf_acc_ts ON feedback(symbol, tf, accepted, ts)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_fb_uid_ts ON feedback(uid, ts)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_fb_outcome ON feedback(outcome)")
     conn.commit()
-
-    # ---- model tables ----
+        # ---- model tables ----
     cur.execute("""
       CREATE TABLE IF NOT EXISTS calibrations(
         tf TEXT PRIMARY KEY,
@@ -214,8 +197,7 @@ def ensure_feedback_migrations(conn):
     """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_weights_ns_ns ON weights_ns(namespace)")
     conn.commit()
-
-    # ---- per-namespace (symbol|tf) performance counters ----
+        # ---- per-namespace (symbol|tf) performance counters ----
     cur.execute("""
       CREATE TABLE IF NOT EXISTS ns_stats(
         ns TEXT PRIMARY KEY,
@@ -611,27 +593,24 @@ from collections import OrderedDict
 _WINDOW_CACHE = OrderedDict()
 _WINDOW_TTL = 60  # seconds
 _WINDOW_MAX = 64  # entries
-_WCACHE_LOCK = threading.Lock()
 
 def _wcache_get(key):
     now = time.time()
-    with _WCACHE_LOCK:
-        v = _WINDOW_CACHE.get(key)
-        if not v:
-            return None
-        ts, df = v
-        if (now - ts) > _WINDOW_TTL:
-            _WINDOW_CACHE.pop(key, None)
-            return None
-        _WINDOW_CACHE.move_to_end(key)
-        return df.copy()
+    v = _WINDOW_CACHE.get(key)
+    if not v: return None
+    ts, df = v
+    if (now - ts) > _WINDOW_TTL:
+        _WINDOW_CACHE.pop(key, None)
+        return None
+    # move to MRU
+    _WINDOW_CACHE.move_to_end(key)
+    return df.copy()
 
 def _wcache_set(key, df):
-    with _WCACHE_LOCK:
-        _WINDOW_CACHE[key] = (time.time(), df.copy())
-        _WINDOW_CACHE.move_to_end(key)
-        while len(_WINDOW_CACHE) > _WINDOW_MAX:
-            _WINDOW_CACHE.popitem(last=False)
+    _WINDOW_CACHE[key] = (time.time(), df.copy())
+    _WINDOW_CACHE.move_to_end(key)
+    while len(_WINDOW_CACHE) > _WINDOW_MAX:
+        _WINDOW_CACHE.popitem(last=False)
 
 EVAL_STOP_FIRST = bool(int(os.getenv("EVAL_STOP_FIRST", "0")))  # if 1: SL wins ties within same bar
 
@@ -709,8 +688,7 @@ def _tp_hit_first(entry, stop, tps, df, direction: str) -> Tuple[str, float]:
     return first_event, event_pnl
 
 # ----- Indicators -----
-def ema(s: pd.Series, n: int) -> pd.Series:
-    return s.ewm(span=n, adjust=False).mean()
+def ema(s: pd.Series, n: int) -> pd.Series: return s.ewm(span=n, adjust=False).mean()
 def rsi(s: pd.Series, n: int = 14) -> pd.Series:
     d = s.diff(); up = d.clip(lower=0); dn = -d.clip(upper=0)
     rs = ema(up,n) / (ema(dn,n) + 1e-12)
@@ -808,14 +786,7 @@ def build_trade(symbol: str, df: pd.DataFrame, direction: str,
                 risk_pct: float = 1.0, equity: Optional[float] = None, leverage: float = 1.0,
                 market_name: Optional[str] = None) -> Dict[str, Any]:
     ad = _auto_adapter(symbol, market_name)
-
-    # Try to fetch precision metadata from the adapter (ccxt-backed adapters will fill this)
-    precision: Dict[str, Any] = {}
-    try:
-        if hasattr(ad, "precision_for"):
-            precision = ad.precision_for(symbol) or {}
-    except Exception:
-        pass
+    mkt = {}  # only used for ccxt precision metadata in UI; safe empty for yfinance
 
     last  = df.iloc[-1]
     price = float(last["close"])
@@ -842,11 +813,14 @@ def build_trade(symbol: str, df: pd.DataFrame, direction: str,
     risk_amt = None
     if equity and risk_pct:
         risk_amt = float(equity) * (float(risk_pct) / 100.0)
+
+        # risk-based size: leverage should NOT change risk_per_unit
         risk_per_unit = abs(denom)
         qty_raw = risk_amt / max(risk_per_unit, 1e-8)
         qty = float(ad.amount_to_precision(symbol, qty_raw))
         notional = qty * price_p
 
+        # margin uses leverage; risk does not
         levf = max(float(leverage or 1.0), 1.0)
         margin = notional / levf
 
@@ -860,6 +834,7 @@ def build_trade(symbol: str, df: pd.DataFrame, direction: str,
 
         pos = {"qty": qty, "notional": notional, "margin": margin, "leverage": levf}
 
+
     return {
         "direction": direction,
         "entry": price_p,
@@ -867,15 +842,15 @@ def build_trade(symbol: str, df: pd.DataFrame, direction: str,
         "targets": targets,
         "rr": rr,
         "position_size": pos,
-        "risk_amount": risk_amt,
-        "leverage": float(leverage or 1.0),
+        "risk_amount": risk_amt,         # NEW: shows $ at risk
+        "leverage": float(leverage or 1.0),            # handy for UI
         "risk_suggestions": {
             "breakeven_after_tp": 1,
             "trail_after_tp": 2,
             "trail_method": "ATR",
             "trail_multiple": 1.0
         },
-        "precision": precision
+        "precision": mkt.get("precision", {})
     }
 
 def infer_regime(feats: pd.DataFrame) -> str:
@@ -1020,17 +995,16 @@ def evaluate_signal(
     last = feats.iloc[-1]
     turnover = float(last.get("turnover_sma96") or last.get("turnover") or 0.0)
     # scale per-bar threshold to per-hour
-    tf_minutes = 60 if tf == "1h" else 1440 if tf == "1d" else 5 if tf == "5m" else 15 if tf == "15m" else 60
-    min_turnover = TURNOVER_MIN_USD_PER_HR * (tf_minutes / 60.0)
+    tf_minutes = (60 if tf=="1h" else 1440 if tf=="1d" else 5 if tf=="5m" else 15 if tf=="15m" else 60)
+    min_turnover = TURNOVER_MIN_USD_PER_HR * (tf_minutes/60.0)
     liquid_ok = bool(turnover >= min_turnover)
     if not liquid_ok:
         reasons.append(f"turnover ${turnover:,.0f} < ${min_turnover:,.0f} min")
 
-    # For markets where yfinance volume is unreliable (e.g., forex/commodities/stocks),
+    # For markets where yfinance volume is unreliable (e.g., forex),
     # if recent volume is missing/zero, bypass the turnover gate.
     try:
-        eff_market = (market_name or _auto_adapter(symbol, market_name).name.split(":", 1)[0])
-        if eff_market in ("forex", "commodities", "stocks"):
+        if market_name in ("forex", "commodities", "stocks"):
             vol_sum = float(pd.to_numeric(feats["volume"].tail(200), errors="coerce").fillna(0).sum())
             if vol_sum <= 0:
                 liquid_ok = True
@@ -1069,7 +1043,7 @@ def evaluate_signal(
             else:
                 R = float((entry - tp1) / max(1e-9, (stop - entry))) if tp1 else 1.2
             p = float(conf)
-            ev = p * R - (1 - p) * 1.0
+            ev = p*R - (1-p)*1.0
             if ev < EV_MIN:
                 advice = "Skip"
                 reasons.append(f"EV {ev:.2f} < {EV_MIN:.2f}")
@@ -1126,12 +1100,8 @@ def resolve_offer_row(row: sqlite3.Row) -> dict:
     row_map = dict(row)
     df = fetch_ohlcv_window(symbol, tf, created_ts * 1000, expires_ts * 1000, market_name=row_map.get("market"))
 
-    # Guard: if window returned no data, mark as NEITHER to avoid index errors
-    if df is None or df.empty:
-        return {"result": "NEITHER", "pnl": 0.0, "outcome": 0, "resolved_ts": time.time()}
 
     if fallback_only:
-
         created_close = float(df.iloc[0]["close"])
         close = float(df.iloc[-1]["close"])
         if not direction:
@@ -1157,22 +1127,19 @@ def resolve_offer_row(row: sqlite3.Row) -> dict:
 
     return {"result": result, "pnl": float(pnl_frac), "outcome": int(outcome), "resolved_ts": time.time()}
 
+# --- REPLACE: resolve_due_offers with short, per-row lock usage ---
 def resolve_due_offers(limit: int = 50) -> dict:
     """
-    Resolve due offers with minimal lock time and an overall deadline:
+    Resolve due offers with minimal lock time:
       1) read list of rows/ids under lock,
       2) compute outcome without lock,
       3) write each result under lock,
       4) (optionally) insert feedback outside existing locks.
     """
-    t0 = time.time()
-    deadline_ms = int(os.getenv("RESOLVE_DEADLINE_MS", "50000"))  # ~50s (stay under WP 65s)
-    hard_cap    = int(os.getenv("RESOLVE_LIMIT_MAX", "15"))       # clamp per call
     now = time.time()
     done = good = bad = 0
 
-    # 1) Read candidates under lock (respect cap)
-    lim = min(int(limit), hard_cap)
+    # 1) Read candidates under lock
     with _db_lock:
         conn = _db()
         conn.row_factory = sqlite3.Row
@@ -1181,16 +1148,12 @@ def resolve_due_offers(limit: int = 50) -> dict:
             "features, equity, risk_pct, leverage, created_ts, expires_ts "
             "FROM offers WHERE resolved=0 AND expires_ts<=? "
             "ORDER BY expires_ts ASC LIMIT ?",
-            (now, lim),
+            (now, int(limit)),
         ).fetchall()
         conn.close()
 
     # 2..4) For each row, compute (no lock) then write (lock) then log feedback (locks internally)
     for row in rows:
-        # Respect overall deadline
-        if (time.time() - t0) * 1000 > deadline_ms:
-            break
-
         try:
             upd = resolve_offer_row(row)  # network/CPU: NO DB LOCK HERE
         except Exception:
@@ -1230,11 +1193,6 @@ class Instrument(BaseModel):
 @app.get("/healthz", include_in_schema=False)
 def healthz():
     return PlainTextResponse("ok")
-
-@app.get("/health", include_in_schema=False)
-def health():
-    return PlainTextResponse("ok")
-
 
 @app.middleware("http")
 async def _log_requests(request, call_next):
@@ -1316,21 +1274,9 @@ def signals(
         res["confidence"] = apply_calibration(tf, biased)
 
 
-        # Keep filter in sync using the calibrated confidence
-        # Keep filter in sync using the calibrated confidence and the same threshold we evaluated with (mc)
-        thr = float(mc)
-        if isinstance(res.get("filters"), dict):
-            res["filters"]["confidence_ok"] = (res["confidence"] >= thr)
-            # If calibration lowered confidence, downgrade advice
-            if res.get("advice") == "Consider" and not res["filters"]["confidence_ok"]:
-                res["advice"] = "Skip"
-            # If calibration raised confidence above threshold and other gates are OK (and EV/LB didn't veto), upgrade advice
-            if res.get("advice") == "Skip" and res["filters"]["confidence_ok"] and res["filters"].get("vol_ok") and res["filters"].get("liquid_ok"):
-                reasons = res.get("filters", {}).get("reasons", [])
-                ev_or_lb_block = any(isinstance(r, str) and (r.startswith("EV ") or r.startswith("LB ")) for r in reasons)
-                dir_ok = res.get("signal") in ("Bullish","Bearish")
-                if dir_ok and not ev_or_lb_block:
-                    res["advice"] = "Consider"
+        # Keep filter in sync with the threshold if provided
+        if isinstance(res.get("filters"), dict) and min_confidence is not None:
+            res["filters"]["confidence_ok"] = (res["confidence"] >= float(min_confidence))
 
         # Include market for convenient round-trip to /chart
         resolved_market = market or _auto_adapter(symbol, market).name.split(":", 1)[0]
@@ -1360,18 +1306,12 @@ def scan(
     market: Optional[str] = Query(None),
     _: None = Depends(require_key)
 ):
-    # Hard time budget so we don't exceed upstream proxy limits
-    SCAN_DEADLINE_MS = int(os.getenv("SCAN_DEADLINE_MS", "30000"))
-    t0 = time.time()
     # Per-market scan caps to keep ccxt routes under the WP 65s proxy timeout
     MARKET_SCAN_CAP = {
         "crypto":   int(os.getenv("TOP_N_CRYPTO",  "12")),
         "futures":  int(os.getenv("TOP_N_FUTURES", "12")),   # binance_perps is treated as 'futures'
     }
     mkey = (market or "crypto").split(":", 1)[0]
-    # normalize futures aliases so caps apply
-    if mkey in ("binance_perps", "binance"):
-        mkey = "futures"
     eff_limit = min(limit, MARKET_SCAN_CAP.get(mkey, limit))
 
     uni = get_universe(limit=eff_limit, market_name=market)
@@ -1379,9 +1319,6 @@ def scan(
 
     for it in uni:
         try:
-            # Respect time budget
-            if (time.time() - t0) * 1000 > SCAN_DEADLINE_MS:
-                break
             mc = (min_confidence if min_confidence is not None else MIN_CONFIDENCE)
             if precision:
                 mc = min(1.0, mc + 0.05)
@@ -1400,25 +1337,12 @@ def scan(
             biased = apply_feedback_bias(base_conf, feats_map, s["symbol"], s["timeframe"])
             s["confidence"] = apply_calibration(tf, biased)
 
-            # Re-evaluate threshold using calibrated confidence and same threshold used (mc)
-            thr = float(mc)
-            if isinstance(s.get("filters"), dict):
-                s["filters"]["confidence_ok"] = (s["confidence"] >= thr)
-                # Downgrade if calibration lowered confidence below threshold
-                if s.get("advice") == "Consider" and not s["filters"]["confidence_ok"]:
-                    s["advice"] = "Skip"
-                # Upgrade if calibration raised confidence above threshold and all other gates are OK (unless EV/LB vetoed)
-                if s.get("advice") == "Skip" and s["filters"]["confidence_ok"] and s["filters"].get("vol_ok") and s["filters"].get("liquid_ok"):
-                    reasons = s.get("filters", {}).get("reasons", [])
-                    ev_or_lb_block = any(isinstance(r, str) and (r.startswith("EV ") or r.startswith("LB ")) for r in reasons)
-                    dir_ok = (s.get("signal") in ("Bullish","Bearish")) or bool(allow_neutral)
-                    if dir_ok and not ev_or_lb_block:
-                        s["advice"] = "Consider"
+            if isinstance(s.get("filters"), dict) and (min_confidence is not None):
+                s["filters"]["confidence_ok"] = (s["confidence"] >= float(min_confidence))
 
             s["market"] = it["market"]
             if s["advice"] == "Consider":
                 ok.append(s)
-
             results.append(s)
         except HTTPException as he:
             results.append({
@@ -1443,10 +1367,9 @@ def scan(
 
     out: List[Dict[str, Any]] = []
     for s in topK:
-        # [main.py] // SCAN: reuse same cached OHLCV to avoid a second ccxt call
         if include_chart:
             try:
-                df = fetch_ohlcv(s["symbol"], tf, bars=400, market_name=market or s.get("market"))
+                df = fetch_ohlcv(s["symbol"], tf, bars=160, market_name=market or s.get("market"))
                 s["chart"] = {"closes": pd.to_numeric(df["close"], errors="coerce").tail(120).dropna().astype(float).to_list()}
             except Exception:
                 s["chart"] = None
@@ -1608,45 +1531,14 @@ def feedback_summary(symbol: str, tf: str, direction: Optional[str] = None, wind
 
 @app.get("/feedback/stats")
 def feedback_stats():
-    """
-    Faster, single-pass aggregates + defensive casting.
-    Avoids multiple table scans and is resilient if tables are empty.
-    """
-    try:
-        with _db_lock:
-            conn = _db()
-            try:
-                r = conn.execute("""
-                    SELECT
-                      COUNT(*)                                        AS total,
-                      SUM(CASE WHEN outcome= 1 THEN 1 ELSE 0 END)     AS good,
-                      SUM(CASE WHEN outcome=-1 THEN 1 ELSE 0 END)     AS bad
-                    FROM feedback
-                """).fetchone()
-                total = int(r[0] or 0)
-                good  = int(r[1] or 0)
-                bad   = int(r[2] or 0)
-
-                rows = conn.execute("""
-                  SELECT feature, w
-                  FROM weights
-                  ORDER BY ABS(w) DESC
-                  LIMIT 24
-                """).fetchall()
-                W = {}
-                for k, v in rows or []:
-                    if k is not None and v is not None:
-                        try:
-                            W[str(k)] = float(v)
-                        except Exception:
-                            continue
-            finally:
-                conn.close()
-        return {"total": total, "good": good, "bad": bad, "weights": W}
-    except Exception as e:
-        # Never hard-fail this endpoint; return safe defaults
-        print("FEEDBACK_STATS_ERROR:", repr(e))
-        return {"total": 0, "good": 0, "bad": 0, "weights": {}}
+    with _db_lock:
+        conn = _db()
+        total = conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0]
+        good  = conn.execute("SELECT COUNT(*) FROM feedback WHERE outcome=1").fetchone()[0]
+        bad   = conn.execute("SELECT COUNT(*) FROM feedback WHERE outcome=-1").fetchone()[0]
+        W = {k: v for k, v in conn.execute("SELECT feature, w FROM weights ORDER BY ABS(w) DESC LIMIT 24")}
+        conn.close()
+    return {"total": total, "good": good, "bad": bad, "weights": W}
 
 @app.post("/learning/offered")
 def learning_offered(batch: OffersBatch, request: Request, _: None = Depends(require_key)):
@@ -1746,18 +1638,17 @@ def learning_stats(_: None = Depends(require_key)):
 
 @app.get("/learning/config")
 def learning_config(_: None = Depends(require_key)):
-    # Small helper so the frontend knows how long to 'hold' before resolution.
-    cfg = {
+    """Small helper so the frontend knows how long to ‘hold’ before resolution."""
+    return {
         "hold_secs": {
             "5m": HOLD_5M_SECS,
             "15m": HOLD_15M_SECS,
             "1h": HOLD_1H_SECS,
-            "1d": HOLD_1D_SECS,
+            "1d": HOLD_1D_SECS
         },
         "bg_interval": BG_INTERVAL,
         "eval_stop_first": bool(EVAL_STOP_FIRST),
     }
-    return cfg
 
 # ========= TRACKED TRADES (for mobile app) =========
 from fastapi import Body
@@ -1863,61 +1754,6 @@ def tracked_delete_path(id: str, x_user_id: Optional[int] = Header(None), _: Non
         conn.commit()
         conn.close()
     return _tracked_list_for(uid)
-
-# ----- Admin / maintenance (secure) -----
-
-@app.post("/admin/feedback/purge")
-def admin_feedback_purge(_: None = Depends(require_key)):
-    """
-    Hard-delete all learning data (feedback + weights) and VACUUM.
-    Use sparingly. Returns counts deleted.
-    """
-    with _db_lock:
-        conn = _db()
-        try:
-            cur = conn.cursor()
-            cur.execute("SELECT COUNT(*) FROM feedback")
-            n_fb = int(cur.fetchone()[0] or 0)
-            cur.execute("SELECT COUNT(*) FROM weights")
-            n_wt = int(cur.fetchone()[0] or 0)
-
-            cur.execute("DELETE FROM feedback")
-            cur.execute("DELETE FROM weights")
-            conn.commit()
-        finally:
-            conn.close()
-
-    # Separate VACUUM (outside the open connection)
-    with _db_lock:
-        conn2 = _db()
-        try:
-            conn2.execute("VACUUM")
-        finally:
-            conn2.close()
-
-    return {"ok": True, "deleted_feedback": n_fb, "deleted_weights": n_wt}
-
-@app.post("/admin/feedback/vacuum")
-def admin_feedback_vacuum(_: None = Depends(require_key)):
-    """
-    Compact the DB without deleting rows. Safe to run anytime.
-    """
-    with _db_lock:
-        conn = _db()
-        try:
-            conn.execute("VACUUM")
-        finally:
-            conn.close()
-    return {"ok": True}
-
-@app.on_event("startup")
-def warmup_markets():
-    try:
-        from adapters import get_adapter
-        get_adapter("crypto").list_universe(limit=1)
-        print("Exchange markets preloaded.")
-    except Exception as e:
-        print("Warmup failed:", e)
 
 # ---- Learning: record a feedback row from an offer resolution ----
 def _record_feedback_from_offer(offer: Dict[str, Any], outcome: int, resolved_ts: float, pnl: Optional[float] = None):
