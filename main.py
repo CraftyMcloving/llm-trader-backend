@@ -18,9 +18,15 @@ app = FastAPI(title="AI Trade Advisor API", version="2025.09")
 
 origins_env = os.getenv("ALLOWED_ORIGINS", "*")
 origins = ["*"] if origins_env == "*" else [o.strip() for o in origins_env.split(",") if o.strip()]
+allowed = [
+    "https://craftyalpha.com",
+    "https://www.craftyalpha.com",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=allowed,
     allow_methods=["*"],
     allow_headers=["*"],
     allow_credentials=True,
@@ -603,24 +609,27 @@ from collections import OrderedDict
 _WINDOW_CACHE = OrderedDict()
 _WINDOW_TTL = 60  # seconds
 _WINDOW_MAX = 64  # entries
+_WCACHE_LOCK = threading.Lock()
 
 def _wcache_get(key):
     now = time.time()
-    v = _WINDOW_CACHE.get(key)
-    if not v: return None
-    ts, df = v
-    if (now - ts) > _WINDOW_TTL:
-        _WINDOW_CACHE.pop(key, None)
-        return None
-    # move to MRU
-    _WINDOW_CACHE.move_to_end(key)
-    return df.copy()
+    with _WCACHE_LOCK:
+        v = _WINDOW_CACHE.get(key)
+        if not v:
+            return None
+        ts, df = v
+        if (now - ts) > _WINDOW_TTL:
+            _WINDOW_CACHE.pop(key, None)
+            return None
+        _WINDOW_CACHE.move_to_end(key)
+        return df.copy()
 
 def _wcache_set(key, df):
-    _WINDOW_CACHE[key] = (time.time(), df.copy())
-    _WINDOW_CACHE.move_to_end(key)
-    while len(_WINDOW_CACHE) > _WINDOW_MAX:
-        _WINDOW_CACHE.popitem(last=False)
+    with _WCACHE_LOCK:
+        _WINDOW_CACHE[key] = (time.time(), df.copy())
+        _WINDOW_CACHE.move_to_end(key)
+        while len(_WINDOW_CACHE) > _WINDOW_MAX:
+            _WINDOW_CACHE.popitem(last=False)
 
 EVAL_STOP_FIRST = bool(int(os.getenv("EVAL_STOP_FIRST", "0")))  # if 1: SL wins ties within same bar
 
@@ -796,7 +805,14 @@ def build_trade(symbol: str, df: pd.DataFrame, direction: str,
                 risk_pct: float = 1.0, equity: Optional[float] = None, leverage: float = 1.0,
                 market_name: Optional[str] = None) -> Dict[str, Any]:
     ad = _auto_adapter(symbol, market_name)
-    mkt = {}  # only used for ccxt precision metadata in UI; safe empty for yfinance
+
+    # Try to fetch precision metadata from the adapter (ccxt-backed adapters will fill this)
+    precision: Dict[str, Any] = {}
+    try:
+        if hasattr(ad, "precision_for"):
+            precision = ad.precision_for(symbol) or {}
+    except Exception:
+        pass
 
     last  = df.iloc[-1]
     price = float(last["close"])
@@ -823,14 +839,11 @@ def build_trade(symbol: str, df: pd.DataFrame, direction: str,
     risk_amt = None
     if equity and risk_pct:
         risk_amt = float(equity) * (float(risk_pct) / 100.0)
-
-        # risk-based size: leverage should NOT change risk_per_unit
         risk_per_unit = abs(denom)
         qty_raw = risk_amt / max(risk_per_unit, 1e-8)
         qty = float(ad.amount_to_precision(symbol, qty_raw))
         notional = qty * price_p
 
-        # margin uses leverage; risk does not
         levf = max(float(leverage or 1.0), 1.0)
         margin = notional / levf
 
@@ -844,7 +857,6 @@ def build_trade(symbol: str, df: pd.DataFrame, direction: str,
 
         pos = {"qty": qty, "notional": notional, "margin": margin, "leverage": levf}
 
-
     return {
         "direction": direction,
         "entry": price_p,
@@ -852,15 +864,15 @@ def build_trade(symbol: str, df: pd.DataFrame, direction: str,
         "targets": targets,
         "rr": rr,
         "position_size": pos,
-        "risk_amount": risk_amt,         # NEW: shows $ at risk
-        "leverage": float(leverage or 1.0),            # handy for UI
+        "risk_amount": risk_amt,
+        "leverage": float(leverage or 1.0),
         "risk_suggestions": {
             "breakeven_after_tp": 1,
             "trail_after_tp": 2,
             "trail_method": "ATR",
             "trail_multiple": 1.0
         },
-        "precision": mkt.get("precision", {})
+        "precision": precision
     }
 
 def infer_regime(feats: pd.DataFrame) -> str:
@@ -1012,17 +1024,18 @@ def evaluate_signal(
         reasons.append(f"turnover ${turnover:,.0f} < ${min_turnover:,.0f} min")
 
     # For markets where yfinance volume is unreliable (e.g., forex),
-    # if recent volume is missing/zero, bypass the turnover gate.
-    try:
-        if market_name in ("forex", "commodities", "stocks"):
-            vol_sum = float(pd.to_numeric(feats["volume"].tail(200), errors="coerce").fillna(0).sum())
-            if vol_sum <= 0:
-                liquid_ok = True
-                reasons = [r for r in reasons if "turnover" not in r.lower()]
-    except Exception:
-        # If we can't assess volume reliably, don't block the signal on liquidity.
-        liquid_ok = True
-        reasons = [r for r in reasons if "turnover" not in r.lower()]
+# if recent volume is missing/zero, bypass the turnover gate.
+try:
+    eff_market = (market_name or _auto_adapter(symbol, market_name).name.split(":", 1)[0])
+    if eff_market in ("forex", "commodities", "stocks"):
+        vol_sum = float(pd.to_numeric(feats["volume"].tail(200), errors="coerce").fillna(0).sum())
+        if vol_sum <= 0:
+            liquid_ok = True
+            reasons = [r for r in reasons if "turnover" not in r.lower()]
+except Exception:
+    # If we can't assess volume reliably, don't block the signal on liquidity.
+    liquid_ok = True
+    reasons = [r for r in reasons if "turnover" not in r.lower()]
 
     trade = None
     advice = "Skip"
@@ -1109,6 +1122,10 @@ def resolve_offer_row(row: sqlite3.Row) -> dict:
 
     row_map = dict(row)
     df = fetch_ohlcv_window(symbol, tf, created_ts * 1000, expires_ts * 1000, market_name=row_map.get("market"))
+    # Guard: if window returned no data, mark as NEITHER to avoid index errors
+if df is None or df.empty:
+    return {"result": "NEITHER", "pnl": 0.0, "outcome": 0, "resolved_ts": time.time()}
+
 
 
     if fallback_only:
@@ -1204,6 +1221,11 @@ class Instrument(BaseModel):
 def healthz():
     return PlainTextResponse("ok")
 
+@app.get("/health", include_in_schema=False)
+def health():
+    return PlainTextResponse("ok")
+
+
 @app.middleware("http")
 async def _log_requests(request, call_next):
     if request.url.path in ("/healthz", "/health"):
@@ -1284,9 +1306,21 @@ def signals(
         res["confidence"] = apply_calibration(tf, biased)
 
 
-        # Keep filter in sync with the threshold if provided
-        if isinstance(res.get("filters"), dict) and min_confidence is not None:
-            res["filters"]["confidence_ok"] = (res["confidence"] >= float(min_confidence))
+        # Keep filter in sync using the calibrated confidence
+        # Keep filter in sync using the calibrated confidence and the same threshold we evaluated with (mc)
+        thr = float(mc)
+        if isinstance(res.get("filters"), dict):
+            res["filters"]["confidence_ok"] = (res["confidence"] >= thr)
+            # If calibration lowered confidence, downgrade advice
+            if res.get("advice") == "Consider" and not res["filters"]["confidence_ok"]:
+                res["advice"] = "Skip"
+            # If calibration raised confidence above threshold and other gates are OK (and EV/LB didn't veto), upgrade advice
+            if res.get("advice") == "Skip" and res["filters"]["confidence_ok"] and res["filters"].get("vol_ok") and res["filters"].get("liquid_ok"):
+                reasons = res.get("filters", {}).get("reasons", [])
+                ev_or_lb_block = any(isinstance(r, str) and (r.startswith("EV ") or r.startswith("LB ")) for r in reasons)
+                dir_ok = res.get("signal") in ("Bullish","Bearish")
+                if dir_ok and not ev_or_lb_block:
+                    res["advice"] = "Consider"
 
         # Include market for convenient round-trip to /chart
         resolved_market = market or _auto_adapter(symbol, market).name.split(":", 1)[0]
@@ -1325,6 +1359,9 @@ def scan(
         "futures":  int(os.getenv("TOP_N_FUTURES", "12")),   # binance_perps is treated as 'futures'
     }
     mkey = (market or "crypto").split(":", 1)[0]
+    # normalize futures aliases so caps apply
+    if mkey in ("binance_perps", "binance"):
+        mkey = "futures"
     eff_limit = min(limit, MARKET_SCAN_CAP.get(mkey, limit))
 
     uni = get_universe(limit=eff_limit, market_name=market)
@@ -1353,12 +1390,25 @@ def scan(
             biased = apply_feedback_bias(base_conf, feats_map, s["symbol"], s["timeframe"])
             s["confidence"] = apply_calibration(tf, biased)
 
-            if isinstance(s.get("filters"), dict) and (min_confidence is not None):
-                s["filters"]["confidence_ok"] = (s["confidence"] >= float(min_confidence))
+            # Re-evaluate threshold using calibrated confidence and same threshold used (mc)
+            thr = float(mc)
+            if isinstance(s.get("filters"), dict):
+                s["filters"]["confidence_ok"] = (s["confidence"] >= thr)
+                # Downgrade if calibration lowered confidence below threshold
+                if s.get("advice") == "Consider" and not s["filters"]["confidence_ok"]:
+                    s["advice"] = "Skip"
+                # Upgrade if calibration raised confidence above threshold and all other gates are OK (unless EV/LB vetoed)
+                if s.get("advice") == "Skip" and s["filters"]["confidence_ok"] and s["filters"].get("vol_ok") and s["filters"].get("liquid_ok"):
+                    reasons = s.get("filters", {}).get("reasons", [])
+                    ev_or_lb_block = any(isinstance(r, str) and (r.startswith("EV ") or r.startswith("LB ")) for r in reasons)
+                    dir_ok = (s.get("signal") in ("Bullish","Bearish")) or bool(allow_neutral)
+                    if dir_ok and not ev_or_lb_block:
+                        s["advice"] = "Consider"
 
             s["market"] = it["market"]
             if s["advice"] == "Consider":
                 ok.append(s)
+
             results.append(s)
         except HTTPException as he:
             results.append({
