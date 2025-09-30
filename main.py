@@ -50,7 +50,7 @@ def require_key(
 # ----- Exchange (Kraken) -----
 EXCHANGE_ID = os.getenv("EXCHANGE", "kraken")
 QUOTE = os.getenv("QUOTE", "USD")
-TOP_N = int(os.getenv("TOP_N", "30"))
+TOP_N = int(os.getenv("TOP_N", "12"))
 
 _ex = None
 def get_exchange():
