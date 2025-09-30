@@ -142,6 +142,7 @@ def init_feedback_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_offers_created ON offers(created_ts);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_offers_resolved ON offers(resolved, expires_ts);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_offers_exp ON offers(expires_ts);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_fb_outcome ON feedback(outcome)")
         conn.commit()
         conn.close()
 
@@ -191,6 +192,7 @@ def ensure_feedback_migrations(conn):
     cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_feedback_uid_fp ON feedback(uid, fingerprint)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_fb_sym_tf_acc_ts ON feedback(symbol, tf, accepted, ts)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_fb_uid_ts ON feedback(uid, ts)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_fb_outcome ON feedback(outcome)")
     conn.commit()
 
     # ---- model tables ----
@@ -1359,7 +1361,7 @@ def scan(
     _: None = Depends(require_key)
 ):
     # Hard time budget so we don't exceed upstream proxy limits
-    SCAN_DEADLINE_MS = int(os.getenv("SCAN_DEADLINE_MS", "55000"))
+    SCAN_DEADLINE_MS = int(os.getenv("SCAN_DEADLINE_MS", "30000"))
     t0 = time.time()
     # Per-market scan caps to keep ccxt routes under the WP 65s proxy timeout
     MARKET_SCAN_CAP = {
@@ -1610,18 +1612,28 @@ def feedback_stats():
         with _db_lock:
             conn = _db()
             try:
-                r = conn.execute("SELECT COUNT(*) FROM feedback").fetchone()
-                total = int(r[0]) if r and r[0] is not None else 0
+                # Single pass: total, good, bad
+                r = conn.execute(
+                    """
+                    SELECT
+                      COUNT(*) AS total,
+                      SUM(CASE WHEN outcome = 1  THEN 1 ELSE 0 END) AS good,
+                      SUM(CASE WHEN outcome = -1 THEN 1 ELSE 0 END) AS bad
+                    FROM feedback
+                    """
+                ).fetchone()
 
-                r = conn.execute("SELECT COUNT(*) FROM feedback WHERE outcome=1").fetchone()
-                good = int(r[0]) if r and r[0] is not None else 0
-
-                r = conn.execute("SELECT COUNT(*) FROM feedback WHERE outcome=-1").fetchone()
-                bad = int(r[0]) if r and r[0] is not None else 0
+                if r:
+                    total = int(r[0] or 0)
+                    good  = int(r[1] or 0)
+                    bad   = int(r[2] or 0)
+                else:
+                    total = good = bad = 0
 
                 rows = conn.execute(
                     "SELECT feature, w FROM weights ORDER BY ABS(w) DESC LIMIT 24"
                 ).fetchall()
+
                 # Cast for JSON safety
                 W = {}
                 for k, v in rows or []:
@@ -1853,6 +1865,15 @@ def tracked_delete_path(id: str, x_user_id: Optional[int] = Header(None), _: Non
         conn.commit()
         conn.close()
     return _tracked_list_for(uid)
+
+@app.on_event("startup")
+def warmup_markets():
+    try:
+        from adapters import get_adapter
+        get_adapter("crypto").list_universe(limit=1)
+        print("Exchange markets preloaded.")
+    except Exception as e:
+        print("Warmup failed:", e)
 
 # ---- Learning: record a feedback row from an offer resolution ----
 def _record_feedback_from_offer(offer: Dict[str, Any], outcome: int, resolved_ts: float, pnl: Optional[float] = None):
