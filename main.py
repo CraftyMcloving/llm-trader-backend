@@ -85,6 +85,10 @@ _db_lock = threading.RLock()
 def _db():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA temp_store=MEMORY;")
+    conn.execute("PRAGMA mmap_size=300000000;")   # ~300MB if available (no-op if not)
+    conn.execute("PRAGMA cache_size=-20000;")     # ~20MB page cache
     return conn
 
 def init_feedback_db():
@@ -1323,7 +1327,7 @@ def signals(
 @app.get("/scan")
 def scan(
     tf: str = Query("1h"),
-    limit: int = Query(20, ge=1, le=50),                # universe size to scan
+    limit: int = Query(18, ge=1, le=50),                # universe size to scan
     top: int = Query(6, ge=1, le=12),                  # how many results to return
     allow_neutral: int = Query(0, ge=0, le=1),
     ignore_trend: int = Query(0, ge=0, le=1),
@@ -1687,6 +1691,44 @@ def learning_config(_: None = Depends(require_key)):
         "bg_interval": BG_INTERVAL,
         "eval_stop_first": bool(EVAL_STOP_FIRST),
     }
+
+# === FX helper endpoint (USD/EUR/GBP) ===
+from typing import Set
+
+@app.get("/fx")
+def fx(base: str = "USD", _: None = Depends(require_key)):
+    """
+    Return simple FX map for front-end display/sizing.
+    Output format: {"base": "USD", "rates": {"EUR": <EUR per USD>, "GBP": <GBP per USD>}, "ts": <epoch_ms>}
+    """
+    base = (base or "USD").upper()
+    want: Set[str] = {"EUR", "GBP"}
+
+    # Use the existing Yahoo/forex adapter so we don't add new deps here.
+    def _last_px(ticker: str) -> float:
+        df = fetch_ohlcv(ticker, "1h", bars=2, market_name="forex")
+        return float(df["close"].iloc[-1])
+
+    rates = {}
+    for iso in want:
+        if iso == base:
+            rates[iso] = 1.0
+            continue
+        rate = None
+        # Prefer direct "BASEISO=X" (ISO per BASE) if Yahoo supports it, otherwise invert "ISOBASE=X"
+        try:
+            rate = _last_px(f"{base}{iso}=X")
+        except Exception:
+            try:
+                inv = _last_px(f"{iso}{base}=X")  # USD per ISO (if base=USD)
+                if inv and inv > 0:
+                    rate = 1.0 / float(inv)
+            except Exception:
+                pass
+        if rate is not None:
+            rates[iso] = float(rate)
+
+    return {"base": base, "rates": rates, "ts": int(time.time() * 1000)}
 
 # ========= TRACKED TRADES (for mobile app) =========
 from fastapi import Body
