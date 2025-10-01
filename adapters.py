@@ -100,7 +100,7 @@ class CryptoCCXT(BaseAdapter):
         limit = int(limit or 20)
 
         # Optional hard cap from env (keeps scans snappy)
-        hard_cap = int(os.getenv("CRYPTO_UNIVERSE_CAP", "12"))
+        hard_cap = int(os.getenv("CRYPTO_UNIVERSE_CAP", "18"))
 
         m = self._load_markets()
         avail: List[str] = []
