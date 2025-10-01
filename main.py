@@ -760,6 +760,20 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     out["turnover"] = (out["close"] * out["volume"]).replace([np.inf, -np.inf], np.nan)
     out["turnover_sma96"] = out["turnover"].rolling(96).mean()
 
+    # === Additional indicators ===
+    # Momentum: percentage change over 10 bars (longer horizon than ret5)
+    out["momentum"] = out["close"].pct_change(10)
+    # Bollinger band width: normalized width of the Bollinger Bands (upper – lower) / mid.
+    out["bb_width"] = (4.0 * out["bb_std"] / out["bb_mid"]).replace([np.inf, -np.inf], np.nan)
+    # MACD and related: compute standard MACD (12, 26) with a 9‑period signal line.
+    ema12 = out["close"].ewm(span=12, adjust=False).mean()
+    ema26 = out["close"].ewm(span=26, adjust=False).mean()
+    macd_line = ema12 - ema26
+    macd_signal = macd_line.ewm(span=9, adjust=False).mean()
+    out["macd"] = macd_line
+    out["macd_signal"] = macd_signal
+    out["macd_hist"] = macd_line - macd_signal
+
     return out
 
 def last_features_snapshot(feats: pd.DataFrame) -> Dict[str, float]:
@@ -769,8 +783,10 @@ def last_features_snapshot(feats: pd.DataFrame) -> Dict[str, float]:
     """
     row = feats.iloc[-1]
     keys = [
-        "rsi14","atr_pct","ret5","slope20","bb_pos",
-        "turnover","turnover_sma96",
+        "rsi14", "atr_pct", "ret5", "slope20", "bb_pos",
+        "turnover", "turnover_sma96",
+        # additional indicators: momentum (10), Bollinger width, MACD line/histogram
+        "momentum", "bb_width", "macd", "macd_hist",
     ]
     out: Dict[str, float] = {}
     for k in keys:
@@ -1354,8 +1370,13 @@ def scan(
 
             if isinstance(s.get("filters"), dict) and (min_confidence is not None):
                 s["filters"]["confidence_ok"] = (s["confidence"] >= float(min_confidence))
-
+                
             s["market"] = it["market"]
+            # Attach a human-friendly name for UI purposes (fallback to symbol if missing)
+            try:
+                s["name"] = it.get("name", it["symbol"])
+            except Exception:
+                s["name"] = it["symbol"]
             if s["advice"] == "Consider":
                 ok.append(s)
             results.append(s)
@@ -1365,7 +1386,8 @@ def scan(
                 "confidence": 0.0, "updated": pd.Timestamp.utcnow().isoformat(),
                 "trade": None,
                 "filters": {"trend_ok": False, "vol_ok": False, "confidence_ok": False, "reasons": [he.detail]},
-                "advice": "Skip", "market": it["market"]
+                "advice": "Skip", "market": it["market"],
+                "name": it.get("name", it["symbol"])
             })
         except Exception as e:
             results.append({
@@ -1373,7 +1395,8 @@ def scan(
                 "confidence": 0.0, "updated": pd.Timestamp.utcnow().isoformat(),
                 "trade": None,
                 "filters": {"trend_ok": False, "vol_ok": False, "confidence_ok": False, "reasons": [f"exception: {e}"]},
-                "advice": "Skip", "market": it["market"]
+                "advice": "Skip", "market": it["market"],
+                "name": it.get("name", it["symbol"])
             })
 
     pool = ok if ok else results
