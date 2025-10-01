@@ -50,7 +50,7 @@ def require_key(
 # ----- Exchange (Kraken) -----
 EXCHANGE_ID = os.getenv("EXCHANGE", "kraken")
 QUOTE = os.getenv("QUOTE", "USD")
-TOP_N = int(os.getenv("TOP_N", "12"))
+TOP_N = int(os.getenv("TOP_N", "18"))
 
 _ex = None
 def get_exchange():
@@ -1339,8 +1339,8 @@ def scan(
 ):
     # Per-market scan caps to keep ccxt routes under the WP 65s proxy timeout
     MARKET_SCAN_CAP = {
-        "crypto":   int(os.getenv("TOP_N_CRYPTO",  "12")),
-        "futures":  int(os.getenv("TOP_N_FUTURES", "12")),   # binance_perps is treated as 'futures'
+        "crypto":   int(os.getenv("TOP_N_CRYPTO",  "18")),
+        "futures":  int(os.getenv("TOP_N_FUTURES", "18")),   # binance_perps is treated as 'futures'
     }
     mkey = (market or "crypto").split(":", 1)[0]
     eff_limit = min(limit, MARKET_SCAN_CAP.get(mkey, limit))
