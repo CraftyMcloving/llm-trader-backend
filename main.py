@@ -79,8 +79,8 @@ def load_markets():
 
 
 # ========= FEEDBACK STORAGE & ONLINE WEIGHTS =========
-DB_PATH = os.getenv("FEEDBACK_DB", "/tmp/ai_trade_feedback.db")
-_db_lock = threading.Lock()
+DB_PATH = os.getenv("FEEDBACK_DB", "ai_trade_feedback.db")
+_db_lock = threading.RLock()
 
 def _db():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -392,19 +392,20 @@ def apply_calibration(tf: str, p: float) -> float:
 def _ns(symbol: str, tf: str) -> str:
     return f"{symbol}|{tf}"
 
-def get_weights_ns(symbol: str, tf: str) -> Dict[str, float]:
-    ns_sym = _ns(symbol, tf)
-    ns_tf  = f"*|{tf}"
-    W = {}
+    # Build weights in order of increasing specificity (global → timeframe-level → symbol-level),
+    # allowing later assignments to override earlier ones.  We always include global weights
+    # so that features missing at the namespace level fall back to a sensible base.
     with _db_lock:
         conn = _db()
-        for ns in (ns_tf, ns_sym):
-            for k,v in conn.execute("SELECT feature, w FROM weights_ns WHERE namespace=?", (ns,)):
-                W.setdefault(k, float(v))   # keep more specific later if we flip order
-        # final fallback to global table if nothing yet
-        if not W:
-            for k,v in conn.execute("SELECT feature, w FROM weights"):
-                W[k] = float(v)
+        # Global base weights
+        for k, v in conn.execute("SELECT feature, w FROM weights"):
+            W[k] = float(v)
+        # Timeframe-level overrides (e.g. "*|1h")
+        for k, v in conn.execute("SELECT feature, w FROM weights_ns WHERE namespace=?", (ns_tf,)):
+            W[k] = float(v)
+        # Symbol-specific overrides (e.g. "BTC/USD|1h")
+        for k, v in conn.execute("SELECT feature, w FROM weights_ns WHERE namespace=?", (ns_sym,)):
+            W[k] = float(v)
         conn.close()
     return W
 
@@ -443,18 +444,32 @@ def ns_stats_get(symbol: str, tf: str) -> Tuple[int,int]:
     return (int(row[0]), int(row[1]))
 
 def ns_stats_update(symbol: str, tf: str, outcome: int):
-    if outcome == 0: return
+    """
+    Incrementally update per-namespace win/total counters.
+    This uses a single SQL statement with arithmetic increments to avoid
+    reading the existing row under the same lock (which can deadlock
+    with non-reentrant locks).  The update inserts a row if missing,
+    otherwise adds to the existing counts.
+    """
+    if outcome == 0:
+        return
+    inc_win = 1 if outcome > 0 else 0
+    inc_total = 1
+    now_ts = time.time()
     with _db_lock:
         conn = _db()
-        wins,total = ns_stats_get(symbol, tf)
-        wins  = wins + (1 if outcome>0 else 0)
-        total = total + 1
         conn.execute(
-          "INSERT INTO ns_stats(ns,wins,total,updated_ts) VALUES(?,?,?,?) "
-          "ON CONFLICT(ns) DO UPDATE SET wins=?, total=?, updated_ts=?",
-          (_ns(symbol, tf), wins, total, time.time(), wins, total, time.time())
+            """
+            INSERT INTO ns_stats(ns, wins, total, updated_ts) VALUES(?, ?, ?, ?)
+            ON CONFLICT(ns) DO UPDATE SET
+              wins = wins + ?,
+              total = total + ?,
+              updated_ts = excluded.updated_ts
+            """,
+            (_ns(symbol, tf), inc_win, inc_total, now_ts, inc_win, inc_total)
         )
-        conn.commit(); conn.close()
+        conn.commit()
+        conn.close()
 
 def wilson_lb(wins: int, total: int, z: float = 1.96) -> float:
     if total <= 0: return 0.0
