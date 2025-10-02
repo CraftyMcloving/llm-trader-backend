@@ -370,6 +370,7 @@ class MixedTopTradedAdapter(BaseAdapter):
 
         self.mode   = (mode or os.getenv("TOPTRADED_MODE", "balanced")).lower()
         self.metric = (metric or os.getenv("TOPTRADED_METRIC", "auto")).lower()
+        self.name = f"top_traded:{self.mode}"
         self.cache_ttl = int(cache_ttl or os.getenv("TOPTRADED_CACHE_TTL", "600"))
         self._cache: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
 
@@ -476,7 +477,7 @@ class MixedTopTradedAdapter(BaseAdapter):
             return []
 
     def _build_balanced(self, total:int) -> List[Dict[str, Any]]:
-        # pull modest pools from each market; we’ll over-sample to rank properly
+        # 1) score candidates by class
         pools = {
             "crypto":      (self._crypto,      40),
             "forex":       (self._forex,       40),
@@ -494,29 +495,82 @@ class MixedTopTradedAdapter(BaseAdapter):
             pairs.sort(key=lambda t: t[1], reverse=True)
             scored_by_class[k] = pairs
 
-        # apply quotas from env
-        quotas = dict(self.targets)
-        must = sum(max(0, int(v)) for v in quotas.values())
-        want = max(total, must)  # at least fill quotas; extra will be redistributed if must<total
+        # 2) normalize quotas to the requested 'total' and available candidates
+        raw = {k: max(0, int(self.targets.get(k, 0))) for k in scored_by_class.keys()}
+        # zero quotas for empty classes
+        for k in list(raw.keys()):
+            if len(scored_by_class[k]) == 0:
+                raw[k] = 0
+        must = sum(raw.values()) or 1
 
+        # start with at least 1 per eligible class (if there is room)
+        alloc = {k: 0 for k in raw.keys()}
+        eligible = [k for k, v in raw.items() if v > 0 and len(scored_by_class[k]) > 0]
+        if total >= len(eligible):
+            for k in eligible:
+                alloc[k] = 1
+            remaining = total - len(eligible)
+        else:
+            # fewer slots than classes: take the best 'total' classes by their top score
+            ranked_classes = sorted(
+                eligible,
+                key=lambda k: scored_by_class[k][0][1] if scored_by_class[k] else 0.0,
+                reverse=True
+            )
+            for k in ranked_classes[:total]:
+                alloc[k] = 1
+            remaining = 0
+
+        # 3) distribute remaining proportionally to raw quotas
+        if remaining > 0 and must > 0:
+            shares = {k: (raw[k] / must) * remaining for k in raw}
+            floors = {k: int(np.floor(shares[k])) for k in raw}
+            # respect capacity per class
+            for k in floors:
+                floors[k] = min(floors[k], max(0, len(scored_by_class[k]) - alloc[k]))
+            used = sum(floors.values())
+            for k, v in floors.items():
+                alloc[k] += v
+            left = max(0, remaining - used)
+
+            if left > 0:
+                # give leftovers by largest fractional remainder, respecting capacity
+                rema = sorted(
+                    [(k, shares[k] - np.floor(shares[k])) for k in raw],
+                    key=lambda x: x[1],
+                    reverse=True
+                )
+                i = 0
+                while left > 0 and i < len(rema):
+                    k = rema[i][0]
+                    if alloc[k] < len(scored_by_class[k]):
+                        alloc[k] += 1
+                        left -= 1
+                    i += 1
+                # still left? round-robin any remaining capacity
+                if left > 0:
+                    for k in list(raw.keys()):
+                        while left > 0 and alloc[k] < len(scored_by_class[k]):
+                            alloc[k] += 1
+                            left -= 1
+                            if left == 0:
+                                break
+
+        # 4) build final list exactly 'total' long
         chosen: List[Dict[str, Any]] = []
-        leftovers: List[Tuple[str, str, float]] = []
+        leftovers: List[Dict[str, Any]] = []
 
         for k, pairs in scored_by_class.items():
-            take = min(len(pairs), max(0, int(quotas.get(k, 0))))
+            take = min(alloc.get(k, 0), len(pairs))
             for s, sc in pairs[:take]:
                 chosen.append({"symbol": s, "market": k, "score": sc, "tf_supported": ["5m","15m","1h","1d"]})
             for s, sc in pairs[take:]:
-                leftovers.append((k, s, sc))
+                leftovers.append({"symbol": s, "market": k, "score": sc, "tf_supported": ["5m","15m","1h","1d"]})
 
-        # top up to desired total with best leftovers across all classes
-        leftovers.sort(key=lambda t: t[2], reverse=True)
-        for k, s, sc in leftovers:
-            if len(chosen) >= want:
-                break
-            chosen.append({"symbol": s, "market": k, "score": sc, "tf_supported": ["5m","15m","1h","1d"]})
+        if len(chosen) < total and leftovers:
+            leftovers.sort(key=lambda r: r["score"], reverse=True)
+            chosen.extend(leftovers[: max(0, total - len(chosen))])
 
-        # finally clamp to 'total'
         chosen = sorted(chosen, key=lambda r: r["score"], reverse=True)[:total]
         return chosen
 
@@ -538,7 +592,8 @@ class MixedTopTradedAdapter(BaseAdapter):
         return scored[:total]
 
     def _compute_top(self, limit:int=20) -> List[Dict[str, Any]]:
-        key = f"{self.mode}:{self.metric}:top:{limit}"
+        targets_key = ",".join(f"{k}:{int(self.targets.get(k,0))}" for k in sorted(self.targets.keys()))
+        key = f"{self.mode}:{self.metric}:targets:{targets_key}:top:{limit}"
         cached = self._cache.get(key)
         if cached and (time.time() - cached[0]) <= self.cache_ttl:
             return cached[1]
@@ -564,6 +619,9 @@ class MixedTopTradedAdapter(BaseAdapter):
         mkey = self._guess_market(symbol)
         ad = {"crypto": self._crypto, "forex": self._forex, "commodities": self._comm, "stocks": self._stocks}.get(mkey, self._stocks)
         return ad.fetch_window(symbol, tf, start_ms, end_ms)
+        
+    def clear_cache(self):
+        self._cache.clear()
 
 # ---------- Registry & dynamic loading ----------
 ADAPTERS: Dict[str, Callable[[], BaseAdapter]] = {
@@ -576,8 +634,8 @@ ADAPTERS: Dict[str, Callable[[], BaseAdapter]] = {
     "forex": ForexAdapter,
     "commodities": CommoditiesAdapter,
     "stocks": StocksAdapter,
-    "top_traded": MixedTopTradedAdapter,
     "top_traded_pure": lambda: MixedTopTradedAdapter(mode="pure"),
+    "top_traded_bal": lambda: MixedTopTradedAdapter(mode="balanced"),
 }
 
 # SINGLETON CACHE for adapters (so ccxt/yf clients + in-adapter caches are reused)
@@ -603,9 +661,8 @@ def get_adapter(name: Optional[str] = None) -> BaseAdapter:
         "forex": "forex",
         "commodities": "commodities",
         "stocks": "stocks",
-        "top_traded": "top_traded",
-        "mixed": "top_traded",
-        "mixed_top": "top_traded",
+        "top_traded_pure": "top_traded_pure",
+        "top_traded_bal": "top_traded_bal",
     }
     key = aliases.get(key, key)
 

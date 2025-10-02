@@ -1354,8 +1354,20 @@ def scan(
     min_confidence: Optional[float] = Query(None),
     precision: int = Query(PRECISION_DEFAULT, ge=0, le=1),
     market: Optional[str] = Query(None),
+    mode: str | None = Query(None, description="For top_traded adapters: balanced|pure"),
+    refresh: int | None = Query(None, description="If 1, clear adapter cache before building list"),
     _: None = Depends(require_key)
 ):
+    
+# Allow runtime mode swap for the mixed adapter
+    if mode and hasattr(adapter, "mode"):
+        m = mode.lower()
+        if m in ("balanced", "pure"):
+            adapter.mode = m
+            # keep name unique after override
+            if hasattr(adapter, "name"):
+                adapter.name = f"top_traded:{adapter.mode}"
+    
     # Per-market scan caps to keep ccxt routes under the WP 65s proxy timeout
     MARKET_SCAN_CAP = {
         "crypto":   int(os.getenv("TOP_N_CRYPTO",  "18")),
