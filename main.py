@@ -1035,11 +1035,20 @@ def evaluate_signal(
     liquid_ok = bool(turnover >= min_turnover)
     if not liquid_ok:
         reasons.append(f"turnover ${turnover:,.0f} < ${min_turnover:,.0f} min")
+        
+    # --- normalize mkey for volume reliability (handle 'top_traded' by inferring from symbol) ---
+    mkey = (market_name or "").split(":", 1)[0]
+    if mkey in ("", "top_traded", "mixed", "mixed_top"):
+        su = symbol.upper()
+        if su.endswith("=X"):      mkey = "forex"
+        elif su.endswith("=F"):    mkey = "commodities"
+        elif "/" not in su:        mkey = "stocks"
+        else:                      mkey = "crypto"
 
     # For markets where yfinance volume is unreliable (e.g., forex),
     # if recent volume is missing/zero, bypass the turnover gate.
     try:
-        if market_name in ("forex", "commodities", "stocks"):
+        if mkey in ("forex", "commodities", "stocks"):
             vol_sum = float(pd.to_numeric(feats["volume"].tail(200), errors="coerce").fillna(0).sum())
             if vol_sum <= 0:
                 liquid_ok = True

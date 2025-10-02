@@ -342,6 +342,137 @@ def CommoditiesAdapter() -> BaseAdapter:
 def StocksAdapter() -> BaseAdapter:
     return YFAdapter("stocks", ["AAPL","MSFT","NVDA","TSLA","SPY","QQQ","AMZN","INTC","PLTR","META","ORCL","AVGO","TQQQ","AMD","GOOGL","COST","IWM","MU","APP","GOOG"], price_decimals=2)
 
+# ----- Mixed Top-Traded (All Markets) -----
+class MixedTopTradedAdapter(BaseAdapter):
+    """
+    Cross-market universe built from crypto (ccxt), forex/commodities/stocks (yfinance).
+    Ranks by recent 1h liquidity: primary = Σ(close * volume) over ~48 bars;
+    fallback = ATR proxy when volume is unreliable (e.g., many FX tickers).
+    Cached for TOPTRADED_CACHE_TTL seconds (default 600).
+    """
+    def __init__(self, cache_ttl:int = None):
+        self.name = "top_traded"
+        # Reuse your existing adapters
+        self._crypto = CryptoCCXT(os.getenv("EXCHANGE", "kraken"), os.getenv("QUOTE", "USD"),
+                                  curated=[s.strip().upper() for s in os.getenv("CURATED","BTC,ETH,SOL,XRP,ADA,DOGE,LINK,LTC,BCH,TRX,DOT,ATOM,XLM,ETC,MATIC,UNI,APT,ARB,OP,AVAX,NEAR,ALGO,FIL,SUI,SHIB,USDC,USDT,XMR,AAVE,PAXG,ONDO,PEPE,SEI,IMX,TIA").split(",") if s.strip()])
+        self._forex  = ForexAdapter()
+        self._comm   = CommoditiesAdapter()
+        self._stocks = StocksAdapter()
+        # You can optionally also include futures/perps if you like:
+        # self._perps  = BinancePerpsUSDT()
+
+        self.cache_ttl = int(cache_ttl or os.getenv("TOPTRADED_CACHE_TTL", "600"))
+        self._cache: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
+
+    # --- helpers ---
+    def _guess_market(self, symbol:str) -> str:
+        s = symbol.upper()
+        if "/" in s:       return "crypto"
+        if s.endswith("=X"): return "forex"
+        if s.endswith("=F"): return "commodities"
+        return "stocks"
+
+    def _liquidity_score(self, df: pd.DataFrame, mkey: str) -> float:
+        # try notional turnover when volume is available
+        try:
+            close = pd.to_numeric(df["close"], errors="coerce")
+            vol   = pd.to_numeric(df.get("volume"), errors="coerce").fillna(0.0)
+            notional = float((close.tail(48) * vol.tail(48)).sum())
+            if notional > 0:
+                return notional
+        except Exception:
+            pass
+        # fallback: ATR proxy × small class weight, so FX majors still rank reasonably
+        try:
+            hi  = pd.to_numeric(df["high"], errors="coerce")
+            lo  = pd.to_numeric(df["low"], errors="coerce")
+            cl  = pd.to_numeric(df["close"], errors="coerce")
+            prev = cl.shift(1)
+            tr  = pd.concat([(hi-lo).abs(), (hi-prev).abs(), (lo-prev).abs()], axis=1).max(axis=1)
+            atr = tr.rolling(14, min_periods=1).mean()
+            proxy = float((atr.tail(48) * cl.tail(48)).sum())
+            weights = {"forex": 1e9, "commodities": 2e8, "stocks": 1e8, "crypto": 5e7}
+            return proxy * weights.get(mkey, 1e8)
+        except Exception:
+            return 0.0
+
+    def _compute_top(self, limit:int=20) -> List[Dict[str, Any]]:
+        key = f"top:{limit}"
+        cached = self._cache.get(key)
+        if cached and (time.time() - cached[0]) <= self.cache_ttl:
+            return cached[1]
+
+        # Pull modest candidate sets from each market to keep it quick
+        def _syms(adapter: BaseAdapter, lim:int) -> List[str]:
+            try:
+                uni = adapter.list_universe(limit=lim)
+                out = []
+                for it in uni:
+                    if isinstance(it, dict):
+                        out.append(it.get("symbol") or "")
+                    else:
+                        out.append(getattr(it, "symbol", "") or "")
+                return [s for s in out if s]
+            except Exception:
+                return []
+
+        # candidates
+        c_crypto = _syms(self._crypto, 20)
+        c_fx     = _syms(self._forex, 20)
+        c_comm   = _syms(self._comm, 16)
+        c_stk    = _syms(self._stocks, 24)
+
+        # score every candidate (guard errors individually)
+        scored: List[Dict[str, Any]] = []
+        def _score_many(market_key: str, adapter: BaseAdapter, syms: List[str], cap:int):
+            for s in syms[:cap]:
+                try:
+                    df = adapter.fetch_ohlcv(s, "1h", bars=120)
+                    sc = self._liquidity_score(df, market_key)
+                    if sc <= 0: 
+                        continue
+                    scored.append({"symbol": s, "market": market_key, "score": sc})
+                except Exception:
+                    continue
+
+        _score_many("crypto", self._crypto, c_crypto, 20)
+        _score_many("forex", self._forex, c_fx, 20)
+        _score_many("commodities", self._comm, c_comm, 16)
+        _score_many("stocks", self._stocks, c_stk, 24)
+
+        # de-dup exact symbols, keep best score
+        best: Dict[str, Dict[str, Any]] = {}
+        for row in scored:
+            sym = row["symbol"]
+            if (sym not in best) or (row["score"] > best[sym]["score"]):
+                best[sym] = row
+
+        top = sorted(best.values(), key=lambda r: r["score"], reverse=True)[:max(6, min(limit, 20))]
+
+        # attach display names
+        out = []
+        for r in top:
+            name = r["symbol"].replace("=F","").replace("^","")
+            out.append({"symbol": r["symbol"], "name": name, "market": r["market"], "tf_supported": ["5m","15m","1h","1d"]})
+
+        self._cache[key] = (time.time(), out)
+        return out
+
+    # ---- BaseAdapter API ----
+    def list_universe(self, limit:int=20) -> List[Dict[str, Any]]:
+        return self._compute_top(limit)
+
+    def fetch_ohlcv(self, symbol: str, tf: str, bars:int) -> pd.DataFrame:
+        # Delegate to the appropriate underlying adapter (defensive guess if symbol not from our cache)
+        mkey = self._guess_market(symbol)
+        ad = {"crypto": self._crypto, "forex": self._forex, "commodities": self._comm, "stocks": self._stocks}.get(mkey, self._stocks)
+        return ad.fetch_ohlcv(symbol, tf, bars)
+
+    def fetch_window(self, symbol:str, tf:str, start_ms:int, end_ms:int) -> pd.DataFrame:
+        mkey = self._guess_market(symbol)
+        ad = {"crypto": self._crypto, "forex": self._forex, "commodities": self._comm, "stocks": self._stocks}.get(mkey, self._stocks)
+        return ad.fetch_window(symbol, tf, start_ms, end_ms)
+
 # ---------- Registry & dynamic loading ----------
 ADAPTERS: Dict[str, Callable[[], BaseAdapter]] = {
     "crypto": lambda: CryptoCCXT(
@@ -353,6 +484,7 @@ ADAPTERS: Dict[str, Callable[[], BaseAdapter]] = {
     "forex": ForexAdapter,
     "commodities": CommoditiesAdapter,
     "stocks": StocksAdapter,
+    "top_traded": MixedTopTradedAdapter,
 }
 
 # SINGLETON CACHE for adapters (so ccxt/yf clients + in-adapter caches are reused)
@@ -378,6 +510,9 @@ def get_adapter(name: Optional[str] = None) -> BaseAdapter:
         "forex": "forex",
         "commodities": "commodities",
         "stocks": "stocks",
+        "top_traded": "top_traded",
+        "mixed": "top_traded",
+        "mixed_top": "top_traded",
     }
     key = aliases.get(key, key)
 
