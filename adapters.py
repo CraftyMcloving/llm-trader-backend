@@ -345,125 +345,217 @@ def StocksAdapter() -> BaseAdapter:
 # ----- Mixed Top-Traded (All Markets) -----
 class MixedTopTradedAdapter(BaseAdapter):
     """
-    Cross-market universe built from crypto (ccxt), forex/commodities/stocks (yfinance).
-    Ranks by recent 1h liquidity: primary = Σ(close * volume) over ~48 bars;
-    fallback = ATR proxy when volume is unreliable (e.g., many FX tickers).
-    Cached for TOPTRADED_CACHE_TTL seconds (default 600).
+    Cross-market universe (crypto/forex/commodities/stocks).
+    Ranking metric is configurable:
+      - TOPTRADED_METRIC=24h  -> sum over last ~24×1h of (close*volume) when available
+      - TOPTRADED_METRIC=1d   -> last daily bar close*volume
+      - TOPTRADED_METRIC=auto -> crypto=24h, stocks/commodities=1d, forex=atr_proxy
+    Composition is configurable (balanced quotas vs pure global top):
+      - TOPTRADED_MODE=balanced (default) with TOPTRADED_TARGETS (e.g. "stocks:8,crypto:6,forex:4,commodities:2")
+      - TOPTRADED_MODE=pure     ignore quotas; take global top-N
+
+    Tuning:
+      - TOPTRADED_CACHE_TTL (seconds) default 600
+      - TOPTRADED_TARGETS string must sum to ~20 if you want a 20-name universe
     """
-    def __init__(self, cache_ttl:int = None):
+    def __init__(self, mode: str | None = None, metric: str | None = None, cache_ttl: int | None = None, targets: dict | None = None):
         self.name = "top_traded"
-        # Reuse your existing adapters
+
+        # Reuse existing adapters
         self._crypto = CryptoCCXT(os.getenv("EXCHANGE", "kraken"), os.getenv("QUOTE", "USD"),
                                   curated=[s.strip().upper() for s in os.getenv("CURATED","BTC,ETH,SOL,XRP,ADA,DOGE,LINK,LTC,BCH,TRX,DOT,ATOM,XLM,ETC,MATIC,UNI,APT,ARB,OP,AVAX,NEAR,ALGO,FIL,SUI,SHIB,USDC,USDT,XMR,AAVE,PAXG,ONDO,PEPE,SEI,IMX,TIA").split(",") if s.strip()])
         self._forex  = ForexAdapter()
         self._comm   = CommoditiesAdapter()
         self._stocks = StocksAdapter()
-        # You can optionally also include futures/perps if you like:
-        # self._perps  = BinancePerpsUSDT()
 
+        self.mode   = (mode or os.getenv("TOPTRADED_MODE", "balanced")).lower()
+        self.metric = (metric or os.getenv("TOPTRADED_METRIC", "auto")).lower()
         self.cache_ttl = int(cache_ttl or os.getenv("TOPTRADED_CACHE_TTL", "600"))
         self._cache: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
 
-    # --- helpers ---
-    def _guess_market(self, symbol:str) -> str:
+        def _parse_targets(s: str) -> Dict[str, int]:
+            out = {"stocks": 8, "crypto": 6, "forex": 4, "commodities": 2}
+            if not s:
+                return out
+            for part in s.split(","):
+                if ":" in part:
+                    k, v = part.split(":", 1)
+                    k = k.strip().lower()
+                    try:
+                        out[k] = max(0, int(v.strip()))
+                    except Exception:
+                        pass
+            return out
+
+        self.targets = targets or _parse_targets(os.getenv("TOPTRADED_TARGETS", "stocks:8,crypto:6,forex:4,commodities:2"))
+
+    # ---- helpers ----
+    def _guess_market(self, symbol: str) -> str:
         s = symbol.upper()
-        if "/" in s:       return "crypto"
+        if "/" in s:         return "crypto"
         if s.endswith("=X"): return "forex"
         if s.endswith("=F"): return "commodities"
         return "stocks"
 
-    def _liquidity_score(self, df: pd.DataFrame, mkey: str) -> float:
-        # try notional turnover when volume is available
+    def _notional_24h(self, adapter: BaseAdapter, symbol: str) -> float:
+        """Sum over last ~24×1h of close*volume (skips if volume missing)."""
         try:
+            df = adapter.fetch_ohlcv(symbol, "1h", bars=30)
             close = pd.to_numeric(df["close"], errors="coerce")
             vol   = pd.to_numeric(df.get("volume"), errors="coerce").fillna(0.0)
-            notional = float((close.tail(48) * vol.tail(48)).sum())
-            if notional > 0:
-                return notional
+            # Take last ~24 bars (use 26 to be safe for gaps)
+            return float((close.tail(26) * vol.tail(26)).sum())
         except Exception:
-            pass
-        # fallback: ATR proxy × small class weight, so FX majors still rank reasonably
+            return 0.0
+
+    def _notional_1d(self, adapter: BaseAdapter, symbol: str) -> float:
+        """Use last daily bar close*volume (works well for stocks/commodities)."""
         try:
+            df = adapter.fetch_ohlcv(symbol, "1d", bars=2)
+            close = float(pd.to_numeric(df["close"], errors="coerce").iloc[-1])
+            vol   = float(pd.to_numeric(df.get("volume"), errors="coerce").fillna(0.0).iloc[-1])
+            return close * vol
+        except Exception:
+            return 0.0
+
+    def _atr_proxy(self, adapter: BaseAdapter, symbol: str, lot: float = 100_000.0) -> float:
+        """
+        ATR-based activity proxy for markets with unreliable/no volume (e.g., forex).
+        Scale by standard FX lot notional so majors rank sensibly.
+        """
+        try:
+            df = adapter.fetch_ohlcv(symbol, "1h", bars=30)
             hi  = pd.to_numeric(df["high"], errors="coerce")
             lo  = pd.to_numeric(df["low"], errors="coerce")
             cl  = pd.to_numeric(df["close"], errors="coerce")
             prev = cl.shift(1)
             tr  = pd.concat([(hi-lo).abs(), (hi-prev).abs(), (lo-prev).abs()], axis=1).max(axis=1)
             atr = tr.rolling(14, min_periods=1).mean()
-            proxy = float((atr.tail(48) * cl.tail(48)).sum())
-            weights = {"forex": 1e9, "commodities": 2e8, "stocks": 1e8, "crypto": 5e7}
-            return proxy * weights.get(mkey, 1e8)
+            # Sum last ~24 bars and scale by price*lot
+            proxy = float((atr.tail(26) * cl.tail(26)).sum() * lot)
+            return proxy
         except Exception:
             return 0.0
 
+    def _score(self, mkey: str, symbol: str) -> float:
+        met = self.metric
+        if met == "24h":
+            if mkey in ("stocks", "commodities"):
+                # still okay to use 24h, but many instruments only have daily volume; fall back
+                v = self._notional_24h(self._stocks if mkey=="stocks" else self._comm, symbol)
+                return v if v > 0 else self._notional_1d(self._stocks if mkey=="stocks" else self._comm, symbol)
+            if mkey == "crypto":
+                return self._notional_24h(self._crypto, symbol)
+            if mkey == "forex":
+                return self._atr_proxy(self._forex, symbol)
+        elif met == "1d":
+            if mkey == "crypto":
+                # use 24h on crypto even in 1d mode (exchanges are 24/7)
+                v = self._notional_24h(self._crypto, symbol)
+                return v if v > 0 else self._notional_1d(self._crypto, symbol)
+            if mkey == "forex":
+                return self._atr_proxy(self._forex, symbol)
+            return self._notional_1d(self._stocks if mkey=="stocks" else self._comm, symbol)
+        # auto: crypto=24h, stocks/comm=1d, forex=atr
+        if mkey == "crypto":       return self._notional_24h(self._crypto, symbol)
+        if mkey == "stocks":       return self._notional_1d(self._stocks, symbol)
+        if mkey == "commodities":  return self._notional_1d(self._comm, symbol)
+        return self._atr_proxy(self._forex, symbol)
+
+    def _candidates(self, adapter: BaseAdapter, cap: int) -> List[str]:
+        try:
+            uni = adapter.list_universe(limit=cap)
+            out = []
+            for it in uni:
+                if isinstance(it, dict):
+                    out.append(it.get("symbol") or "")
+                else:
+                    out.append(getattr(it, "symbol", "") or "")
+            return [s for s in out if s]
+        except Exception:
+            return []
+
+    def _build_balanced(self, total:int) -> List[Dict[str, Any]]:
+        # pull modest pools from each market; we’ll over-sample to rank properly
+        pools = {
+            "crypto":      (self._crypto,      40),
+            "forex":       (self._forex,       40),
+            "commodities": (self._comm,        30),
+            "stocks":      (self._stocks,      50),
+        }
+        scored_by_class: Dict[str, List[Tuple[str, float]]] = {}
+        for k, (ad, cap) in pools.items():
+            syms = self._candidates(ad, cap)
+            pairs = []
+            for s in syms:
+                sc = self._score(k, s)
+                if sc > 0:
+                    pairs.append((s, sc))
+            pairs.sort(key=lambda t: t[1], reverse=True)
+            scored_by_class[k] = pairs
+
+        # apply quotas from env
+        quotas = dict(self.targets)
+        must = sum(max(0, int(v)) for v in quotas.values())
+        want = max(total, must)  # at least fill quotas; extra will be redistributed if must<total
+
+        chosen: List[Dict[str, Any]] = []
+        leftovers: List[Tuple[str, str, float]] = []
+
+        for k, pairs in scored_by_class.items():
+            take = min(len(pairs), max(0, int(quotas.get(k, 0))))
+            for s, sc in pairs[:take]:
+                chosen.append({"symbol": s, "market": k, "score": sc, "tf_supported": ["5m","15m","1h","1d"]})
+            for s, sc in pairs[take:]:
+                leftovers.append((k, s, sc))
+
+        # top up to desired total with best leftovers across all classes
+        leftovers.sort(key=lambda t: t[2], reverse=True)
+        for k, s, sc in leftovers:
+            if len(chosen) >= want:
+                break
+            chosen.append({"symbol": s, "market": k, "score": sc, "tf_supported": ["5m","15m","1h","1d"]})
+
+        # finally clamp to 'total'
+        chosen = sorted(chosen, key=lambda r: r["score"], reverse=True)[:total]
+        return chosen
+
+    def _build_pure(self, total:int) -> List[Dict[str, Any]]:
+        # flatten all candidates and rank globally
+        pools = {
+            "crypto":      (self._crypto,      60),
+            "forex":       (self._forex,       60),
+            "commodities": (self._comm,        40),
+            "stocks":      (self._stocks,      80),
+        }
+        scored: List[Dict[str, Any]] = []
+        for k, (ad, cap) in pools.items():
+            for s in self._candidates(ad, cap):
+                sc = self._score(k, s)
+                if sc > 0:
+                    scored.append({"symbol": s, "market": k, "score": sc, "tf_supported": ["5m","15m","1h","1d"]})
+        scored.sort(key=lambda r: r["score"], reverse=True)
+        return scored[:total]
+
     def _compute_top(self, limit:int=20) -> List[Dict[str, Any]]:
-        key = f"top:{limit}"
+        key = f"{self.mode}:{self.metric}:top:{limit}"
         cached = self._cache.get(key)
         if cached and (time.time() - cached[0]) <= self.cache_ttl:
             return cached[1]
 
-        # Pull modest candidate sets from each market to keep it quick
-        def _syms(adapter: BaseAdapter, lim:int) -> List[str]:
-            try:
-                uni = adapter.list_universe(limit=lim)
-                out = []
-                for it in uni:
-                    if isinstance(it, dict):
-                        out.append(it.get("symbol") or "")
-                    else:
-                        out.append(getattr(it, "symbol", "") or "")
-                return [s for s in out if s]
-            except Exception:
-                return []
+        total = max(6, min(20, int(limit)))
+        out = self._build_balanced(total) if self.mode == "balanced" else self._build_pure(total)
+        # strip score before returning
+        cleaned = [{"symbol": r["symbol"], "name": r["symbol"].replace("=F","").replace("^",""), "market": r["market"], "tf_supported": r["tf_supported"]} for r in out]
 
-        # candidates
-        c_crypto = _syms(self._crypto, 20)
-        c_fx     = _syms(self._forex, 20)
-        c_comm   = _syms(self._comm, 16)
-        c_stk    = _syms(self._stocks, 24)
-
-        # score every candidate (guard errors individually)
-        scored: List[Dict[str, Any]] = []
-        def _score_many(market_key: str, adapter: BaseAdapter, syms: List[str], cap:int):
-            for s in syms[:cap]:
-                try:
-                    df = adapter.fetch_ohlcv(s, "1h", bars=120)
-                    sc = self._liquidity_score(df, market_key)
-                    if sc <= 0: 
-                        continue
-                    scored.append({"symbol": s, "market": market_key, "score": sc})
-                except Exception:
-                    continue
-
-        _score_many("crypto", self._crypto, c_crypto, 20)
-        _score_many("forex", self._forex, c_fx, 20)
-        _score_many("commodities", self._comm, c_comm, 16)
-        _score_many("stocks", self._stocks, c_stk, 24)
-
-        # de-dup exact symbols, keep best score
-        best: Dict[str, Dict[str, Any]] = {}
-        for row in scored:
-            sym = row["symbol"]
-            if (sym not in best) or (row["score"] > best[sym]["score"]):
-                best[sym] = row
-
-        top = sorted(best.values(), key=lambda r: r["score"], reverse=True)[:max(6, min(limit, 20))]
-
-        # attach display names
-        out = []
-        for r in top:
-            name = r["symbol"].replace("=F","").replace("^","")
-            out.append({"symbol": r["symbol"], "name": name, "market": r["market"], "tf_supported": ["5m","15m","1h","1d"]})
-
-        self._cache[key] = (time.time(), out)
-        return out
+        self._cache[key] = (time.time(), cleaned)
+        return cleaned
 
     # ---- BaseAdapter API ----
     def list_universe(self, limit:int=20) -> List[Dict[str, Any]]:
         return self._compute_top(limit)
 
     def fetch_ohlcv(self, symbol: str, tf: str, bars:int) -> pd.DataFrame:
-        # Delegate to the appropriate underlying adapter (defensive guess if symbol not from our cache)
         mkey = self._guess_market(symbol)
         ad = {"crypto": self._crypto, "forex": self._forex, "commodities": self._comm, "stocks": self._stocks}.get(mkey, self._stocks)
         return ad.fetch_ohlcv(symbol, tf, bars)
@@ -485,6 +577,7 @@ ADAPTERS: Dict[str, Callable[[], BaseAdapter]] = {
     "commodities": CommoditiesAdapter,
     "stocks": StocksAdapter,
     "top_traded": MixedTopTradedAdapter,
+    "top_traded_pure": lambda: MixedTopTradedAdapter(mode="pure"),
 }
 
 # SINGLETON CACHE for adapters (so ccxt/yf clients + in-adapter caches are reused)
