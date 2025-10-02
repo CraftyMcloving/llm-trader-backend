@@ -1337,7 +1337,7 @@ def signals(
 def scan(
     tf: str = Query("1h"),
     limit: int = Query(18, ge=1, le=50),                # universe size to scan
-    top: int = Query(6, ge=1, le=12),                  # how many results to return
+    top: int = Query(6, ge=1, le=TOP_MAX),                  # how many results to return
     allow_neutral: int = Query(0, ge=0, le=1),
     ignore_trend: int = Query(0, ge=0, le=1),
     ignore_vol: int = Query(0, ge=0, le=1),
@@ -1355,6 +1355,9 @@ def scan(
         "crypto":   int(os.getenv("TOP_N_CRYPTO",  "18")),
         "futures":  int(os.getenv("TOP_N_FUTURES", "18")),   # binance_perps is treated as 'futures'
     }
+    # ---- scan/signal caps ----
+    TOP_MAX = int(os.getenv("TOP_MAX", "18"))  # was effectively 12 before
+    
     mkey = (market or "crypto").split(":", 1)[0]
     eff_limit = min(limit, MARKET_SCAN_CAP.get(mkey, limit))
 
