@@ -142,10 +142,14 @@ class CryptoCCXT(BaseAdapter):
         c = self._cache_get(key)
         if c is not None:
             return c
-        try:
-            data = ex.fetch_ohlcv(symbol, timeframe=tf_ex, limit=min(bars + 40, 2000))
-        except Exception as e:
-            raise AdapterError(f"{self.exchange_id} fetch_ohlcv({symbol},{tf_ex}) failed: {e}") from e
+        for attempt in range(3):
+            try:
+                data = ex.fetch_ohlcv(symbol, timeframe=tf_ex, limit=min(bars + 40, 2000))
+                break
+            except Exception as e:
+                if attempt == 2:
+                    raise AdapterError(f"{self.exchange_id} fetch_ohlcv({symbol},{tf_ex}) failed: {e}") from e
+                time.sleep(0.6 * (attempt + 1))
         if not data:
             raise AdapterError("no candles")
         df = pd.DataFrame(data, columns=["ts","open","high","low","close","volume"])
@@ -161,10 +165,14 @@ class CryptoCCXT(BaseAdapter):
         per = tf_ms(tf)
         need = max(2, int((end_ms - start_ms) / per) + 4)
         since = max(0, start_ms - 2 * per)
-        try:
-            data = ex.fetch_ohlcv(symbol, timeframe=tf_ex, since=since, limit=min(need + 20, 2000))
-        except Exception as e:
-            raise AdapterError(f"{self.exchange_id} fetch_window({symbol},{tf_ex}) failed: {e}") from e
+        for attempt in range(3):
+            try:
+                data = ex.fetch_ohlcv(symbol, timeframe=tf_ex, since=since, limit=min(need + 20, 2000))
+                break
+            except Exception as e:
+                if attempt == 2:
+                    raise AdapterError(f"{self.exchange_id} fetch_window({symbol},{tf_ex}) failed: {e}") from e
+                time.sleep(0.6 * (attempt + 1))
         if not data:
             raise AdapterError("no candles for window")
         df = pd.DataFrame(data, columns=["ts","open","high","low","close","volume"])
@@ -177,6 +185,10 @@ class CryptoCCXT(BaseAdapter):
     def amount_to_precision(self, symbol:str, qty:float) -> float:
         self._load_markets()
         return float(self._exh().amount_to_precision(symbol, qty))
+        
+    def clear_cache(self):
+        try: self._cache.clear()
+        except Exception: pass
 
 # ---------- Binance Perps (USDT-M futures) via ccxt ----------
 class BinancePerpsUSDT(BaseAdapter):
@@ -331,6 +343,10 @@ class YFAdapter(BaseAdapter):
     
     def price_to_precision(self, symbol:str, price:float) -> float:
         return float(round(price, self.price_decimals))
+        
+    def clear_cache(self):
+        try: self._cache.clear()
+        except Exception: pass
 
 # “Add-on pack” factories (top-20 defaults)
 def ForexAdapter() -> BaseAdapter:
@@ -644,31 +660,39 @@ _ADAPTER_INSTANCES: Dict[str, BaseAdapter] = {}
 def register_adapter(key: str, factory: Callable[[], BaseAdapter]):
     ADAPTERS[key.lower()] = factory
 
-# --- replace your current get_adapter with this normalized + cached version ---
 def get_adapter(name: Optional[str] = None) -> BaseAdapter:
     """
     Select adapter by query param or env ADAPTER; accept long-form names like 'crypto:kraken:usd'.
-    Returns a singleton instance per logical adapter (crypto, binance_perps, forex, ...).
+    Returns a singleton instance per logical adapter (crypto, binance_perps, forex, stocks, commodities, top_traded_*).
     """
-    raw = (name or os.getenv("ADAPTER", "crypto")).lower().strip()
-    key = raw.split(":", 1)[0]  # 'crypto:kraken:usd' -> 'crypto'
+    raw = (name or os.getenv("ADAPTER", "top_traded_bal")).strip().lower()
+    parts = [p for p in raw.split(":") if p]
+    base = parts[0] if parts else "top_traded_bal"
 
-    aliases = {
-        "crypto": "crypto",
-        "binance_perps": "binance_perps",
-        "futures": "binance_perps",
-        "binance": "binance_perps",
-        "forex": "forex",
-        "commodities": "commodities",
-        "stocks": "stocks",
-        "top_traded_pure": "top_traded_pure",
-        "top_traded_bal": "top_traded_bal",
-    }
-    key = aliases.get(key, key)
+    # Expand long-form crypto:exchange:quote
+    if base == "crypto":
+        if len(parts) >= 2: os.environ["EXCHANGE"] = parts[1]
+        if len(parts) >= 3: os.environ["QUOTE"]   = parts[2]
+        key = "crypto"
+
+    # Top-traded shorthand aliases
+    elif base in ("top_traded", "toptraded", "top-traded"):
+        mode = os.getenv("TOPTRADED_MODE", "balanced").lower()
+        key = "top_traded_bal" if mode == "balanced" else "top_traded_pure"
+    elif base in ("top_traded_bal", "toptraded_bal"):
+        key = "top_traded_bal"
+    elif base in ("top_traded_pure", "toptraded_pure"):
+        key = "top_traded_pure"
+
+    # Direct names
+    else:
+        key = base
+
+    if key not in ADAPTERS:
+        raise AdapterError(f"Unknown adapter '{raw}' (valid: {', '.join(sorted(ADAPTERS.keys()))})")
 
     inst = _ADAPTER_INSTANCES.get(key)
     if inst is None:
-        factory = ADAPTERS.get(key) or ADAPTERS["crypto"]
-        inst = factory()
+        inst = ADAPTERS[key]()    # construct once
         _ADAPTER_INSTANCES[key] = inst
     return inst

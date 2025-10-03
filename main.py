@@ -26,16 +26,20 @@ def _get_top_max() -> int:
 
 origins_env = os.getenv("ALLOWED_ORIGINS", "*")
 origins = ["*"] if origins_env == "*" else [o.strip() for o in origins_env.split(",") if o.strip()]
+allow_creds = (origins != ["*"])  # credentials only when not wildcard
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
     allow_methods=["*"],
     allow_headers=["*"],
-    allow_credentials=True,
+    allow_credentials=allow_creds,
 )
 
 # ----- Security -----
 API_KEY = os.getenv("API_KEY", "change-me")
+if API_KEY == "change-me" and not os.getenv("ALLOW_INSECURE_DEV", ""):
+    raise RuntimeError("API_KEY not set. Refusing to start with default key.")
 def require_key(
     authorization: Optional[str] = Header(None),
     x_api_key: Optional[str] = Header(None),
@@ -95,8 +99,9 @@ def _db():
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA temp_store=MEMORY;")
-    conn.execute("PRAGMA mmap_size=300000000;")   # ~300MB if available (no-op if not)
-    conn.execute("PRAGMA cache_size=-20000;")     # ~20MB page cache
+    conn.execute("PRAGMA mmap_size=300000000;")
+    conn.execute("PRAGMA cache_size=-20000;")
+    conn.execute("PRAGMA busy_timeout=5000;")
     return conn
 
 def init_feedback_db():
@@ -189,6 +194,8 @@ def ensure_feedback_migrations(conn):
     cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_feedback_uid_fp ON feedback(uid, fingerprint)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_fb_sym_tf_acc_ts ON feedback(symbol, tf, accepted, ts)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_fb_uid_ts ON feedback(uid, ts)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_fb_outcome_ts ON feedback(outcome, ts)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_fb_tf_outcome ON feedback(tf, outcome)")
     conn.commit()
         # ---- model tables ----
     cur.execute("""
@@ -982,15 +989,22 @@ def _vote_matches_market(fb: FeedbackIn) -> Tuple[bool, str]:
     if not fb.direction or fb.entry is None:
         return False, "missing direction/entry for consistency check"
 
-    # Prefer real-time last price; fallback to last close
-    ex = get_exchange()
+    # Try real-time last via ccxt only if available; gracefully fall back
     px = None
+    ex = None
     try:
-        t = ex.fetch_ticker(fb.symbol)
-        if t and t.get("last"):
-            px = float(t["last"])
+        ex = get_exchange()  # may raise if ccxt not installed/configured
     except Exception:
-        pass
+        ex = None
+
+    if ex:
+        try:
+            t = ex.fetch_ticker(fb.symbol)
+            if t and t.get("last"):
+                px = float(t["last"])
+        except Exception:
+            pass
+
     if px is None:
         df = fetch_ohlcv(fb.symbol, fb.tf, bars=2, market_name=fb.market)
         px = float(df["close"].iloc[-1])
@@ -1099,10 +1113,10 @@ def evaluate_signal(
             rsi14 = float(feats["rsi14"].iloc[-1])
             bbpos = float(feats["bb_pos"].iloc[-1])
             direction = "Long" if (slope >= 0 or rsi14 >= 50 or bbpos >= 0) else "Short"
-
         trade = build_trade(symbol, feats, direction, risk_pct, equity, leverage, market_name=market_name)
         advice = "Consider"
-
+        R = 1.2
+        p = float(conf) 
         # ---- EV gate ----
         try:
             entry = float(trade["entry"]); stop = float(trade["stop"])
@@ -1112,14 +1126,22 @@ def evaluate_signal(
                 R = float((tp1 - entry) / max(1e-9, (entry - stop))) if tp1 else 1.2
             else:
                 R = float((entry - tp1) / max(1e-9, (stop - entry))) if tp1 else 1.2
-            p = float(conf)
             ev = p*R - (1-p)*1.0
             if ev < EV_MIN:
                 advice = "Skip"
                 reasons.append(f"EV {ev:.2f} < {EV_MIN:.2f}")
         except Exception:
             pass
-
+        try:
+            # classical Kelly for binary outcome with payoff R: f* = p - (1-p)/R
+            kelly = float(p - (1.0 - p) / max(R, 1e-9))
+            # clip to [-0.05, 0.1] — conservative bounds for retail UX
+            kelly = max(-0.05, min(0.10, kelly))
+            if isinstance(trade, dict):
+                trade.setdefault("risk_suggestions", {})
+                trade["risk_suggestions"]["kelly_fraction"] = round(kelly, 4)
+        except Exception:
+            pass
         # ---- Reliability (Wilson LB) gate ----
         try:
             wins, total = ns_stats_get(symbol, tf)
@@ -1285,31 +1307,37 @@ async def _log_requests(request, call_next):
 def instruments(market: Optional[str] = None, _: None = Depends(require_key)):
     return get_universe(market_name=market)
 
+# === PATCH: tiny in-memory cache around /chart ===
+# [ANCHOR] keep near your other process cache helpers (CACHE / cache_get / cache_set exist)
+# uses the same cache_get/cache_set you already define
+
 @app.get("/chart")
 def chart(symbol: str, tf: str = "1h", n: int = 120, market: Optional[str] = None, _: None = Depends(require_key)):
+    cache_key = f"chart:{market or ''}:{symbol}:{tf}:{int(n)}"
+    cached = cache_get(cache_key, ttl=60)  # 60s is plenty for UI sparks
+    if cached is not None:
+        return cached
+
     df = fetch_ohlcv(symbol, tf, bars=max(200, n + 20), market_name=market)
 
-    # Ensure we have a usable "close" series even if columns are duplicated or MI
+    # (keep your robust close-column normalization exactly as-is)
     if "close" not in df.columns:
-        # try case-insensitive fallback
         cols_lower = {str(c).lower(): c for c in df.columns}
         if "close" not in cols_lower:
             raise HTTPException(502, detail="no 'close' column in data")
         close_obj = df[cols_lower["close"]]
     else:
         close_obj = df["close"]
-
-    # If it's a DataFrame (duplicate column names), squeeze to the first column
     if isinstance(close_obj, pd.DataFrame):
         if close_obj.shape[1] == 0:
             raise HTTPException(502, detail="'close' column is empty")
         close_obj = close_obj.iloc[:, 0]
-
     closes = pd.to_numeric(close_obj, errors="coerce").tail(n).dropna().astype(float).to_list()
     if not closes:
         raise HTTPException(502, detail="no numeric close data")
-
-    return {"symbol": symbol, "tf": tf, "closes": closes}
+    out = {"symbol": symbol, "tf": tf, "closes": closes}
+    cache_set(cache_key, out)
+    return out
 
 @app.get("/signals")
 def signals(
@@ -1321,11 +1349,14 @@ def signals(
     min_confidence: Optional[float] = Query(None),
     precision: int = Query(PRECISION_DEFAULT, ge=0, le=1),
     market: Optional[str] = Query(None),
-    # optional: let the UI override ATR% gates (see §4 below)
     vol_cap: Optional[float] = Query(None),
     vol_min: Optional[float] = Query(None),
     _: None = Depends(require_key),
 ):
+    key_sig = f"sig:{symbol}:{tf}:{risk_pct}:{equity}:{leverage}:{min_confidence}:{precision}:{market}:{vol_cap}:{vol_min}"
+    cached = cache_get(key_sig, ttl=7)   # tiny TTL to smooth bursts
+    if cached is not None:
+        return cached
     try:
         mc = (min_confidence if min_confidence is not None else MIN_CONFIDENCE)
         if precision:
@@ -1339,12 +1370,11 @@ def signals(
             leverage=leverage,
             min_confidence=mc,
             market_name=market,
-            # pass through ATR% overrides if provided
             vol_cap=vol_cap,
             vol_min=vol_min,
         )
 
-        # Include market for UI parity
+        # Ensure market shows up
         if market:
             res["market"] = market
         else:
@@ -1353,13 +1383,11 @@ def signals(
             except Exception:
                 pass
 
-        # Learned bias + calibration
+        # Bias + calibration + Wilson-LB nudge
         base_conf = float(res.get("confidence", 0.0))
         feats: Dict[str, Any] = res.get("features") or {}
         biased = apply_feedback_bias(base_conf, feats, symbol, tf)
         res["confidence"] = apply_calibration(tf, biased)
-
-        # Soft Wilson-LB nudge (per TF)
         try:
             wins, total = ns_stats_get(symbol, tf)
             if total >= LB_NUDGE_MIN_N:
@@ -1377,14 +1405,13 @@ def signals(
         except Exception:
             pass
 
-        # Keep filter in sync with explicit threshold, if provided
         if isinstance(res.get("filters"), dict) and min_confidence is not None:
             res["filters"]["confidence_ok"] = (res["confidence"] >= float(min_confidence))
 
-        # Resolve market string for /chart round trips
         resolved_market = market or _auto_adapter(symbol, market).name.split(":", 1)[0]
         res["market"] = resolved_market
 
+        cache_set(key_sig, res)
         return res
     except HTTPException:
         raise
@@ -1413,14 +1440,21 @@ def scan(
     vol_min: Optional[float] = Query(None),
     _: None = Depends(require_key)
 ):
+    # --- add this block at the top of the function body ---
+    key = f"scan:{tf}:{limit}:{top}:{allow_neutral}:{ignore_trend}:{ignore_vol}:{risk_pct}:{equity}:{leverage}:{include_chart}:{min_confidence}:{precision}:{market}:{mode}:{vol_cap}:{vol_min}"
+    if not refresh:
+        cached = cache_get(key, ttl=7)   # tiny TTL to absorb repeat clicks
+    else:
+        cached = None
+    if cached is not None:
+        return cached
     adapter = get_adapter(market)
     if refresh:
         try:
             adapter.clear_cache()
         except Exception:
             pass
-    
-# Allow runtime mode swap for the mixed adapter
+    # Allow runtime mode swap for the mixed adapter
     if mode and hasattr(adapter, "mode"):
         m = mode.lower()
         if m in ("balanced", "pure"):
@@ -1428,21 +1462,18 @@ def scan(
             # keep name unique after override
             if hasattr(adapter, "name"):
                 adapter.name = f"top_traded:{adapter.mode}"
-    
     # Per-market scan caps to keep ccxt routes under the WP 65s proxy timeout
     MARKET_SCAN_CAP = {
         "crypto":   int(os.getenv("TOP_N_CRYPTO",  "18")),
         "futures":  int(os.getenv("TOP_N_FUTURES", "18")),   # binance_perps is treated as 'futures'
     }
-    
     mkey = (market or "crypto").split(":", 1)[0]
     eff_limit = min(limit, MARKET_SCAN_CAP.get(mkey, limit))
-
     uni = get_universe(limit=eff_limit, market_name=market)
     results, ok = [], []
+    MAX_SCAN_WORKERS = int(os.getenv("MAX_SCAN_WORKERS", "12"))
+    max_workers = min(MAX_SCAN_WORKERS, max(1, len(uni)))
 
-    # --- parallel scan of the universe (inside /scan) ---
-    max_workers = min(12, max(1, len(uni)))
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futs = {}
         for it in uni:
@@ -1461,7 +1492,6 @@ def scan(
                 vol_cap=vol_cap,   # may be None
                 vol_min=vol_min,   # may be None
             )] = it
-
         for fut in as_completed(futs):
             it = futs[fut]
             try:
@@ -1470,13 +1500,11 @@ def scan(
                 s["market"] = (market or it.get("market"))
                 if it.get("name"):
                     s["name"] = it["name"]
-
                 # learned bias + calibration
                 base_conf = float(s.get("confidence", 0.0))
                 feats_map = s.get("features") or {}
                 biased = apply_feedback_bias(base_conf, feats_map, s["symbol"], s["timeframe"])
                 s["confidence"] = apply_calibration(tf, biased)
-
                 # Wilson-LB nudge per symbol|tf
                 try:
                     wins, total = ns_stats_get(s["symbol"], tf)
@@ -1494,14 +1522,11 @@ def scan(
                         )
                 except Exception:
                     pass
-
                 if isinstance(s.get("filters"), dict) and (min_confidence is not None):
                     s["filters"]["confidence_ok"] = (s["confidence"] >= float(min_confidence))
-
                 # clean up market / name again for UI
                 s["market"] = it.get("market")
                 s["name"] = it.get("name", it["symbol"])
-
                 if s["advice"] == "Consider":
                     ok.append(s)
                 results.append(s)
@@ -1523,11 +1548,9 @@ def scan(
                     "advice": "Skip", "market": it.get("market"),
                     "name": it.get("name", it["symbol"])
                 })
-
     pool = ok if ok else results
     pool_sorted = sorted(pool, key=lambda s: abs(s.get("confidence") or 0.0), reverse=True)
     topK = pool_sorted[:top]   # <-- separate “top” from “limit”
-
     out: List[Dict[str, Any]] = []
     for s in topK:
         if include_chart:
@@ -1537,12 +1560,12 @@ def scan(
             except Exception:
                 s["chart"] = None
         out.append(s)
-
     note = None
     if not ok and allow_neutral:
         note = "No high-confidence setups; returning best candidates by confidence."
-
-    return {"universe": len(uni), "note": note, "results": out}
+    result = {"universe": len(uni), "note": note, "results": out}
+    cache_set(key, result)
+    return result
 
 # ========= FEEDBACK API =========
 class FeedbackIn(BaseModel):
@@ -1587,7 +1610,6 @@ class OfferIn(BaseModel):
     risk_pct: Optional[float] = None
     leverage: Optional[float] = None
     currency: Optional[str] = None
-
     created_ts: float
     expires_ts: float
 
@@ -1601,28 +1623,22 @@ def post_feedback(fb: FeedbackIn, request: Request, x_user_id: Optional[int] = H
     ua = request.headers.get("user-agent", "")[:300]
     ip = request.client.host if request.client else ""
     now = time.time()
-
     uid = int(x_user_id or 0)
     if uid <= 0 and fb.uid:          # accept body fallback if header got dropped
         uid = int(fb.uid or 0)
-
     # Must be logged in (WP proxy stamps this) – keep, but it’s redundant now
     if uid <= 0:
         raise HTTPException(status_code=401, detail="login required")
-
     fb.uid = uid  # canonicalize
-
     if not fb.fingerprint:
         d = (fb.direction or "").upper()
         e = f"{fb.entry:.6f}" if fb.entry is not None else "0"
         s = f"{fb.stop:.6f}" if fb.stop is not None else "0"
         t = f"{(fb.targets or [None])[0]:.6f}" if (fb.targets and fb.targets[0] is not None) else "0"
         fb.fingerprint = "|".join([fb.symbol, fb.tf, d, e, s, t])
-
     ok, why = _vote_matches_market(fb)
     if not ok:
         raise HTTPException(status_code=422, detail=f"Vote rejected: {why}")
-
     with _db_lock:
         conn = _db()
         try:
@@ -1633,7 +1649,6 @@ def post_feedback(fb: FeedbackIn, request: Request, x_user_id: Optional[int] = H
             ).fetchone()
             if row_u is not None and isinstance(row_u[0], (float, int)) and (now - row_u[0]) < 30:
                 raise HTTPException(status_code=429, detail="Too fast. Please wait a moment and try again.")
-
             # IP-based cooldown
             row = conn.execute(
                 "SELECT ts FROM feedback WHERE ip=? ORDER BY ts DESC LIMIT 1", (ip,)
@@ -1642,7 +1657,6 @@ def post_feedback(fb: FeedbackIn, request: Request, x_user_id: Optional[int] = H
                 last_ts = row[0]
                 if isinstance(last_ts, (float, int)) and (now - last_ts) < 30:
                     raise HTTPException(status_code=429, detail="Feedback rate limit exceeded. Only one vote is allowed per trade.")
-
             # unique (uid,fingerprint)
             try:
                 cur = conn.execute(
@@ -1661,21 +1675,18 @@ def post_feedback(fb: FeedbackIn, request: Request, x_user_id: Optional[int] = H
                 )
             except sqlite3.IntegrityError:
                 raise HTTPException(status_code=409, detail="Already voted for this trade")
-
             rid = cur.lastrowid
             conn.commit()
         finally:
             conn.close()
-
     try:
         update_weights_ns(fb.features or {}, fb.outcome, fb.symbol, fb.tf)
     except Exception:
         pass
-
     return FeedbackAck(ok=True, stored_id=rid, accepted=True)
 
 @app.get("/feedback/summary")
-def feedback_summary(symbol: str, tf: str, direction: Optional[str] = None, window: int = Query(86400, ge=1)):
+def feedback_summary(symbol: str, tf: str, direction: Optional[str] = None, window: int = Query(86400, ge=1), _: None = Depends(require_key)):
     """Summarize ONLY accepted, human votes in the last `window` seconds."""
     cutoff = time.time() - float(window)
     with _db_lock:
@@ -1693,7 +1704,7 @@ def feedback_summary(symbol: str, tf: str, direction: Optional[str] = None, wind
     return {"up": up, "down": down, "total": total}
 
 @app.get("/feedback/stats")
-def feedback_stats():
+def feedback_stats(_: None = Depends(require_key)):
     with _db_lock:
         conn = _db()
         total = conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0]
@@ -1707,10 +1718,8 @@ def feedback_stats():
 def learning_offered(batch: OffersBatch, request: Request, _: None = Depends(require_key)):
     if not batch.items:
         return {"ok": True, "stored": 0}
-
     ua = request.headers.get("user-agent", "")[:300]
     ip = request.client.host if request.client else ""
-
     with _db_lock:
         conn = _db()
         try:
@@ -1734,7 +1743,6 @@ def learning_offered(batch: OffersBatch, request: Request, _: None = Depends(req
             conn.commit()
         finally:
             conn.close()
-
     return {"ok": True, "stored": len(batch.items)}
 
 # --- REPLACE: resolve-one to avoid nested locks and long critical sections ---
@@ -1751,10 +1759,8 @@ def learning_resolve_one(body: ResolveOneIn, _: None = Depends(require_key)):
         conn.close()
     if not row:
         raise HTTPException(404, detail="offer not found")
-
     # 2) Do network-heavy work OUTSIDE the lock
     upd = resolve_offer_row(row)
-
     # 3) Write update under lock (short transaction)
     with _db_lock:
         conn = _db()
@@ -1764,7 +1770,6 @@ def learning_resolve_one(body: ResolveOneIn, _: None = Depends(require_key)):
         )
         conn.commit()
         conn.close()
-
     # 4) Log synthetic feedback OUTSIDE existing lock (helper locks internally)
     try:
         if int(upd.get("outcome", 0)) != 0:
@@ -1774,7 +1779,6 @@ def learning_resolve_one(body: ResolveOneIn, _: None = Depends(require_key)):
             )
     except Exception:
         pass  # never block resolution on logging
-
     return {"ok": True, "id": body.id, **upd}
 
 @app.post("/learning/resolve-due")
@@ -1813,6 +1817,15 @@ def learning_config(_: None = Depends(require_key)):
         "eval_stop_first": bool(EVAL_STOP_FIRST),
         "nudge_enabled": int(NEUTRAL_NUDGE_ENABLED),
     }
+    
+@app.get("/metrics", include_in_schema=False)
+def metrics(_: None = Depends(require_key)):
+    with _db_lock:
+        conn = _db()
+        pending = conn.execute("SELECT COUNT(*) FROM offers WHERE resolved=0").fetchone()[0]
+        done    = conn.execute("SELECT COUNT(*) FROM offers WHERE resolved=1").fetchone()[0]
+        conn.close()
+    return PlainTextResponse(f"offers_pending {pending}\noffers_resolved_total {done}\n")
 
 # === FX helper endpoint (USD/EUR/GBP) ===
 from typing import Set
@@ -1825,12 +1838,14 @@ def fx(base: str = "USD", _: None = Depends(require_key)):
     """
     base = (base or "USD").upper()
     want: Set[str] = {"EUR", "GBP"}
-
+    ckey = f"fx:{base}"
+    cached = cache_get(ckey, ttl=60)
+    if cached is not None:
+        return cached
     # Use the existing Yahoo/forex adapter so we don't add new deps here.
     def _last_px(ticker: str) -> float:
         df = fetch_ohlcv(ticker, "1h", bars=2, market_name="forex")
         return float(df["close"].iloc[-1])
-
     rates = {}
     for iso in want:
         if iso == base:
@@ -1849,8 +1864,9 @@ def fx(base: str = "USD", _: None = Depends(require_key)):
                 pass
         if rate is not None:
             rates[iso] = float(rate)
-
-    return {"base": base, "rates": rates, "ts": int(time.time() * 1000)}
+    out = {"base": base, "rates": rates, "ts": int(time.time() * 1000)}
+    cache_set(ckey, out)
+    return out
 
 # ========= TRACKED TRADES (for mobile app) =========
 from fastapi import Body
@@ -1956,6 +1972,33 @@ def tracked_delete_path(id: str, x_user_id: Optional[int] = Header(None), _: Non
         conn.commit()
         conn.close()
     return _tracked_list_for(uid)
+
+@app.post("/admin/cache/clear")
+def admin_cache_clear(scope: Optional[str] = Query(None), _: None = Depends(require_key)):
+    global CACHE, _WINDOW_CACHE
+    sc = (scope or "").strip().lower()
+
+    # process caches
+    if sc in ("", "proc", "all"):
+        CACHE.clear()
+        _WINDOW_CACHE.clear()
+
+    # adapter caches
+    if sc in ("", "adapters", "all"):
+        # clear all known adapters
+        for name in ("crypto", "forex", "stocks", "commodities", "top_traded_bal", "top_traded_pure"):
+            try:
+                get_adapter(name).clear_cache()
+            except Exception:
+                pass
+    elif sc not in ("proc", "adapters", "all"):
+        # clear a specific adapter by name
+        try:
+            get_adapter(sc).clear_cache()
+        except Exception:
+            pass
+
+    return {"ok": True, "scope": sc or "all"}
 
 # ---- Learning: record a feedback row from an offer resolution ----
 def _record_feedback_from_offer(offer: Dict[str, Any], outcome: int, resolved_ts: float, pnl: Optional[float] = None):
