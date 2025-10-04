@@ -105,9 +105,9 @@ def _db():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
-    conn.execute("PRAGMA temp_store=MEMORY;")
-    conn.execute("PRAGMA mmap_size=300000000;")
-    conn.execute("PRAGMA cache_size=-20000;")
+    conn.execute("PRAGMA temp_store=FILE;")
+    conn.execute("PRAGMA mmap_size=0;")
+    conn.execute("PRAGMA cache_size=-5000;")
     conn.execute("PRAGMA busy_timeout=5000;")
     return conn
 
@@ -789,7 +789,7 @@ def tf_ms(tf: str) -> int:
 from collections import OrderedDict
 _WINDOW_CACHE = OrderedDict()
 _WINDOW_TTL = 30  # seconds
-_WINDOW_MAX = 8  # entries
+_WINDOW_MAX = 4  # entries
 
 def _wcache_get(key):
     now = time.time()
@@ -801,10 +801,10 @@ def _wcache_get(key):
         return None
     # move to MRU
     _WINDOW_CACHE.move_to_end(key)
-    return df.copy()
+    return df
 
 def _wcache_set(key, df):
-    _WINDOW_CACHE[key] = (time.time(), df.copy())
+    _WINDOW_CACHE[key] = (time.time(), df)
     _WINDOW_CACHE.move_to_end(key)
     while len(_WINDOW_CACHE) > _WINDOW_MAX:
         _WINDOW_CACHE.popitem(last=False)
@@ -979,7 +979,7 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     out["di_plus"]  = di_p
     out["di_minus"] = di_m
 
-    _downcast_inplace(out)
+    _downcast_inplace(feats)
 
     return out
 

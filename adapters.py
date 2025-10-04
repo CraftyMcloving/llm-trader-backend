@@ -94,64 +94,89 @@ class CryptoCCXT(BaseAdapter):
             self._markets = self._exh().load_markets()
         return self._markets
 
-def list_universe(self, limit: int = None, top: int = None) -> List[Dict[str, Any]]:
-    """
-    Crypto universe:
-      - Prefer curated symbols for this quote (e.g., 'USDT').
-      - Optionally top-up from exchange markets if CCXT_FILL_REMAINDER=1.
-      - Honor CRYPTO_UNIVERSE_CAP (>0 caps; 0 means 'no cap').
-    """
-    # alias handling
-    if top is not None and limit is None:
-        limit = top
-    limit = int(limit or 20)
+    def list_universe(self, limit: int = None, top: int = None) -> List[Dict[str, Any]]:
+        """
+        Build a crypto universe for the configured exchange/quote.
 
-    # read hard cap early
-    try:
-        hard_cap = int(os.getenv("CRYPTO_UNIVERSE_CAP", "60"))  # widen default from 18 → 60
-    except Exception:
-        hard_cap = 60
+        Order of preference:
+          1) Start with curated bases (preserve their order) if the pair exists and is active.
+          2) Optionally top up with any other active pairs for the same quote (when CCXT_FILL_REMAINDER=1).
+          3) If still empty, try the opposite stable quote (USDT<->USD) for curated bases as a last resort.
 
-    m = self._load_markets()
-    avail: List[str] = []
+        Caps:
+          - CRYPTO_UNIVERSE_CAP (>0) limits the final list length; 0 means 'no cap'.
+        """
+        # alias handling
+        if top is not None and limit is None:
+            limit = top
+        limit = int(limit or 20)
 
-    # 1) curated first (preferred, preserves order)
-    for base in (self.curated or []):
-        sym = f"{base}/{self.quote}"
-        if sym in m and m[sym].get("active"):
-            avail.append(sym)
+        # read hard cap early
+        try:
+            hard_cap = int(os.getenv("CRYPTO_UNIVERSE_CAP", "24"))
+        except Exception:
+            hard_cap = 24
+        eff_limit = limit if hard_cap <= 0 else min(limit, hard_cap)
 
-    # 2) optionally fill the remainder from all active markets for this quote
-    #    (only if explicitly enabled; off by default for speed)
-    if len(avail) < limit and bool(int(os.getenv("CCXT_FILL_REMAINDER", "0"))):
-        for sym, info in m.items():
-            if info.get("quote") == self.quote and info.get("active"):
-                avail.append(sym)
-                if len(avail) >= limit:
-                    break
+        # load exchange markets (cached by ccxt)
+        m = self._load_markets() or {}
+        avail: List[str] = []
 
-    # 3) de-dupe while preserving order
-    seen = set()
-    avail = [s for s in avail if not (s in seen or seen.add(s))]
+        # 1) curated first (preferred, preserves given order)
+        if self.curated:
+            for base in self.curated:
+                sym = f"{base}/{self.quote}"
+                info = m.get(sym)
+                if info and info.get("active", True):
+                    avail.append(sym)
 
-    # 4) apply effective limit (respect 'no cap' when hard_cap == 0)
-    eff_limit = limit if hard_cap <= 0 else min(limit, hard_cap)
-    avail = avail[:eff_limit]
+        # 2) optionally fill remainder from any other active markets for this quote
+        if len(avail) < eff_limit and bool(int(os.getenv("CCXT_FILL_REMAINDER", "0"))):
+            # deterministic iteration for stability
+            for sym in sorted(m.keys()):
+                info = m.get(sym) or {}
+                try:
+                    if info.get("quote") == self.quote and info.get("active", True):
+                        if sym not in avail:
+                            avail.append(sym)
+                            if len(avail) >= eff_limit:
+                                break
+                except Exception:
+                    continue
 
-    # 5) shape response
-    return [
-        {"symbol": s, "name": s, "market": "crypto", "tf_supported": ["5m", "15m", "1h", "1d"]}
-        for s in avail
-    ]
+        # trim to effective limit
+        avail = avail[:eff_limit]
+
+        # 3) last-resort: if still empty, attempt alternate quote for curated (e.g., USD <-> USDT)
+        if not avail and self.curated:
+            alt_q = "USDT" if self.quote.upper() != "USDT" else "USD"
+            for base in self.curated:
+                sym = f"{base}/{alt_q}"
+                info = m.get(sym)
+                if info and info.get("active", True):
+                    avail.append(sym)
+                    if len(avail) >= eff_limit:
+                        break
+
+        # shape response for the app
+        return [
+            {
+                "symbol": s,
+                "name": s.split("/", 1)[0],
+                "market": "crypto",
+                "tf_supported": ["5m", "15m", "1h", "1d"],
+            }
+            for s in avail
+        ]
 
     def _cache_get(self, key:str) -> Optional[pd.DataFrame]:
         v = self._cache.get(key)
         if not v: return None
         ts, df = v
-        return df.copy() if (time.time()-ts) <= self.cache_ttl else None
+        return df if (time.time()-ts) <= self.cache_ttl else None
 
     def _cache_set(self, key:str, df:pd.DataFrame):
-        self._cache[key] = (time.time(), df.copy())
+        self._cache[key] = (time.time(), df)
 
     def fetch_ohlcv(self, symbol:str, tf:str, bars:int) -> pd.DataFrame:
         ex = self._exh()
@@ -288,10 +313,10 @@ class YFAdapter(BaseAdapter):
         v = self._cache.get(key)
         if not v: return None
         ts, df = v
-        return df.copy() if (time.time() - ts) <= self.cache_ttl else None
+        return df if (time.time() - ts) <= self.cache_ttl else None
 
     def _cache_set(self, key:str, df:pd.DataFrame):
-        self._cache[key] = (time.time(), df.copy())
+        self._cache[key] = (time.time(), df)
 
     def list_universe(self, limit:int) -> List[Dict[str,Any]]:
         syms = self.tickers[:max(1, limit)]
@@ -308,9 +333,10 @@ class YFAdapter(BaseAdapter):
         if cached is not None:
             df = cached
         else:
+            _period = {"5m": "7d", "15m": "30d", "60m": "90d", "1h": "90d", "1d": "365d"}[self._interval(tf)]
             df_raw = yf.download(
                 symbol,
-                period="60d",
+                period=_period,
                 interval=self._interval(tf),
                 progress=False,
                 prepost=False,
