@@ -979,7 +979,7 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     out["di_plus"]  = di_p
     out["di_minus"] = di_m
 
-    _downcast_inplace(out)
+    _downcast_inplace(feats)
 
     return out
 
@@ -1066,6 +1066,7 @@ if PRECISION_STRICT:
 def build_trade(symbol: str, df: pd.DataFrame, direction: str,
                 risk_pct: float = 1.0, equity: Optional[float] = None, leverage: float = 1.0,
                 market_name: Optional[str] = None, tf: Optional[str] = None) -> Dict[str, Any]:
+    feats = df
     ad = _auto_adapter(symbol, market_name)
     mkt = {}  # only used for ccxt precision metadata in UI; safe empty for yfinance
 
