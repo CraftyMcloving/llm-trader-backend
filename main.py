@@ -556,17 +556,18 @@ def get_universe(quote=QUOTE, limit=TOP_N, market_name: Optional[str] = None) ->
     if u is not None:
         return u
 
-    # tolerate different adapter signatures
+# tolerate different adapter signatures
+try:
     try:
         items = ad.list_universe(limit=lim)
-    except Exception as e:
-        logger.exception("list_universe failed: %s", e)
-        items = []
     except TypeError:
         try:
             items = ad.list_universe(top=lim)
         except TypeError:
             items = ad.list_universe(lim)
+except Exception as e:
+    logger.exception("list_universe failed: %s", e)
+    items = []
 
     def _get(it, k, default=None):
         return it.get(k, default) if isinstance(it, dict) else getattr(it, k, default)
@@ -966,11 +967,6 @@ def build_trade(symbol: str, df: pd.DataFrame, direction: str,
 
     denom = (price_p - stop)
     rr = [round(abs((t - price_p) / denom), 2) if denom else 0.0 for t in targets]
-
-    # [ADD] Entry improvement hint: try a half-ATR pullback for better R:R
-    pull = 0.5 * a
-    entry_hint = price_p - pull if direction == "Long" else price_p + pull
-    entry_hint = float(ad.price_to_precision(symbol, entry_hint))
 
     pos = None
     risk_amt = None
