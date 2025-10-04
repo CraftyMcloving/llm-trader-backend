@@ -552,6 +552,9 @@ def get_universe(quote=QUOTE, limit=TOP_N, market_name: Optional[str] = None) ->
     # tolerate different adapter signatures
     try:
         items = ad.list_universe(limit=lim)
+    except Exception as e:
+        logger.exception("list_universe failed: %s", e)
+        items = []
     except TypeError:
         try:
             items = ad.list_universe(top=lim)

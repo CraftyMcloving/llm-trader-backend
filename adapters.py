@@ -95,34 +95,54 @@ class CryptoCCXT(BaseAdapter):
         return self._markets
 
     def list_universe(self, limit: int = None, top: int = None) -> List[Dict[str, Any]]:
+        """
+        Crypto universe:
+          - Prefer curated symbols for this quote (e.g., 'USDT').
+          - Optionally top-up from exchange markets if CCXT_FILL_REMAINDER=1.
+          - Honor CRYPTO_UNIVERSE_CAP (>0 caps; 0 means 'no cap').
+        """
+        # alias handling
         if top is not None and limit is None:
-            limit = top
+        limit = top
         limit = int(limit or 20)
+
+        # read cap early
+        try:
+            hard_cap = int(os.getenv("CRYPTO_UNIVERSE_CAP", "60"))  # default widened 18 → 60
+        except Exception:
+            hard_cap = 60
 
         m = self._load_markets()
         avail: List[str] = []
 
-        # curated first (preferred)
+        # 1) curated first (preferred, preserves order)
         for base in (self.curated or []):
             sym = f"{base}/{self.quote}"
             if sym in m and m[sym].get("active"):
                 avail.append(sym)
 
-        # by default DO NOT fill remainder for CCXT (too slow in bulk)
-        # flip on with CCXT_FILL_REMAINDER=1 if you really want a bigger list
-        if not avail and bool(int(os.getenv("CCXT_FILL_REMAINDER", "0"))):
+        # 2) optionally fill the remainder from all active markets for this quote
+        #    (only if explicitly enabled; off by default for speed)
+        if len(avail) < limit and bool(int(os.getenv("CCXT_FILL_REMAINDER", "0"))):
             for sym, info in m.items():
                 if info.get("quote") == self.quote and info.get("active"):
                     avail.append(sym)
                     if len(avail) >= limit:
                         break
 
-        avail = avail[:min(limit, hard_cap)]
-        # after you've built `avail` (a de-duplicated list of symbols) …
-        hard_cap = int(os.getenv("CRYPTO_UNIVERSE_CAP", "60"))  # was 18; widen default
-        eff_limit = min(int(limit or 20), hard_cap) if hard_cap > 0 else int(limit or 20)
+        # 3) de-dupe while preserving order
+        seen = set()
+        avail = [s for s in avail if not (s in seen or seen.add(s))]
+
+        # 4) apply effective limit (respect 'no cap' when hard_cap == 0)
+        eff_limit = limit if hard_cap <= 0 else min(limit, hard_cap)
         avail = avail[:eff_limit]
-        return [{"symbol": s, "name": s, "market": "crypto", "tf_supported": ["5m","15m","1h","1d"]} for s in avail]
+
+        # 5) shape response
+        return [
+            {"symbol": s, "name": s, "market": "crypto", "tf_supported": ["5m", "15m", "1h", "1d"]}
+            for s in avail
+        ]
 
     def _cache_get(self, key:str) -> Optional[pd.DataFrame]:
         v = self._cache.get(key)
