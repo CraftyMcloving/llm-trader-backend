@@ -630,40 +630,32 @@ TF_MAP = {"5m":"5m","15m":"15m","1h": "1h", "1d": "1d"}
 
 # --- Crypto symbol variants & ccxt direct fallback (avoid Yahoo for crypto) ---
 def _crypto_sym_variants(symbol: str) -> list[str]:
-    """Try sensible alternates like USD <-> USDT."""
     s = symbol.upper()
     alts = [s]
-    if "/USD" in s:
-        alts.append(s.replace("/USD", "/USDT"))
-    if "/USDT" in s:
-        alts.append(s.replace("/USDT", "/USD"))
-    return list(dict.fromkeys(alts))  # dedupe, keep order
+    if "/USD" in s:  alts.append(s.replace("/USD", "/USDT"))
+    if "/USDT" in s: alts.append(s.replace("/USDT", "/USD"))
+    return list(dict.fromkeys(alts))
 
-def _ccxt_direct_crypto(symbol: str, tf: str, bars: int, exchanges=("binance","okx","kucoin")):
-    """
-    Emergency OHLCV fetch that bypasses adapters when they fail or Yahoo is down.
-    Returns a pandas DataFrame or None.
-    """
-    try:
-        import ccxt
-    except Exception:
-        return None  # can't help without ccxt
-
-    tf_ccxt = {"5m":"5m", "15m":"15m", "1h":"1h", "1d":"1d"}.get(tf, "1h")
-    for ex_id in exchanges:
+def _ccxt_direct_crypto(symbol: str, tf: str, bars: int):
+    tf_ccxt = {"5m":"5m","15m":"15m","1h":"1h","1d":"1d"}.get(tf, "1h")
+    for ex_id in ("binance", "okx", "kucoin"):
+        ex = _get_ccxt(ex_id)
+        if not ex:
+            continue
         try:
-            ex = getattr(ccxt, ex_id)({"enableRateLimit": True, "timeout": 20000})
-            markets = ex.load_markets()
             for s in _crypto_sym_variants(symbol):
-                if s not in markets:
+                if s not in ex.markets:
                     continue
                 ohlcv = ex.fetch_ohlcv(s, timeframe=tf_ccxt, limit=bars)
                 if not ohlcv:
                     continue
                 df = pd.DataFrame(ohlcv, columns=["timestamp","open","high","low","close","volume"])
-                # standardize index
                 df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
                 df.set_index("timestamp", inplace=True)
+                # downcast right away to save RAM
+                for c in ("open","high","low","close","volume"):
+                    if c in df.columns:
+                        df[c] = pd.to_numeric(df[c], errors="coerce").astype("float32")
                 return df
         except Exception:
             continue
@@ -719,6 +711,8 @@ def fetch_ohlcv(symbol: str, tf: str, bars: int = 720, market_name: Optional[str
                 except Exception:
                     tried.append(alt_ad.name if 'alt_ad' in locals() else alt)
                     continue
+                    
+        _downcast_inplace(df)
 
         _fail("", e)
 
@@ -757,13 +751,13 @@ def fetch_ohlcv_window(symbol: str, tf: str, start_ms: int, end_ms: int, market_
                     tried.append(alt)
                     continue
 
-            # ccxt direct: approximate by fetching enough bars then slicing
             need = int((end_ms - start_ms) / max(tf_ms(tf), 1) + 10)
             df_ccxt = _ccxt_direct_crypto(symbol, tf, max(need, 120))
             if df_ccxt is not None:
                 tried.append("ccxt:direct")
-                df_slice = df_ccxt[(df_ccxt.index.view("int64") // 10**6 >= start_ms) &
-                                   (df_ccxt.index.view("int64") // 10**6 <= end_ms)]
+                idx_ms = df_ccxt.index.view("int64") // 10**6
+                mask = (idx_ms >= start_ms) & (idx_ms <= end_ms)
+                df_slice = df_ccxt.loc[mask]
                 if not df_slice.empty:
                     return _set(df_slice)
 
@@ -794,8 +788,8 @@ def tf_ms(tf: str) -> int:
 
 from collections import OrderedDict
 _WINDOW_CACHE = OrderedDict()
-_WINDOW_TTL = 60  # seconds
-_WINDOW_MAX = 64  # entries
+_WINDOW_TTL = 30  # seconds
+_WINDOW_MAX = 8  # entries
 
 def _wcache_get(key):
     now = time.time()
@@ -985,6 +979,8 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     out["di_plus"]  = di_p
     out["di_minus"] = di_m
 
+    _downcast_inplace(out)
+
     return out
 
 def last_features_snapshot(feats: pd.DataFrame) -> Dict[str, float]:
@@ -1032,6 +1028,22 @@ NEUTRAL_NUDGE_ENABLED = bool(int(os.getenv("NEUTRAL_NUDGE_ENABLED", "1")))
 PRECISION_STRICT = bool(int(os.getenv("PRECISION_STRICT", "0")))
 PROB_FLOOR       = float(os.getenv("PROB_FLOOR", "0.58"))  # hard prob floor
 UNIVERSE_LIMIT_MAX = int(os.getenv("UNIVERSE_LIMIT_MAX", "200"))
+# ---- ccxt exchange pool (reuse across calls/threads) ----
+_CCXT_POOL = {}
+_CCXT_LOCK = threading.RLock()
+
+def _get_ccxt(ex_id: str):
+    try:
+        import ccxt
+    except Exception:
+        return None
+    with _CCXT_LOCK:
+        ex = _CCXT_POOL.get(ex_id)
+        if ex is None:
+            ex = getattr(ccxt, ex_id)({"enableRateLimit": True, "timeout": 20000})
+            ex.load_markets()
+            _CCXT_POOL[ex_id] = ex
+        return ex
 
 if PRECISION_STRICT:
     # minimum model confidence
@@ -1352,6 +1364,11 @@ def _htf_bias(symbol: str, tf: str, market_name: Optional[str]) -> str:
         return "Bullish" if up else ("Bearish" if dn else "Neutral")
     except Exception:
         return "Neutral"
+        
+def _downcast_inplace(df: pd.DataFrame):
+    for c in df.columns:
+        if pd.api.types.is_float_dtype(df[c]):
+            df[c] = df[c].astype("float32")
 
 # ----- Pure helper used by both endpoints -----
 def evaluate_signal(
@@ -1368,10 +1385,11 @@ def evaluate_signal(
     vol_cap: Optional[float] = None,
     vol_min: Optional[float] = None,
 ) -> Dict[str, Any]:
-    df = fetch_ohlcv(symbol, tf, bars=400, market_name=market_name)
+    df = fetch_ohlcv(symbol, tf, bars=320, market_name=market_name)
     feats = compute_features(df).dropna().iloc[-200:]
     if len(feats) < 50:
         raise HTTPException(502, detail="insufficient features window")
+    _downcast_inplace(out)
 
     thresh = min_confidence if (min_confidence is not None) else MIN_CONFIDENCE
     sig, conf, filt, reasons = infer_signal(feats, thresh, vol_cap=vol_cap, vol_min=vol_min)
@@ -1881,7 +1899,7 @@ def scan(
     eff_limit = min(limit, MARKET_SCAN_CAP.get(mkey, limit))
     uni = get_universe(limit=eff_limit, market_name=market)
     results, ok = [], []
-    MAX_SCAN_WORKERS = int(os.getenv("MAX_SCAN_WORKERS", "12"))
+    MAX_SCAN_WORKERS = int(os.getenv("MAX_SCAN_WORKERS", "4"))
     max_workers = min(MAX_SCAN_WORKERS, max(1, len(uni)))
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
