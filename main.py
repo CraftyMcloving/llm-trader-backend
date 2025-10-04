@@ -979,7 +979,7 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     out["di_plus"]  = di_p
     out["di_minus"] = di_m
 
-    _downcast_inplace(feats)
+    _downcast_inplace(out)
 
     return out
 
