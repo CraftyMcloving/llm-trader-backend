@@ -1404,8 +1404,9 @@ def evaluate_signal(
             risk_pct=risk_pct, equity=equity, leverage=leverage,
             market_name=market_name, tf=tf
         )
-        # mark clearly so front-end can style if it wants
-        draft_trade.setdefault("meta", {})["draft"] = True
+        mt = draft_trade.setdefault("meta", {})
+        mt["draft"] = True
+        mt["preview_only"] = True
     except Exception:
         draft_trade = None
 
@@ -1513,7 +1514,7 @@ def evaluate_signal(
             return {
                 "symbol": symbol, "timeframe": tf, "signal": sig, "confidence": conf,
                 "updated": pd.Timestamp.utcnow().isoformat(),
-                "trade": None,
+                "trade": draft_trade,
                 "filters": {**filt, "reasons": reasons, "liquid_ok": True},
                 "advice": "Skip",
                 "features": last_features_snapshot(feats),
