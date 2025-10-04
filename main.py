@@ -633,17 +633,44 @@ def fetch_ohlcv(symbol: str, tf: str, bars: int = 720, market_name: Optional[str
     try:
         return ad.fetch_ohlcv(symbol, tf, bars)
     except AdapterError as e:
-        # try second-chance heuristics if market was missing
-        if not market_name:
-            for alt in ("forex","commodities","stocks","crypto"):
+        tried = [ad.name]
+        # Prefer same-market rescue first (crypto)
+        if (market_name or ad.name).split(":",1)[0] == "crypto":
+            basesym = symbol
+            sym_variants = [basesym]
+            if "/USD" in basesym:
+                sym_variants.append(basesym.replace("/USD", "/USDT"))
+            elif "/USDT" in basesym:
+                sym_variants.append(basesym.replace("/USDT", "/USD"))
+            for alt in ("top_traded_bal","top_traded_pure","crypto"):
                 try:
-                    if alt != ad.name.split(":",1)[0]:
-                        return get_adapter(alt).fetch_ohlcv(symbol, tf, bars)
+                    alt_ad = get_adapter(alt)
+                    if alt_ad.name == ad.name:
+                        continue
+                    for s in sym_variants:
+                        try:
+                            return alt_ad.fetch_ohlcv(s, tf, bars)
+                        except Exception:
+                            continue
+                    tried.append(alt_ad.name)
                 except Exception:
                     pass
-        raise HTTPException(502, detail=str(e))
+        # Cross-market hail-mary (kept, but unlikely to help for crypto symbols)
+        if not market_name:
+            for alt in ("forex","commodities","stocks"):
+                try:
+                    alt_ad = get_adapter(alt)
+                    if alt_ad.name.split(":",1)[0] == ad.name.split(":",1)[0]:
+                        continue
+                    return alt_ad.fetch_ohlcv(symbol, tf, bars)
+                except Exception:
+                    tried.append(alt)
+                    continue
+        msg = str(e) or getattr(e, "message", "") or repr(e)
+        raise HTTPException(502, detail=f"{ad.name} fetch_ohlcv error: {msg} (tried: {', '.join(tried)})")
     except Exception as e:
-        raise HTTPException(502, detail=f"{ad.name} fetch_ohlcv error: {e}")
+        msg = str(e) or getattr(e, "message", "") or repr(e)
+        raise HTTPException(502, detail=f"{ad.name} fetch_ohlcv error: {msg}")
 
 def fetch_ohlcv_window(symbol: str, tf: str, start_ms: int, end_ms: int, market_name: Optional[str] = None) -> pd.DataFrame:
     ad = _auto_adapter(symbol, market_name)
@@ -656,18 +683,44 @@ def fetch_ohlcv_window(symbol: str, tf: str, start_ms: int, end_ms: int, market_
         _wcache_set(k, df)
         return df
     except AdapterError as e:
-        if not market_name:
-            for alt in ("forex","commodities","stocks","crypto"):
+        tried = [ad.name]
+        # Prefer same-market rescue first (crypto)
+        if (market_name or ad.name).split(":",1)[0] == "crypto":
+            basesym = symbol
+            sym_variants = [basesym]
+            if "/USD" in basesym:
+                sym_variants.append(basesym.replace("/USD", "/USDT"))
+            elif "/USDT" in basesym:
+                sym_variants.append(basesym.replace("/USDT", "/USD"))
+            for alt in ("top_traded_bal","top_traded_pure","crypto"):
                 try:
-                    if alt != ad.name.split(":",1)[0]:
-                        df = get_adapter(alt).fetch_window(symbol, tf, start_ms, end_ms)
-                        _wcache_set(k, df)
-                        return df
+                    alt_ad = get_adapter(alt)
+                    if alt_ad.name == ad.name:
+                        continue
+                    for s in sym_variants:
+                        try:
+                            return alt_ad.fetch_window(s, tf, bars)
+                        except Exception:
+                            continue
+                    tried.append(alt_ad.name)
                 except Exception:
                     pass
-        raise HTTPException(502, detail=str(e))
+        # Cross-market hail-mary (kept, but unlikely to help for crypto symbols)
+        if not market_name:
+            for alt in ("forex","commodities","stocks"):
+                try:
+                    alt_ad = get_adapter(alt)
+                    if alt_ad.name.split(":",1)[0] == ad.name.split(":",1)[0]:
+                        continue
+                    return alt_ad.fetch_window(symbol, tf, bars)
+                except Exception:
+                    tried.append(alt)
+                    continue
+        msg = str(e) or getattr(e, "message", "") or repr(e)
+        raise HTTPException(502, detail=f"{ad.name} fetch_window error: {msg} (tried: {', '.join(tried)})")
     except Exception as e:
-        raise HTTPException(502, detail=f"{ad.name} fetch_window error: {e}")
+        msg = str(e) or getattr(e, "message", "") or repr(e)
+        raise HTTPException(502, detail=f"{ad.name} fetch_window error: {msg}")
 
 # ms per bar
 def tf_ms(tf: str) -> int:
