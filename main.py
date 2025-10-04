@@ -6,10 +6,12 @@ from fastapi.responses import PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import os, json, sqlite3, threading, time
 import math
 import pandas as pd
 import numpy as np
+
 
 # NEW: external adapters
 from adapters import get_adapter, BaseAdapter, UniverseItem, AdapterError
@@ -402,18 +404,24 @@ def apply_calibration(tf: str, p: float) -> float:
 def _ns(symbol: str, tf: str) -> str:
     return f"{symbol}|{tf}"
 
-    # Build weights in order of increasing specificity (global → timeframe-level → symbol-level),
-    # allowing later assignments to override earlier ones.  We always include global weights
-    # so that features missing at the namespace level fall back to a sensible base.
+def get_weights_ns(symbol: str, tf: str) -> Dict[str, float]:
+    """
+    Merge weights in order of specificity:
+      global (weights) -> timeframe overrides (*|tf) -> symbol+tf (BTC/USD|1h).
+    Later levels override earlier ones.
+    """
+    ns_tf  = f"*|{tf}"
+    ns_sym = _ns(symbol, tf)
+    W: Dict[str, float] = {}
     with _db_lock:
         conn = _db()
-        # Global base weights
+        # global base
         for k, v in conn.execute("SELECT feature, w FROM weights"):
             W[k] = float(v)
-        # Timeframe-level overrides (e.g. "*|1h")
+        # timeframe overrides
         for k, v in conn.execute("SELECT feature, w FROM weights_ns WHERE namespace=?", (ns_tf,)):
             W[k] = float(v)
-        # Symbol-specific overrides (e.g. "BTC/USD|1h")
+        # symbol + timeframe overrides
         for k, v in conn.execute("SELECT feature, w FROM weights_ns WHERE namespace=?", (ns_sym,)):
             W[k] = float(v)
         conn.close()
@@ -822,6 +830,11 @@ TURNOVER_MIN_USD_PER_HR = float(os.getenv("TURNOVER_MIN_USD_PER_HR", "100000")) 
 EV_MIN            = float(os.getenv("EV_MIN", "0.05"))  # min expected value in R units
 WILSON_MIN_N      = int(os.getenv("WILSON_MIN_N", "50"))  # min samples before LB gate
 WILSON_LB_MIN     = float(os.getenv("WILSON_LB_MIN", "0.55"))  # min lower bound win rate
+# Soft confidence nudge from Wilson LB (per TF)
+LB_NUDGE_MIN_N = int(os.getenv("LB_NUDGE_MIN_N", "30"))   # minimum samples to trust LB
+LB_NUDGE_MAX   = float(os.getenv("LB_NUDGE_MAX",   "0.05"))# max ±5% absolute confidence tweak
+# --- Neutral nudge master toggle (env) ---
+NEUTRAL_NUDGE_ENABLED = bool(int(os.getenv("NEUTRAL_NUDGE_ENABLED", "1")))
 
 def build_trade(symbol: str, df: pd.DataFrame, direction: str,
                 risk_pct: float = 1.0, equity: Optional[float] = None, leverage: float = 1.0,
@@ -913,7 +926,7 @@ def infer_regime(feats: pd.DataFrame) -> str:
         return "chop"
     return "mixed"
 
-def infer_signal(feats: pd.DataFrame, min_conf: float) -> Tuple[str,float,Dict[str,bool],List[str]]:
+def infer_signal(feats: pd.DataFrame, min_conf: float, vol_cap: Optional[float] = None, vol_min: Optional[float] = None) -> Tuple[str,float,Dict[str,bool],List[str]]:
     last = feats.iloc[-1]; reasons=[]
 
     # Regime & trend gates
@@ -927,7 +940,9 @@ def infer_signal(feats: pd.DataFrame, min_conf: float) -> Tuple[str,float,Dict[s
 
     # Volatility guardrails (plus extreme tail)
     atr_pct = float(last["atr_pct"])
-    vol_ok  = bool((atr_pct>=VOL_MIN_ATR_PCT) and (atr_pct<=VOL_CAP_ATR_PCT))
+    cap  = float(VOL_CAP_ATR_PCT if vol_cap is None else vol_cap)
+    vmin = float(VOL_MIN_ATR_PCT if vol_min is None else vol_min)
+    vol_ok = bool((atr_pct >= vmin) and (atr_pct <= cap))
     try:
         q98 = float(feats["atr_pct"].tail(300).quantile(0.98))
         if math.isfinite(q98) and atr_pct >= q98 and atr_pct > 0:
@@ -1015,6 +1030,8 @@ def evaluate_signal(
     ignore_vol: bool = False,
     allow_neutral: bool = False,
     market_name: Optional[str] = None,
+    vol_cap: Optional[float] = None,
+    vol_min: Optional[float] = None,
 ) -> Dict[str, Any]:
     df = fetch_ohlcv(symbol, tf, bars=400, market_name=market_name)
     feats = compute_features(df).dropna().iloc[-200:]
@@ -1022,7 +1039,7 @@ def evaluate_signal(
         raise HTTPException(502, detail="insufficient features window")
 
     thresh = min_confidence if (min_confidence is not None) else MIN_CONFIDENCE
-    sig, conf, filt, reasons = infer_signal(feats, thresh)
+    sig, conf, filt, reasons = infer_signal(feats, thresh, vol_cap=vol_cap, vol_min=vol_min)
 
     # client relax flags
     if ignore_trend:
@@ -1067,8 +1084,11 @@ def evaluate_signal(
     trade = None
     advice = "Skip"
 
-    # Direction gate (allow neutral choose side)
-    directional_ok = (sig in ("Bullish", "Bearish")) or allow_neutral
+    # Direction gate (allow neutral choose side) — gated by env
+    nudge_on = bool(allow_neutral) and NEUTRAL_NUDGE_ENABLED
+    directional_ok = (sig in ("Bullish", "Bearish")) or nudge_on
+    nudged_neutral = (sig == "Neutral" and nudge_on)
+
     if conf >= thresh and filt["vol_ok"] and directional_ok and liquid_ok:
         if sig == "Bullish":
             direction = "Long"
@@ -1110,6 +1130,17 @@ def evaluate_signal(
                     reasons.append(f"LB {lb:.2f} < {WILSON_LB_MIN:.2f} (n={total})")
         except Exception:
             pass
+
+        if nudged_neutral:
+            try:
+                wins, total = ns_stats_get(symbol, tf)
+                lb = wilson_lb(wins, total, 1.96) if total >= 1 else None
+                if lb is not None:
+                    reasons.append(f"LB nudge (lb={lb:.2f}, n={total})")
+                else:
+                    reasons.append("LB nudge")
+            except Exception:
+                reasons.append("LB nudge")
 
     # Feature snapshot for learning/bias
     feat_map = last_features_snapshot(feats)
@@ -1290,13 +1321,16 @@ def signals(
     min_confidence: Optional[float] = Query(None),
     precision: int = Query(PRECISION_DEFAULT, ge=0, le=1),
     market: Optional[str] = Query(None),
+    # optional: let the UI override ATR% gates (see §4 below)
+    vol_cap: Optional[float] = Query(None),
+    vol_min: Optional[float] = Query(None),
     _: None = Depends(require_key),
 ):
     try:
         mc = (min_confidence if min_confidence is not None else MIN_CONFIDENCE)
         if precision:
-            mc = min(1.0, mc + 0.05)  # stricter threshold in precision mode
-        # 1) get your base result (your existing function)
+            mc = min(1.0, mc + 0.05)
+
         res = evaluate_signal(
             symbol=symbol,
             tf=tf,
@@ -1305,35 +1339,53 @@ def signals(
             leverage=leverage,
             min_confidence=mc,
             market_name=market,
+            # pass through ATR% overrides if provided
+            vol_cap=vol_cap,
+            vol_min=vol_min,
         )
-        
-        # include market for UI parity with /scan
+
+        # Include market for UI parity
         if market:
             res["market"] = market
         else:
             try:
-                # infer from adapter used for routing
-                res["market"] = _auto_adapter(symbol, market).name.split(":")[0]
+                res["market"] = _auto_adapter(symbol, market).name.split(":", 1)[0]
             except Exception:
                 pass
 
-        # Nudge confidence by learned weights
+        # Learned bias + calibration
         base_conf = float(res.get("confidence", 0.0))
         feats: Dict[str, Any] = res.get("features") or {}
         biased = apply_feedback_bias(base_conf, feats, symbol, tf)
         res["confidence"] = apply_calibration(tf, biased)
 
+        # Soft Wilson-LB nudge (per TF)
+        try:
+            wins, total = ns_stats_get(symbol, tf)
+            if total >= LB_NUDGE_MIN_N:
+                base = float(res["confidence"])
+                lb = wilson_lb(wins, total, 1.96)
+                span_lo, span_hi = 0.35, 0.75
+                x = max(0.0, min(1.0, (lb - span_lo) / max(1e-9, span_hi - span_lo)))
+                delta = (x - 0.5) * 2.0 * LB_NUDGE_MAX
+                res["confidence"] = float(max(0.0, min(1.0, base + delta)))
+                if not isinstance(res.get("filters"), dict):
+                    res["filters"] = {}
+                res["filters"].setdefault("reasons", []).append(
+                    f"LB nudge {delta:+.1%} (lb={lb:.2f}, n={total})"
+                )
+        except Exception:
+            pass
 
-        # Keep filter in sync with the threshold if provided
+        # Keep filter in sync with explicit threshold, if provided
         if isinstance(res.get("filters"), dict) and min_confidence is not None:
             res["filters"]["confidence_ok"] = (res["confidence"] >= float(min_confidence))
 
-        # Include market for convenient round-trip to /chart
+        # Resolve market string for /chart round trips
         resolved_market = market or _auto_adapter(symbol, market).name.split(":", 1)[0]
         res["market"] = resolved_market
 
         return res
-
     except HTTPException:
         raise
     except Exception as e:
@@ -1343,7 +1395,7 @@ def signals(
 def scan(
     tf: str = Query("1h"),
     limit: int = Query(18, ge=1, le=50),                # universe size to scan
-    top: int = Query(6, ge=1, le=_get_top_max()),                  # how many results to return
+    top: int = Query(6, ge=1, le=_get_top_max()),       # how many results to return
     allow_neutral: int = Query(0, ge=0, le=1),
     ignore_trend: int = Query(0, ge=0, le=1),
     ignore_vol: int = Query(0, ge=0, le=1),
@@ -1356,8 +1408,17 @@ def scan(
     market: Optional[str] = Query(None),
     mode: str | None = Query(None, description="For top_traded adapters: balanced|pure"),
     refresh: int | None = Query(None, description="If 1, clear adapter cache before building list"),
+    # optional ATR% bounds override (forwarded to infer_signal/evaluate_signal)
+    vol_cap: Optional[float] = Query(None),
+    vol_min: Optional[float] = Query(None),
     _: None = Depends(require_key)
 ):
+    adapter = get_adapter(market)
+    if refresh:
+        try:
+            adapter.clear_cache()
+        except Exception:
+            pass
     
 # Allow runtime mode swap for the mixed adapter
     if mode and hasattr(adapter, "mode"):
@@ -1380,12 +1441,16 @@ def scan(
     uni = get_universe(limit=eff_limit, market_name=market)
     results, ok = [], []
 
-    for it in uni:
-        try:
+    # --- parallel scan of the universe (inside /scan) ---
+    max_workers = min(12, max(1, len(uni)))
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = {}
+        for it in uni:
             mc = (min_confidence if min_confidence is not None else MIN_CONFIDENCE)
             if precision:
                 mc = min(1.0, mc + 0.05)
-            s = evaluate_signal(
+            futs[ex.submit(
+                evaluate_signal,
                 symbol=it["symbol"], tf=tf,
                 risk_pct=risk_pct, equity=equity, leverage=leverage,
                 min_confidence=mc,
@@ -1393,43 +1458,71 @@ def scan(
                 ignore_vol=bool(ignore_vol),
                 allow_neutral=bool(allow_neutral),
                 market_name=market or it.get("market"),
-            )
+                vol_cap=vol_cap,   # may be None
+                vol_min=vol_min,   # may be None
+            )] = it
 
-            base_conf = float(s.get("confidence", 0.0))
-            feats_map = s.get("features") or {}
-            biased = apply_feedback_bias(base_conf, feats_map, s["symbol"], s["timeframe"])
-            s["confidence"] = apply_calibration(tf, biased)
-
-            if isinstance(s.get("filters"), dict) and (min_confidence is not None):
-                s["filters"]["confidence_ok"] = (s["confidence"] >= float(min_confidence))
-                
-            s["market"] = it["market"]
-            # Attach a human-friendly name for UI purposes (fallback to symbol if missing)
+        for fut in as_completed(futs):
+            it = futs[fut]
             try:
+                s = fut.result()
+                # surface market & friendly name for UI
+                s["market"] = (market or it.get("market"))
+                if it.get("name"):
+                    s["name"] = it["name"]
+
+                # learned bias + calibration
+                base_conf = float(s.get("confidence", 0.0))
+                feats_map = s.get("features") or {}
+                biased = apply_feedback_bias(base_conf, feats_map, s["symbol"], s["timeframe"])
+                s["confidence"] = apply_calibration(tf, biased)
+
+                # Wilson-LB nudge per symbol|tf
+                try:
+                    wins, total = ns_stats_get(s["symbol"], tf)
+                    if total >= LB_NUDGE_MIN_N:
+                        base = float(s["confidence"])
+                        lb = wilson_lb(wins, total, 1.96)
+                        span_lo, span_hi = 0.35, 0.75
+                        x = max(0.0, min(1.0, (lb - span_lo) / max(1e-9, span_hi - span_lo)))
+                        delta = (x - 0.5) * 2.0 * LB_NUDGE_MAX
+                        s["confidence"] = float(max(0.0, min(1.0, base + delta)))
+                        if not isinstance(s.get("filters"), dict):
+                            s["filters"] = {}
+                        s["filters"].setdefault("reasons", []).append(
+                            f"LB nudge {delta:+.1%} (lb={lb:.2f}, n={total})"
+                        )
+                except Exception:
+                    pass
+
+                if isinstance(s.get("filters"), dict) and (min_confidence is not None):
+                    s["filters"]["confidence_ok"] = (s["confidence"] >= float(min_confidence))
+
+                # clean up market / name again for UI
+                s["market"] = it.get("market")
                 s["name"] = it.get("name", it["symbol"])
-            except Exception:
-                s["name"] = it["symbol"]
-            if s["advice"] == "Consider":
-                ok.append(s)
-            results.append(s)
-        except HTTPException as he:
-            results.append({
-                "symbol": it["symbol"], "timeframe": tf, "signal": "Neutral",
-                "confidence": 0.0, "updated": pd.Timestamp.utcnow().isoformat(),
-                "trade": None,
-                "filters": {"trend_ok": False, "vol_ok": False, "confidence_ok": False, "reasons": [he.detail]},
-                "advice": "Skip", "market": it["market"],
-                "name": it.get("name", it["symbol"])
-            })
-        except Exception as e:
-            results.append({
-                "symbol": it["symbol"], "timeframe": tf, "signal": "Neutral",
-                "confidence": 0.0, "updated": pd.Timestamp.utcnow().isoformat(),
-                "trade": None,
-                "filters": {"trend_ok": False, "vol_ok": False, "confidence_ok": False, "reasons": [f"exception: {e}"]},
-                "advice": "Skip", "market": it["market"],
-                "name": it.get("name", it["symbol"])
-            })
+
+                if s["advice"] == "Consider":
+                    ok.append(s)
+                results.append(s)
+            except HTTPException as he:
+                results.append({
+                    "symbol": it["symbol"], "timeframe": tf, "signal": "Neutral",
+                    "confidence": 0.0, "updated": pd.Timestamp.utcnow().isoformat(),
+                    "trade": None,
+                    "filters": {"trend_ok": False, "vol_ok": False, "confidence_ok": False, "reasons": [he.detail]},
+                    "advice": "Skip", "market": it.get("market"),
+                    "name": it.get("name", it["symbol"])
+                })
+            except Exception as e:
+                results.append({
+                    "symbol": it["symbol"], "timeframe": tf, "signal": "Neutral",
+                    "confidence": 0.0, "updated": pd.Timestamp.utcnow().isoformat(),
+                    "trade": None,
+                    "filters": {"trend_ok": False, "vol_ok": False, "confidence_ok": False, "reasons": [f"exception: {e}"]},
+                    "advice": "Skip", "market": it.get("market"),
+                    "name": it.get("name", it["symbol"])
+                })
 
     pool = ok if ok else results
     pool_sorted = sorted(pool, key=lambda s: abs(s.get("confidence") or 0.0), reverse=True)
@@ -1718,6 +1811,7 @@ def learning_config(_: None = Depends(require_key)):
         },
         "bg_interval": BG_INTERVAL,
         "eval_stop_first": bool(EVAL_STOP_FIRST),
+        "nudge_enabled": int(NEUTRAL_NUDGE_ENABLED),
     }
 
 # === FX helper endpoint (USD/EUR/GBP) ===
