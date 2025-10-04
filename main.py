@@ -543,7 +543,7 @@ def get_universe(quote=QUOTE, limit=TOP_N, market_name: Optional[str] = None) ->
         adapter_key = ad.__class__.__name__
 
     # cache key should reflect the effective (clamped) limit
-    lim = min(max(6, limit), 50)
+    lim = min(max(6, limit), UNIVERSE_LIMIT_MAX)
     key = f"uni:{adapter_key}:{lim}"
     u = cache_get(key, 1800)
     if u is not None:
@@ -652,7 +652,7 @@ def _wcache_set(key, df):
     while len(_WINDOW_CACHE) > _WINDOW_MAX:
         _WINDOW_CACHE.popitem(last=False)
 
-EVAL_STOP_FIRST = bool(int(os.getenv("EVAL_STOP_FIRST", "0")))  # if 1: SL wins ties within same bar
+EVAL_STOP_FIRST = bool(int(os.getenv("EVAL_STOP_FIRST", "1")))  # if 1: SL wins ties within same bar
 
 # --- Learning: default hold windows (env-overridable) ---
 HOLD_5M_SECS  = int(os.getenv("HOLD_5M_SECS",  "5400"))     # ~90m
@@ -729,14 +729,32 @@ def _tp_hit_first(entry, stop, tps, df, direction: str) -> Tuple[str, float]:
 
 # ----- Indicators -----
 def ema(s: pd.Series, n: int) -> pd.Series: return s.ewm(span=n, adjust=False).mean()
+
 def rsi(s: pd.Series, n: int = 14) -> pd.Series:
     d = s.diff(); up = d.clip(lower=0); dn = -d.clip(upper=0)
     rs = ema(up,n) / (ema(dn,n) + 1e-12)
     return 100 - (100/(1+rs))
+
 def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
     h,l,c = df["high"], df["low"], df["close"]; pc = c.shift(1)
     tr = pd.concat([(h-l).abs(), (h-pc).abs(), (l-pc).abs()], axis=1).max(axis=1)
     return ema(tr,n)
+
+def adx_di(df: pd.DataFrame, n: int = 14) -> tuple[pd.Series, pd.Series, pd.Series]:
+    h, l, c = df["high"], df["low"], df["close"]
+    up_move = h.diff()
+    dn_move = -l.diff()
+    plus_dm  = up_move.where((up_move > dn_move) & (up_move > 0), 0.0)
+    minus_dm = dn_move.where((dn_move > up_move) & (dn_move > 0), 0.0)
+
+    tr = pd.concat([(h - l).abs(), (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
+    atr_n = ema(tr, n)
+
+    plus_di  = 100.0 * ema(plus_dm, n) / (atr_n + 1e-12)
+    minus_di = 100.0 * ema(minus_dm, n) / (atr_n + 1e-12)
+    dx = ((plus_di - minus_di).abs() / ((plus_di + minus_di) + 1e-12)) * 100.0
+    adx = ema(dx, n)
+    return adx, plus_di, minus_di
 
 def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     # defensive normalization – make sure OHLCV are numeric Series (not DataFrames)
@@ -798,6 +816,11 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     out["macd"] = macd_line
     out["macd_signal"] = macd_signal
     out["macd_hist"] = macd_line - macd_signal
+    # [ADD] ADX/DI features (helps trend/trend-strength gating)
+    adx, di_p, di_m = adx_di(out, 14)
+    out["adx14"]    = adx
+    out["di_plus"]  = di_p
+    out["di_minus"] = di_m
 
     return out
 
@@ -842,10 +865,32 @@ LB_NUDGE_MIN_N = int(os.getenv("LB_NUDGE_MIN_N", "30"))   # minimum samples to t
 LB_NUDGE_MAX   = float(os.getenv("LB_NUDGE_MAX",   "0.05"))# max ±5% absolute confidence tweak
 # --- Neutral nudge master toggle (env) ---
 NEUTRAL_NUDGE_ENABLED = bool(int(os.getenv("NEUTRAL_NUDGE_ENABLED", "1")))
+# --- Precision mode++ (env-driven stricter gates) ---
+PRECISION_STRICT = bool(int(os.getenv("PRECISION_STRICT", "0")))
+PROB_FLOOR       = float(os.getenv("PROB_FLOOR", "0.58"))  # hard prob floor
+UNIVERSE_LIMIT_MAX = int(os.getenv("UNIVERSE_LIMIT_MAX", "200"))
+
+if PRECISION_STRICT:
+    # minimum model confidence
+    MIN_CONFIDENCE = max(float(MIN_CONFIDENCE), 0.30)
+
+    # expected value must be bigger (R-units or fractional return)
+    EV_MIN = max(float(EV_MIN), 0.20)
+
+    # require more human samples and a stronger Wilson lower bound
+    WILSON_MIN_N = max(int(WILSON_MIN_N), 100)
+    WILSON_LB_MIN = max(float(WILSON_LB_MIN), 0.62)
+
+    # tighten volatility & liquidity
+    VOL_CAP_ATR_PCT = min(float(VOL_CAP_ATR_PCT), 0.18)
+    TURNOVER_MIN_USD_PER_HR = max(float(TURNOVER_MIN_USD_PER_HR), 500_000)
+
+    # never force a neutral nudge in strict mode
+    NEUTRAL_NUDGE_ENABLED = 0
 
 def build_trade(symbol: str, df: pd.DataFrame, direction: str,
                 risk_pct: float = 1.0, equity: Optional[float] = None, leverage: float = 1.0,
-                market_name: Optional[str] = None) -> Dict[str, Any]:
+                market_name: Optional[str] = None, tf: Optional[str] = None) -> Dict[str, Any]:
     ad = _auto_adapter(symbol, market_name)
     mkt = {}  # only used for ccxt precision metadata in UI; safe empty for yfinance
 
@@ -855,13 +900,55 @@ def build_trade(symbol: str, df: pd.DataFrame, direction: str,
     if not math.isfinite(a) or a <= 0:
         raise ValueError("ATR not finite")
 
-    mult = 2.2
-    if direction == "Long":
-        stop_raw = price - mult * a
-        targets_raw = [price + k * a for k in (1.5, 2.5, 3.5)]
+    # --- Regime-aware base sizing (uses your existing features) ---
+    regime = infer_regime(df)  # 'trend' | 'chop' | 'mixed'
+    if regime == "trend":
+        base_mult = 2.0; targets_k = (1.6, 2.6, 3.6)
+    elif regime == "chop":
+        base_mult = 2.6; targets_k = (1.3, 2.1, 2.8)
     else:
-        stop_raw = price + mult * a
-        targets_raw = [price - k * a for k in (1.5, 2.5, 3.5)]
+        base_mult = 2.2; targets_k = (1.5, 2.5, 3.5)
+
+    # --- HTF ATR% — widen stops in high HTF vol; tighten in calm regimes ---
+    cur_atr_pct = float(last["atr_pct"]) if "atr_pct" in df.columns else (a / max(price, 1e-12))
+    htf_map = {"5m":"15m","15m":"1h","1h":"1d","1d":"1d"}
+    htf_tf = htf_map.get(tf or "1h", "1d")
+    htf_atr_pct = None
+    try:
+        if tf is not None:
+            df_htf = fetch_ohlcv(symbol, htf_tf, bars=220, market_name=market_name)
+            f_htf  = compute_features(df_htf).dropna()
+            last_h = f_htf.iloc[-1]
+            htf_atr = float(last_h["atr14"]); htf_px = float(last_h["close"])
+            htf_atr_pct = htf_atr / max(htf_px, 1e-12)
+    except Exception:
+        htf_atr_pct = None
+
+    # Stop scaling factor based on HTF/cur ATR% ratio (cap ±30%)
+    scale_stop = 1.0
+    if htf_atr_pct and cur_atr_pct > 0:
+        r = float(htf_atr_pct / max(cur_atr_pct, 1e-9))
+        if r > 1.2:
+            scale_stop = min(1.0 + 0.5*(r - 1.2), 1.30)   # widen up to +30%
+        elif r < 0.8:
+            scale_stop = max(1.0 - 0.5*(0.8 - r), 0.70)   # tighten down to −30%
+
+    mult = base_mult * scale_stop
+
+    # Stops scale with HTF (more conservative when HTF vol is high),
+    # targets stay on base_k so realized R can compress/expand appropriately.
+    if direction == "Long":
+        stop_raw    = price - mult * a
+        targets_raw = [price + k * a for k in targets_k]
+    else:
+        stop_raw    = price + mult * a
+        targets_raw = [price - k * a for k in targets_k]
+
+    # Advisory: suggest a limit entry ~0.5*ATR pullback to improve realized R:R
+    price_p = float(ad.price_to_precision(symbol, price))
+    pull = 0.5 * a
+    entry_hint = price_p - pull if direction == "Long" else price_p + pull
+    entry_hint = float(ad.price_to_precision(symbol, entry_hint))
 
     price_p = float(ad.price_to_precision(symbol, price))
     stop    = float(ad.price_to_precision(symbol, stop_raw))
@@ -869,6 +956,11 @@ def build_trade(symbol: str, df: pd.DataFrame, direction: str,
 
     denom = (price_p - stop)
     rr = [round(abs((t - price_p) / denom), 2) if denom else 0.0 for t in targets]
+
+    # [ADD] Entry improvement hint: try a half-ATR pullback for better R:R
+    pull = 0.5 * a
+    entry_hint = price_p - pull if direction == "Long" else price_p + pull
+    entry_hint = float(ad.price_to_precision(symbol, entry_hint))
 
     pos = None
     risk_amt = None
@@ -910,6 +1002,8 @@ def build_trade(symbol: str, df: pd.DataFrame, direction: str,
             "trail_after_tp": 2,
             "trail_method": "ATR",
             "trail_multiple": 1.0
+            "entry_hint": entry_hint,
+            "entry_hint_note": "Consider a ~0.5×ATR pullback limit to improve R:R"
         },
         "precision": mkt.get("precision", {})
     }
@@ -1032,6 +1126,75 @@ def _vote_matches_market(fb: FeedbackIn) -> Tuple[bool, str]:
 
     return False, "invalid outcome"
 
+# --- Higher-timeframe confirmation ---
+HTF_MAP = {"5m":"15m", "15m":"1h", "1h":"1d", "1d":"1d"}
+
+def _htf_alignment(symbol: str, tf: str, market_name: str | None) -> tuple[bool, float, list[str]]:
+    """Return (aligned?, delta_conf, reasons). Alignment uses HTF SMA/RSI slope."""
+    reasons = []
+    htf = HTF_MAP.get(tf, "1d")
+    if htf == tf:
+        return True, 0.0, reasons  # nothing to do at the top TF
+
+    try:
+        df_h = fetch_ohlcv(symbol, htf, bars=220, market_name=market_name)
+        f_h  = compute_features(df_h)
+        last = f_h.iloc[-1]
+        trend_up = bool(last["sma20"] > last["sma50"] and f_h["slope20"].iloc[-1] > 0)
+        trend_dn = bool(last["sma20"] < last["sma50"] and f_h["slope20"].iloc[-1] < 0)
+        rsi = float(last["rsi14"])
+        bias_up = (rsi >= 52.0); bias_dn = (rsi <= 48.0)
+
+        # HTF signal bucket
+        htf_bull = trend_up and bias_up
+        htf_bear = trend_dn and bias_dn
+        if not (htf_bull or htf_bear):
+            reasons.append(f"HTF {htf} neutral")
+            return True, 0.0, reasons  # neutral HTF neither boosts nor blocks
+
+        # Export which side HTF supports via reasons
+        reasons.append(f"HTF {htf} {'Bullish' if htf_bull else 'Bearish'}")
+        # small nudge to confidence if aligned; penalty if opposite
+        return (True, +0.04, reasons) if htf != "1d" else (True, +0.03, reasons)
+    except Exception as e:
+        reasons.append(f"HTF check failed: {e}")
+        return True, 0.0, reasons
+        
+# --- Higher timeframe bias (for reporting only) ---
+def _htf_of(tf: str) -> str:
+    return {"5m":"15m","15m":"1h","1h":"1d","1d":"1d"}.get(tf, tf)
+
+def htf_ok(symbol: str, tf: str, direction: str, market_name: str | None) -> tuple[bool, str]:
+    """Confirm direction aligns with higher timeframe bias."""
+    htf = _htf_of(tf)
+    try:
+        df_htf = fetch_ohlcv(symbol, htf, bars=400, market_name=market_name)
+        f = compute_features(df_htf).dropna().iloc[-200:]
+        if len(f) < 50: 
+            return False, f"HTF {htf} insufficient window"
+        last = f.iloc[-1]
+        up = (last["sma20"] > last["sma50"]) and (last["macd_hist"] > 0) and (last["rsi14"] >= 50)
+        dn = (last["sma20"] < last["sma50"]) and (last["macd_hist"] < 0) and (last["rsi14"] <= 50)
+        need_up = direction.lower().startswith("long")
+        ok = (up if need_up else dn)
+        return bool(ok), ("" if ok else f"HTF {htf} disagrees")
+    except Exception as e:
+        # Fail closed in strict mode; otherwise allow.
+        return (not PRECISION_STRICT), f"HTF check error: {e.__class__.__name__}"
+
+def _htf_bias(symbol: str, tf: str, market_name: Optional[str]) -> str:
+    """Return 'Bullish' | 'Bearish' | 'Neutral' bias on the next higher TF."""
+    try:
+        htf = _htf_of(tf)
+        df_h = fetch_ohlcv(symbol, htf, bars=320, market_name=market_name)
+        f    = compute_features(df_h).dropna()
+        last = f.iloc[-1]
+        up = (last["sma20"] > last["sma50"]) and (last["macd_hist"] > 0) and (last["rsi14"] >= 50)
+        dn = (last["sma20"] < last["sma50"]) and (last["macd_hist"] < 0) and (last["rsi14"] <= 50)
+        return "Bullish" if up else ("Bearish" if dn else "Neutral")
+    except Exception:
+        return "Neutral"
+
 # ----- Pure helper used by both endpoints -----
 def evaluate_signal(
     symbol: str,
@@ -1054,6 +1217,36 @@ def evaluate_signal(
 
     thresh = min_confidence if (min_confidence is not None) else MIN_CONFIDENCE
     sig, conf, filt, reasons = infer_signal(feats, thresh, vol_cap=vol_cap, vol_min=vol_min)
+
+    # [ADD] Higher-timeframe confirmation
+    aligned, delta_conf, htf_reasons = _htf_alignment(symbol, tf, market_name)
+    reasons.extend(htf_reasons)
+
+    # If HTF is explicitly opposite, veto
+    try:
+        if any("HTF" in r and "Bearish" in r for r in htf_reasons) and sig == "Bullish":
+            reasons.append("Veto: HTF opposes")
+            filt["confidence_ok"] = False
+            return {
+                "symbol": symbol, "timeframe": tf, "signal": sig, "confidence": conf,
+                "updated": pd.Timestamp.utcnow().isoformat(),
+                "trade": None, "filters": {**filt, "reasons": reasons}, "advice": "Skip",
+                "features": last_features_snapshot(feats),
+            }
+        if any("HTF" in r and "Bullish" in r for r in htf_reasons) and sig == "Bearish":
+            reasons.append("Veto: HTF opposes")
+            filt["confidence_ok"] = False
+            return {
+                "symbol": symbol, "timeframe": tf, "signal": sig, "confidence": conf,
+                "updated": pd.Timestamp.utcnow().isoformat(),
+                "trade": None, "filters": {**filt, "reasons": reasons}, "advice": "Skip",
+                "features": last_features_snapshot(feats),
+            }
+    except Exception:
+        pass
+
+    # Otherwise, nudge confidence slightly toward alignment before EV/LB gates
+    conf = float(max(0.0, min(1.0, conf + delta_conf)))
 
     # client relax flags
     if ignore_trend:
@@ -1102,18 +1295,41 @@ def evaluate_signal(
     nudge_on = bool(allow_neutral) and NEUTRAL_NUDGE_ENABLED
     directional_ok = (sig in ("Bullish", "Bearish")) or nudge_on
     nudged_neutral = (sig == "Neutral" and nudge_on)
+    
+    # >>> still before build_trade(...) <<<
+    if conf < PROB_FLOOR:
+        reasons.append(f"p {conf:.2f} < floor {PROB_FLOOR:.2f}")
+        return {
+            "symbol": symbol, "timeframe": tf, "signal": sig, "confidence": conf,
+            "updated": pd.Timestamp.utcnow().isoformat(),
+            "trade": None,
+            "filters": {**filt, "reasons": reasons, "liquid_ok": True},
+            "advice": "Skip",
+            "features": last_features_snapshot(feats),
+        }
 
     if conf >= thresh and filt["vol_ok"] and directional_ok and liquid_ok:
         if sig == "Bullish":
             direction = "Long"
         elif sig == "Bearish":
             direction = "Short"
+        ok_htf, htf_reason = htf_ok(symbol, tf, direction, market_name)
+        if not ok_htf:
+            reasons.append(htf_reason or "HTF misaligned")
+            return {
+                "symbol": symbol, "timeframe": tf, "signal": sig, "confidence": conf,
+                "updated": pd.Timestamp.utcnow().isoformat(),
+                "trade": None,
+                "filters": {**filt, "reasons": reasons, "liquid_ok": True},
+                "advice": "Skip",
+                "features": last_features_snapshot(feats),
+            }
         else:
             slope = float(feats["slope20"].iloc[-1])
             rsi14 = float(feats["rsi14"].iloc[-1])
             bbpos = float(feats["bb_pos"].iloc[-1])
             direction = "Long" if (slope >= 0 or rsi14 >= 50 or bbpos >= 0) else "Short"
-        trade = build_trade(symbol, feats, direction, risk_pct, equity, leverage, market_name=market_name)
+        trade = build_trade(symbol, feats, direction, risk_pct, equity, leverage, market_name=market_name, tf=tf)
         advice = "Consider"
         R = 1.2
         p = float(conf) 
@@ -1150,6 +1366,46 @@ def evaluate_signal(
                 if lb < WILSON_LB_MIN:
                     advice = "Skip"
                     reasons.append(f"LB {lb:.2f} < {WILSON_LB_MIN:.2f} (n={total})")
+        except Exception:
+            pass
+            
+        # --- Pass report for UI ("Why passed") ---
+        try:
+            # HTF bias vs chosen direction
+            bias = _htf_bias(symbol, tf, market_name)
+            want = "Bullish" if direction == "Long" else "Bearish"
+            htf_ok = (bias == want)
+
+            # EV status (if computed)
+            ev_ok = False
+            try:
+                ev_ok = (ev >= EV_MIN)
+            except Exception:
+                ev_ok = False
+
+            # Wilson status (recompute succinctly for the label)
+            wil_ok = False; wil_na = True
+            try:
+                wins, total = ns_stats_get(symbol, tf)
+                if total >= WILSON_MIN_N:
+                    wil_na = False
+                    lb = wilson_lb(wins, total, 1.96)
+                    wil_ok = (lb >= WILSON_LB_MIN)
+            except Exception:
+                pass
+
+            # Liquidity status from earlier gate
+            liq_ok = bool(locals().get("liquid_ok", False))
+
+            report = []
+            report.append("HTF✔" if htf_ok else ("HTF neutral" if bias=="Neutral" else "HTF—"))
+            report.append("EV✔" if ev_ok else "EV—")
+            report.append("Wilson✔" if wil_ok else ("Wilson n/a" if wil_na else "Wilson—"))
+            report.append("Liquidity✔" if liq_ok else "Liquidity—")
+
+            if isinstance(trade, dict) and advice != "Skip":
+                trade.setdefault("meta", {})
+                trade["meta"]["pass_report"] = " · ".join(report)
         except Exception:
             pass
 
@@ -1307,10 +1563,6 @@ async def _log_requests(request, call_next):
 def instruments(market: Optional[str] = None, _: None = Depends(require_key)):
     return get_universe(market_name=market)
 
-# === PATCH: tiny in-memory cache around /chart ===
-# [ANCHOR] keep near your other process cache helpers (CACHE / cache_get / cache_set exist)
-# uses the same cache_get/cache_set you already define
-
 @app.get("/chart")
 def chart(symbol: str, tf: str = "1h", n: int = 120, market: Optional[str] = None, _: None = Depends(require_key)):
     cache_key = f"chart:{market or ''}:{symbol}:{tf}:{int(n)}"
@@ -1421,8 +1673,8 @@ def signals(
 @app.get("/scan")
 def scan(
     tf: str = Query("1h"),
-    limit: int = Query(18, ge=1, le=50),                # universe size to scan
-    top: int = Query(6, ge=1, le=_get_top_max()),       # how many results to return
+    limit: int = Query(18, ge=1, le=UNIVERSE_LIMIT_MAX),                # universe size to scan
+    top: int = Query(3, ge=1, le=_get_top_max()),       # how many results to return
     allow_neutral: int = Query(0, ge=0, le=1),
     ignore_trend: int = Query(0, ge=0, le=1),
     ignore_vol: int = Query(0, ge=0, le=1),
@@ -1867,6 +2119,13 @@ def fx(base: str = "USD", _: None = Depends(require_key)):
     out = {"base": base, "rates": rates, "ts": int(time.time() * 1000)}
     cache_set(ckey, out)
     return out
+
+@app.get("/limits")
+def limits(_: None = Depends(require_key)):
+    return {
+        "top_max": _get_top_max(),
+        "universe_max": UNIVERSE_LIMIT_MAX
+    }
 
 # ========= TRACKED TRADES (for mobile app) =========
 from fastapi import Body

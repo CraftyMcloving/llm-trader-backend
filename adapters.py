@@ -99,9 +99,6 @@ class CryptoCCXT(BaseAdapter):
             limit = top
         limit = int(limit or 20)
 
-        # Optional hard cap from env (keeps scans snappy)
-        hard_cap = int(os.getenv("CRYPTO_UNIVERSE_CAP", "18"))
-
         m = self._load_markets()
         avail: List[str] = []
 
@@ -121,8 +118,11 @@ class CryptoCCXT(BaseAdapter):
                         break
 
         avail = avail[:min(limit, hard_cap)]
-        return [{"symbol": s, "name": s.split('/')[0], "market": self.name,
-                 "tf_supported": ["5m","15m","1h","1d"]} for s in avail]
+        # after you've built `avail` (a de-duplicated list of symbols) …
+        hard_cap = int(os.getenv("CRYPTO_UNIVERSE_CAP", "60"))  # was 18; widen default
+        eff_limit = min(int(limit or 20), hard_cap) if hard_cap > 0 else int(limit or 20)
+        avail = avail[:eff_limit]
+        return [{"symbol": s, "name": s, "market": "crypto", "tf_supported": ["5m","15m","1h","1d"]} for s in avail]
 
     def _cache_get(self, key:str) -> Optional[pd.DataFrame]:
         v = self._cache.get(key)
