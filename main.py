@@ -556,18 +556,55 @@ def get_universe(quote=QUOTE, limit=TOP_N, market_name: Optional[str] = None) ->
     if u is not None:
         return u
 
-    # tolerate different adapter signatures
+    # Try adapter-provided universe; gracefully handle NotImplemented
+    items = []
     try:
         try:
-            items = ad.list_universe(limit=lim)
+            items = ad.list_universe(limit=lim)            # preferred
         except TypeError:
             try:
-                items = ad.list_universe(top=lim)
+                items = ad.list_universe(top=lim)          # some adapters use 'top='
             except TypeError:
-                items = ad.list_universe(lim)
+                items = ad.list_universe(lim)              # positional fallback
+    except NotImplementedError:
+        # Expected for base/legacy adapters — don't log as an error
+        pass
     except Exception as e:
+        # Real failure from a concrete adapter — log once
         logger.exception("list_universe failed: %s", e)
         items = []
+
+    # Fallback: build a reasonable crypto universe from ccxt if the adapter
+    # doesn't provide one (and the market is crypto).
+    if not items:
+        mkey = (market_name or adapter_key or "").split(":", 1)[0].lower()
+        if mkey in ("crypto", "binance_perps", "futures", "top_traded", "mixed"):
+            try:
+                ex = get_exchange()
+                markets = load_markets() or getattr(ex, "markets", {}) or {}
+                # Prefer QUOTE (e.g., USD); if scarce, allow USDT as a backup.
+                def _pick_syms(q):
+                    return [s for s in markets.keys() if s.endswith(f"/{q}")]
+                syms = _pick_syms(QUOTE)
+                if len(syms) < lim:
+                    syms_extra = [s for s in _pick_syms("USDT") if s not in syms]
+                    syms.extend(syms_extra)
+                # Rank majors first, then alpha
+                majors = ["BTC","ETH","SOL","XRP","ADA","DOGE","BNB","TON","TRX",
+                          "DOT","LINK","MATIC","LTC","BCH","AVAX","ATOM","ETC","XLM"]
+                def _rank(sym):
+                    base = sym.split("/",1)[0]
+                    try: i = majors.index(base)
+                    except ValueError: i = len(majors) + 1
+                    return (i, sym)
+                syms = sorted(set(syms), key=_rank)[:lim]
+                items = [{"symbol": s,
+                          "name": s.split("/",1)[0],
+                          "market": "crypto",
+                          "tf_supported": ["5m","15m","1h","1d"]} for s in syms]
+            except Exception:
+                # If ccxt isn’t available or markets can’t load, leave items empty.
+                items = []
 
     def _get(it, k, default=None):
         return it.get(k, default) if isinstance(it, dict) else getattr(it, k, default)
@@ -580,7 +617,7 @@ def get_universe(quote=QUOTE, limit=TOP_N, market_name: Optional[str] = None) ->
         out.append({
             "symbol": sym,
             "name": _get(it, "name", sym.split("/")[0]),
-            "market": _get(it, "market", adapter_key),          # ← default to the adapter you used
+            "market": _get(it, "market", adapter_key),
             "tf_supported": _get(it, "tf_supported", ["5m","15m","1h","1d"]),
         })
 
