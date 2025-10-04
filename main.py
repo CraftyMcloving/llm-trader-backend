@@ -556,18 +556,18 @@ def get_universe(quote=QUOTE, limit=TOP_N, market_name: Optional[str] = None) ->
     if u is not None:
         return u
 
-# tolerate different adapter signatures
-try:
+    # tolerate different adapter signatures
     try:
-        items = ad.list_universe(limit=lim)
-    except TypeError:
         try:
-            items = ad.list_universe(top=lim)
+            items = ad.list_universe(limit=lim)
         except TypeError:
-            items = ad.list_universe(lim)
-except Exception as e:
-    logger.exception("list_universe failed: %s", e)
-    items = []
+            try:
+                items = ad.list_universe(top=lim)
+            except TypeError:
+                items = ad.list_universe(lim)
+    except Exception as e:
+        logger.exception("list_universe failed: %s", e)
+        items = []
 
     def _get(it, k, default=None):
         return it.get(k, default) if isinstance(it, dict) else getattr(it, k, default)
