@@ -630,31 +630,36 @@ TF_MAP = {"5m":"5m","15m":"15m","1h": "1h", "1d": "1d"}
 
 def fetch_ohlcv(symbol: str, tf: str, bars: int = 720, market_name: Optional[str] = None) -> pd.DataFrame:
     ad = _auto_adapter(symbol, market_name)
+    tried = [ad.name]
+    def _try_crypto_fallbacks():
+        basesym = symbol
+        sym_variants = [basesym]
+        if "/USD" in basesym:  sym_variants.append(basesym.replace("/USD", "/USDT"))
+        if "/USDT" in basesym: sym_variants.append(basesym.replace("/USDT", "/USD"))
+        for alt in ("top_traded_bal", "top_traded_pure", "crypto"):
+            try:
+                alt_ad = get_adapter(alt)
+                if alt_ad.name == ad.name:
+                    continue
+                for s in sym_variants:
+                    try:
+                        df = alt_ad.fetch_ohlcv(s, tf, bars)
+                        tried.append(f"{alt_ad.name}:{s}")
+                        return df
+                    except Exception:
+                        tried.append(f"{alt_ad.name}:{s}")
+                        continue
+            except Exception:
+                tried.append(alt)
+                continue
+        return None
     try:
         return ad.fetch_ohlcv(symbol, tf, bars)
-    except AdapterError as e:
-        tried = [ad.name]
-        # Prefer same-market rescue first (crypto)
+    except Exception as e:
         if (market_name or ad.name).split(":",1)[0] == "crypto":
-            basesym = symbol
-            sym_variants = [basesym]
-            if "/USD" in basesym:
-                sym_variants.append(basesym.replace("/USD", "/USDT"))
-            elif "/USDT" in basesym:
-                sym_variants.append(basesym.replace("/USDT", "/USD"))
-            for alt in ("top_traded_bal","top_traded_pure","crypto"):
-                try:
-                    alt_ad = get_adapter(alt)
-                    if alt_ad.name == ad.name:
-                        continue
-                    for s in sym_variants:
-                        try:
-                            return alt_ad.fetch_ohlcv(s, tf, bars)
-                        except Exception:
-                            continue
-                    tried.append(alt_ad.name)
-                except Exception:
-                    pass
+            df_fb = _try_crypto_fallbacks()
+            if df_fb is not None:
+                return df_fb
         # Cross-market hail-mary (kept, but unlikely to help for crypto symbols)
         if not market_name:
             for alt in ("forex","commodities","stocks"):
@@ -662,15 +667,14 @@ def fetch_ohlcv(symbol: str, tf: str, bars: int = 720, market_name: Optional[str
                     alt_ad = get_adapter(alt)
                     if alt_ad.name.split(":",1)[0] == ad.name.split(":",1)[0]:
                         continue
-                    return alt_ad.fetch_ohlcv(symbol, tf, bars)
+                    df = alt_ad.fetch_ohlcv(symbol, tf, bars)
+                    tried.append(alt_ad.name)
+                    return df
                 except Exception:
-                    tried.append(alt)
+                    tried.append(alt_ad.name if 'alt_ad' in locals() else alt)
                     continue
-        msg = str(e) or getattr(e, "message", "") or repr(e)
+        msg = (getattr(e, "detail", None) or str(e) or repr(e) or "")
         raise HTTPException(502, detail=f"{ad.name} fetch_ohlcv error: {msg} (tried: {', '.join(tried)})")
-    except Exception as e:
-        msg = str(e) or getattr(e, "message", "") or repr(e)
-        raise HTTPException(502, detail=f"{ad.name} fetch_ohlcv error: {msg}")
 
 def fetch_ohlcv_window(symbol: str, tf: str, start_ms: int, end_ms: int, market_name: Optional[str] = None) -> pd.DataFrame:
     ad = _auto_adapter(symbol, market_name)
@@ -678,19 +682,20 @@ def fetch_ohlcv_window(symbol: str, tf: str, start_ms: int, end_ms: int, market_
     c = _wcache_get(k)
     if c is not None:
         return c
-    try:
-        df = ad.fetch_window(symbol, tf, start_ms, end_ms)
+    tried = [ad.name]
+    def _set_and_return(df):
         _wcache_set(k, df)
         return df
-    except AdapterError as e:
-        tried = [ad.name]
+    try:
+        return _set_and_return(ad.fetch_window(symbol, tf, start_ms, end_ms))
+    except Exception as e:
         # Prefer same-market rescue first (crypto)
         if (market_name or ad.name).split(":",1)[0] == "crypto":
             basesym = symbol
             sym_variants = [basesym]
             if "/USD" in basesym:
                 sym_variants.append(basesym.replace("/USD", "/USDT"))
-            elif "/USDT" in basesym:
+            if "/USDT" in basesym:
                 sym_variants.append(basesym.replace("/USDT", "/USD"))
             for alt in ("top_traded_bal","top_traded_pure","crypto"):
                 try:
@@ -699,10 +704,12 @@ def fetch_ohlcv_window(symbol: str, tf: str, start_ms: int, end_ms: int, market_
                         continue
                     for s in sym_variants:
                         try:
-                            return alt_ad.fetch_window(s, tf, bars)
+                            df = alt_ad.fetch_window(s, tf, start_ms, end_ms)
+                            tried.append(f"{alt_ad.name}:{s}")
+                            return _set_and_return(df)
                         except Exception:
+                            tried.append(f"{alt_ad.name}:{s}")
                             continue
-                    tried.append(alt_ad.name)
                 except Exception:
                     pass
         # Cross-market hail-mary (kept, but unlikely to help for crypto symbols)
@@ -712,15 +719,14 @@ def fetch_ohlcv_window(symbol: str, tf: str, start_ms: int, end_ms: int, market_
                     alt_ad = get_adapter(alt)
                     if alt_ad.name.split(":",1)[0] == ad.name.split(":",1)[0]:
                         continue
-                    return alt_ad.fetch_window(symbol, tf, bars)
+                    df = alt_ad.fetch_window(symbol, tf, start_ms, end_ms)
+                    tried.append(alt_ad.name)
+                    return _set_and_return(df)
                 except Exception:
-                    tried.append(alt)
+                    tried.append(alt_ad.name if 'alt_ad' in locals() else alt)
                     continue
-        msg = str(e) or getattr(e, "message", "") or repr(e)
+        msg = (getattr(e, "detail", None) or str(e) or repr(e) or "")
         raise HTTPException(502, detail=f"{ad.name} fetch_window error: {msg} (tried: {', '.join(tried)})")
-    except Exception as e:
-        msg = str(e) or getattr(e, "message", "") or repr(e)
-        raise HTTPException(502, detail=f"{ad.name} fetch_window error: {msg}")
 
 # ms per bar
 def tf_ms(tf: str) -> int:
