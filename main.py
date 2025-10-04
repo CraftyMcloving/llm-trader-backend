@@ -1170,6 +1170,18 @@ def build_trade(symbol: str, df: pd.DataFrame, direction: str,
         "precision": mkt.get("precision", {})
     }
 
+def _choose_direction(feats: pd.DataFrame) -> str:
+    """Majority vote from slope, RSI, BB position."""
+    last = feats.iloc[-1]
+    votes = 0
+    try: votes += 1 if float(feats["slope20"].iloc[-1]) >= 0 else 0
+    except: pass
+    try: votes += 1 if float(last["rsi14"]) >= 50 else 0
+    except: pass
+    try: votes += 1 if float(last["bb_pos"]) >= 0 else 0
+    except: pass
+    return "Long" if votes >= 2 else "Short"
+
 def infer_regime(feats: pd.DataFrame) -> str:
     """
     Very light regime classifier:
@@ -1382,6 +1394,20 @@ def evaluate_signal(
     if len(feats) < 50:
         raise HTTPException(502, detail="insufficient features window")
     _downcast_inplace(feats)
+    
+    # Precompute a draft trade so the UI always has a plan to show/copy
+    draft_trade = None
+    try:
+        proposed_dir = _choose_direction(feats)
+        draft_trade = build_trade(
+            symbol, feats, proposed_dir,
+            risk_pct=risk_pct, equity=equity, leverage=leverage,
+            market_name=market_name, tf=tf
+        )
+        # mark clearly so front-end can style if it wants
+        draft_trade.setdefault("meta", {})["draft"] = True
+    except Exception:
+        draft_trade = None
 
     thresh = min_confidence if (min_confidence is not None) else MIN_CONFIDENCE
     sig, conf, filt, reasons = infer_signal(feats, thresh, vol_cap=vol_cap, vol_min=vol_min)
@@ -1398,7 +1424,7 @@ def evaluate_signal(
             return {
                 "symbol": symbol, "timeframe": tf, "signal": sig, "confidence": conf,
                 "updated": pd.Timestamp.utcnow().isoformat(),
-                "trade": None, "filters": {**filt, "reasons": reasons}, "advice": "Skip",
+                "trade": draft_trade, "filters": {**filt, "reasons": reasons}, "advice": "Skip",
                 "features": last_features_snapshot(feats),
             }
         if any("HTF" in r and "Bullish" in r for r in htf_reasons) and sig == "Bearish":
@@ -1407,7 +1433,7 @@ def evaluate_signal(
             return {
                 "symbol": symbol, "timeframe": tf, "signal": sig, "confidence": conf,
                 "updated": pd.Timestamp.utcnow().isoformat(),
-                "trade": None, "filters": {**filt, "reasons": reasons}, "advice": "Skip",
+                "trade": draft_trade, "filters": {**filt, "reasons": reasons}, "advice": "Skip",
                 "features": last_features_snapshot(feats),
             }
     except Exception:
@@ -1470,7 +1496,7 @@ def evaluate_signal(
         return {
             "symbol": symbol, "timeframe": tf, "signal": sig, "confidence": conf,
             "updated": pd.Timestamp.utcnow().isoformat(),
-            "trade": None,
+            "trade": draft_trade,
             "filters": {**filt, "reasons": reasons, "liquid_ok": True},
             "advice": "Skip",
             "features": last_features_snapshot(feats),
@@ -1590,6 +1616,9 @@ def evaluate_signal(
 
     # Feature snapshot for learning/bias
     feat_map = last_features_snapshot(feats)
+    
+    if trade is None and draft_trade is not None:
+        trade = draft_trade
 
     return {
         "symbol": symbol,
