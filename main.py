@@ -11,7 +11,14 @@ import os, json, sqlite3, threading, time
 import math
 import pandas as pd
 import numpy as np
+import logging
 
+logger = logging.getLogger("ai_trade_advisor")
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
 
 # NEW: external adapters
 from adapters import get_adapter, BaseAdapter, UniverseItem, AdapterError
