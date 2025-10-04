@@ -711,8 +711,6 @@ def fetch_ohlcv(symbol: str, tf: str, bars: int = 720, market_name: Optional[str
                 except Exception:
                     tried.append(alt_ad.name if 'alt_ad' in locals() else alt)
                     continue
-                    
-        _downcast_inplace(df)
 
         _fail("", e)
 
@@ -919,7 +917,6 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
 
     # Ensure expected columns exist
     need = ["open","high","low","close","volume"]
-    # some sources may send capitalized keys; map them once
     lower_map = {str(c).lower(): c for c in out.columns}
     for k in need:
         if k not in out.columns and k in lower_map:
@@ -932,10 +929,8 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
                 col = col.iloc[:, 0]
             out[k] = pd.to_numeric(col, errors="coerce")
         else:
-            # if truly missing, create a safe default
             out[k] = np.nan if k != "volume" else 0.0
 
-    # basic NA drop to stabilize rolling calcs (keep enough history)
     out = out.dropna(subset=["open","high","low","close"]).copy()
 
     # Core features
@@ -945,7 +940,6 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     out["rsi14"]   = rsi(out["close"], 14)
     out["atr14"]   = atr(out, 14)
 
-    # guard against div-by-zero and multi-col ops
     safe_close = out["close"].replace(0, np.nan)
     out["atr_pct"] = (out["atr14"] / safe_close).clip(lower=0, upper=2.0)
 
@@ -956,16 +950,13 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     out["bb_std"]  = out["close"].rolling(20).std().replace(0, np.nan)
     out["bb_pos"]  = ((out["close"] - out["bb_mid"]) / (2 * out["bb_std"])).clip(-1, 1)
 
-    # Dollar turnover proxy (will be bypassed later for FX if volume is unreliable)
     out["turnover"] = (out["close"] * out["volume"]).replace([np.inf, -np.inf], np.nan)
     out["turnover_sma96"] = out["turnover"].rolling(96).mean()
 
-    # === Additional indicators ===
-    # Momentum: percentage change over 10 bars (longer horizon than ret5)
+    # Extras
     out["momentum"] = out["close"].pct_change(10)
-    # Bollinger band width: normalized width of the Bollinger Bands (upper – lower) / mid.
     out["bb_width"] = (4.0 * out["bb_std"] / out["bb_mid"]).replace([np.inf, -np.inf], np.nan)
-    # MACD and related: compute standard MACD (12, 26) with a 9‑period signal line.
+
     ema12 = out["close"].ewm(span=12, adjust=False).mean()
     ema26 = out["close"].ewm(span=26, adjust=False).mean()
     macd_line = ema12 - ema26
@@ -973,13 +964,13 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     out["macd"] = macd_line
     out["macd_signal"] = macd_signal
     out["macd_hist"] = macd_line - macd_signal
-    # [ADD] ADX/DI features (helps trend/trend-strength gating)
+
     adx, di_p, di_m = adx_di(out, 14)
     out["adx14"]    = adx
     out["di_plus"]  = di_p
     out["di_minus"] = di_m
 
-    _downcast_inplace(feats)
+    _downcast_inplace(out)   # <-- fixed
 
     return out
 
@@ -1390,7 +1381,7 @@ def evaluate_signal(
     feats = compute_features(df).dropna().iloc[-200:]
     if len(feats) < 50:
         raise HTTPException(502, detail="insufficient features window")
-    _downcast_inplace(out)
+    _downcast_inplace(feats)
 
     thresh = min_confidence if (min_confidence is not None) else MIN_CONFIDENCE
     sig, conf, filt, reasons = infer_signal(feats, thresh, vol_cap=vol_cap, vol_min=vol_min)
