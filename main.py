@@ -1001,7 +1001,7 @@ def build_trade(symbol: str, df: pd.DataFrame, direction: str,
             "breakeven_after_tp": 1,
             "trail_after_tp": 2,
             "trail_method": "ATR",
-            "trail_multiple": 1.0
+            "trail_multiple": 1.0,
             "entry_hint": entry_hint,
             "entry_hint_note": "Consider a ~0.5×ATR pullback limit to improve R:R"
         },
