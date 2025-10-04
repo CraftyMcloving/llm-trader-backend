@@ -95,88 +95,43 @@ class CryptoCCXT(BaseAdapter):
         return self._markets
 
     def list_universe(self, limit: int = None, top: int = None) -> List[Dict[str, Any]]:
-        """
-        Build a crypto universe for the configured exchange/quote.
-
-        Order of preference:
-          1) Start with curated bases (preserve their order) if the pair exists and is active.
-          2) Optionally top up with any other active pairs for the same quote (when CCXT_FILL_REMAINDER=1).
-          3) If still empty, try the opposite stable quote (USDT<->USD) for curated bases as a last resort.
-
-        Caps:
-          - CRYPTO_UNIVERSE_CAP (>0) limits the final list length; 0 means 'no cap'.
-        """
-        # alias handling
         if top is not None and limit is None:
             limit = top
         limit = int(limit or 20)
 
-        # read hard cap early
-        try:
-            hard_cap = int(os.getenv("CRYPTO_UNIVERSE_CAP", "24"))
-        except Exception:
-            hard_cap = 24
-        eff_limit = limit if hard_cap <= 0 else min(limit, hard_cap)
+        # Optional hard cap from env (keeps scans snappy)
+        hard_cap = int(os.getenv("CRYPTO_UNIVERSE_CAP", "18"))
 
-        # load exchange markets (cached by ccxt)
-        m = self._load_markets() or {}
+        m = self._load_markets()
         avail: List[str] = []
 
-        # 1) curated first (preferred, preserves given order)
-        if self.curated:
-            for base in self.curated:
-                sym = f"{base}/{self.quote}"
-                info = m.get(sym)
-                if info and info.get("active", True):
+        # curated first (preferred)
+        for base in (self.curated or []):
+            sym = f"{base}/{self.quote}"
+            if sym in m and m[sym].get("active"):
+                avail.append(sym)
+
+        # by default DO NOT fill remainder for CCXT (too slow in bulk)
+        # flip on with CCXT_FILL_REMAINDER=1 if you really want a bigger list
+        if not avail and bool(int(os.getenv("CCXT_FILL_REMAINDER", "0"))):
+            for sym, info in m.items():
+                if info.get("quote") == self.quote and info.get("active"):
                     avail.append(sym)
-
-        # 2) optionally fill remainder from any other active markets for this quote
-        if len(avail) < eff_limit and bool(int(os.getenv("CCXT_FILL_REMAINDER", "0"))):
-            # deterministic iteration for stability
-            for sym in sorted(m.keys()):
-                info = m.get(sym) or {}
-                try:
-                    if info.get("quote") == self.quote and info.get("active", True):
-                        if sym not in avail:
-                            avail.append(sym)
-                            if len(avail) >= eff_limit:
-                                break
-                except Exception:
-                    continue
-
-        # trim to effective limit
-        avail = avail[:eff_limit]
-
-        # 3) last-resort: if still empty, attempt alternate quote for curated (e.g., USD <-> USDT)
-        if not avail and self.curated:
-            alt_q = "USDT" if self.quote.upper() != "USDT" else "USD"
-            for base in self.curated:
-                sym = f"{base}/{alt_q}"
-                info = m.get(sym)
-                if info and info.get("active", True):
-                    avail.append(sym)
-                    if len(avail) >= eff_limit:
+                    if len(avail) >= limit:
                         break
 
-        # shape response for the app
-        return [
-            {
-                "symbol": s,
-                "name": s.split("/", 1)[0],
-                "market": "crypto",
-                "tf_supported": ["5m", "15m", "1h", "1d"],
-            }
-            for s in avail
-        ]
+        avail = avail[:min(limit, hard_cap)]
+        return [{"symbol": s, "name": s.split('/')[0], "market": self.name,
+                 "tf_supported": ["5m","15m","1h","1d"]} for s in avail]
 
     def _cache_get(self, key:str) -> Optional[pd.DataFrame]:
         v = self._cache.get(key)
         if not v: return None
         ts, df = v
-        return df if (time.time()-ts) <= self.cache_ttl else None
+        return df.copy() if (time.time()-ts) <= self.cache_ttl else None
 
     def _cache_set(self, key:str, df:pd.DataFrame):
-        self._cache[key] = (time.time(), df)
+        self._cache[key] = (time.time(), df.copy())
 
     def fetch_ohlcv(self, symbol:str, tf:str, bars:int) -> pd.DataFrame:
         ex = self._exh()
@@ -187,14 +142,10 @@ class CryptoCCXT(BaseAdapter):
         c = self._cache_get(key)
         if c is not None:
             return c
-        for attempt in range(3):
-            try:
-                data = ex.fetch_ohlcv(symbol, timeframe=tf_ex, limit=min(bars + 40, 2000))
-                break
-            except Exception as e:
-                if attempt == 2:
-                    raise AdapterError(f"{self.exchange_id} fetch_ohlcv({symbol},{tf_ex}) failed: {e}") from e
-                time.sleep(0.6 * (attempt + 1))
+        try:
+            data = ex.fetch_ohlcv(symbol, timeframe=tf_ex, limit=min(bars + 40, 2000))
+        except Exception as e:
+            raise AdapterError(f"{self.exchange_id} fetch_ohlcv({symbol},{tf_ex}) failed: {e}") from e
         if not data:
             raise AdapterError("no candles")
         df = pd.DataFrame(data, columns=["ts","open","high","low","close","volume"])
@@ -210,14 +161,10 @@ class CryptoCCXT(BaseAdapter):
         per = tf_ms(tf)
         need = max(2, int((end_ms - start_ms) / per) + 4)
         since = max(0, start_ms - 2 * per)
-        for attempt in range(3):
-            try:
-                data = ex.fetch_ohlcv(symbol, timeframe=tf_ex, since=since, limit=min(need + 20, 2000))
-                break
-            except Exception as e:
-                if attempt == 2:
-                    raise AdapterError(f"{self.exchange_id} fetch_window({symbol},{tf_ex}) failed: {e}") from e
-                time.sleep(0.6 * (attempt + 1))
+        try:
+            data = ex.fetch_ohlcv(symbol, timeframe=tf_ex, since=since, limit=min(need + 20, 2000))
+        except Exception as e:
+            raise AdapterError(f"{self.exchange_id} fetch_window({symbol},{tf_ex}) failed: {e}") from e
         if not data:
             raise AdapterError("no candles for window")
         df = pd.DataFrame(data, columns=["ts","open","high","low","close","volume"])
@@ -230,10 +177,6 @@ class CryptoCCXT(BaseAdapter):
     def amount_to_precision(self, symbol:str, qty:float) -> float:
         self._load_markets()
         return float(self._exh().amount_to_precision(symbol, qty))
-        
-    def clear_cache(self):
-        try: self._cache.clear()
-        except Exception: pass
 
 # ---------- Binance Perps (USDT-M futures) via ccxt ----------
 class BinancePerpsUSDT(BaseAdapter):
@@ -313,10 +256,10 @@ class YFAdapter(BaseAdapter):
         v = self._cache.get(key)
         if not v: return None
         ts, df = v
-        return df if (time.time() - ts) <= self.cache_ttl else None
+        return df.copy() if (time.time() - ts) <= self.cache_ttl else None
 
     def _cache_set(self, key:str, df:pd.DataFrame):
-        self._cache[key] = (time.time(), df)
+        self._cache[key] = (time.time(), df.copy())
 
     def list_universe(self, limit:int) -> List[Dict[str,Any]]:
         syms = self.tickers[:max(1, limit)]
@@ -333,10 +276,9 @@ class YFAdapter(BaseAdapter):
         if cached is not None:
             df = cached
         else:
-            _period = {"5m": "7d", "15m": "30d", "60m": "90d", "1h": "90d", "1d": "365d"}[self._interval(tf)]
             df_raw = yf.download(
                 symbol,
-                period=_period,
+                period="60d",
                 interval=self._interval(tf),
                 progress=False,
                 prepost=False,
@@ -389,10 +331,6 @@ class YFAdapter(BaseAdapter):
     
     def price_to_precision(self, symbol:str, price:float) -> float:
         return float(round(price, self.price_decimals))
-        
-    def clear_cache(self):
-        try: self._cache.clear()
-        except Exception: pass
 
 # “Add-on pack” factories (top-20 defaults)
 def ForexAdapter() -> BaseAdapter:
@@ -706,39 +644,31 @@ _ADAPTER_INSTANCES: Dict[str, BaseAdapter] = {}
 def register_adapter(key: str, factory: Callable[[], BaseAdapter]):
     ADAPTERS[key.lower()] = factory
 
+# --- replace your current get_adapter with this normalized + cached version ---
 def get_adapter(name: Optional[str] = None) -> BaseAdapter:
     """
     Select adapter by query param or env ADAPTER; accept long-form names like 'crypto:kraken:usd'.
-    Returns a singleton instance per logical adapter (crypto, binance_perps, forex, stocks, commodities, top_traded_*).
+    Returns a singleton instance per logical adapter (crypto, binance_perps, forex, ...).
     """
-    raw = (name or os.getenv("ADAPTER", "top_traded_bal")).strip().lower()
-    parts = [p for p in raw.split(":") if p]
-    base = parts[0] if parts else "top_traded_bal"
+    raw = (name or os.getenv("ADAPTER", "crypto")).lower().strip()
+    key = raw.split(":", 1)[0]  # 'crypto:kraken:usd' -> 'crypto'
 
-    # Expand long-form crypto:exchange:quote
-    if base == "crypto":
-        if len(parts) >= 2: os.environ["EXCHANGE"] = parts[1]
-        if len(parts) >= 3: os.environ["QUOTE"]   = parts[2]
-        key = "crypto"
-
-    # Top-traded shorthand aliases
-    elif base in ("top_traded", "toptraded", "top-traded"):
-        mode = os.getenv("TOPTRADED_MODE", "balanced").lower()
-        key = "top_traded_bal" if mode == "balanced" else "top_traded_pure"
-    elif base in ("top_traded_bal", "toptraded_bal"):
-        key = "top_traded_bal"
-    elif base in ("top_traded_pure", "toptraded_pure"):
-        key = "top_traded_pure"
-
-    # Direct names
-    else:
-        key = base
-
-    if key not in ADAPTERS:
-        raise AdapterError(f"Unknown adapter '{raw}' (valid: {', '.join(sorted(ADAPTERS.keys()))})")
+    aliases = {
+        "crypto": "crypto",
+        "binance_perps": "binance_perps",
+        "futures": "binance_perps",
+        "binance": "binance_perps",
+        "forex": "forex",
+        "commodities": "commodities",
+        "stocks": "stocks",
+        "top_traded_pure": "top_traded_pure",
+        "top_traded_bal": "top_traded_bal",
+    }
+    key = aliases.get(key, key)
 
     inst = _ADAPTER_INSTANCES.get(key)
     if inst is None:
-        inst = ADAPTERS[key]()    # construct once
+        factory = ADAPTERS.get(key) or ADAPTERS["crypto"]
+        inst = factory()
         _ADAPTER_INSTANCES[key] = inst
     return inst
