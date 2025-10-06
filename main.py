@@ -87,13 +87,29 @@ def load_markets():
 
 
 # ========= FEEDBACK STORAGE & ONLINE WEIGHTS =========
-DB_PATH = os.getenv("FEEDBACK_DB", "ai_trade_feedback.db")
+DB_PATH = os.getenv("FEEDBACK_DB", "/var/data/ai_trade_feedback.db")
 _db_lock = threading.RLock()
 
+    try:
+        os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+    except Exception:
+        pass
+
 def _db():
+    
+    timeout_sec = float(os.getenv("DB_BUSY_TIMEOUT_SEC", "5.0"))
+    conn = sqlite3.connect(
+        DB_PATH,
+        check_same_thread=False,
+        isolation_level=None,        # autocommit; explicitly control transactions if needed
+        timeout=timeout_sec
+    )
+    
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA wal_autocheckpoint=1000;")   # checkpoint every ~1000 pages
+    conn.execute("PRAGMA foreign_keys=ON;")
     conn.execute("PRAGMA temp_store=MEMORY;")
     conn.execute("PRAGMA mmap_size=300000000;")   # ~300MB if available (no-op if not)
     conn.execute("PRAGMA cache_size=-20000;")     # ~20MB page cache
@@ -285,6 +301,22 @@ def feedback_bias(features: Dict[str, Any], symbol: str = "", tf: str = "", alph
         s += w * x
     s = max(-1.0, min(1.0, s))
     return alpha * s
+
+DB_MAINT_EVERY_SEC = int(os.getenv("DB_MAINT_EVERY_SEC", "3600"))
+
+def _db_maint_bg():
+    while True:
+        try:
+            _db_maint("checkpoint")
+            _db_maint("optimize")
+        except Exception:
+            pass
+        time.sleep(max(600, DB_MAINT_EVERY_SEC))
+
+@app.on_event("startup")
+def _start_db_maint():
+    t = threading.Thread(target=_db_maint_bg, daemon=True)
+    t.start()
 
 @app.on_event("startup")
 def _fb_startup():
@@ -1956,6 +1988,26 @@ def tracked_delete_path(id: str, x_user_id: Optional[int] = Header(None), _: Non
         conn.commit()
         conn.close()
     return _tracked_list_for(uid)
+
+def _db_maint(op: str):
+    with _db_lock:
+        conn = _db()
+        try:
+            if op == "checkpoint":
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            elif op == "optimize":
+                conn.execute("PRAGMA optimize")
+            elif op == "vacuum":
+                conn.execute("VACUUM")
+        finally:
+            conn.close()
+
+@app.post("/admin/db/{op}", dependencies=[Depends(require_key)])
+def admin_db(op: str):
+    if op not in ("checkpoint", "optimize", "vacuum"):
+        raise HTTPException(status_code=400, detail="op must be checkpoint|optimize|vacuum")
+    _db_maint(op)
+    return {"ok": True, "op": op, "path": DB_PATH}
 
 # ---- Learning: record a feedback row from an offer resolution ----
 def _record_feedback_from_offer(offer: Dict[str, Any], outcome: int, resolved_ts: float, pnl: Optional[float] = None):

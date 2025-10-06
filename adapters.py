@@ -65,6 +65,10 @@ class BaseAdapter:
     def price_to_precision(self, symbol:str, price:float) -> float: return float(round(price, 2))
     def amount_to_precision(self, symbol:str, qty:float) -> float:  return float(qty)
 
+    def _safe_float(v):
+        try: return float(v)
+        except: return None
+
 # ---------- Crypto (CCXT / Kraken default) ----------
 class CryptoCCXT(BaseAdapter):
     def __init__(self, exchange_id:str="kraken", quote:str="USD",
@@ -78,6 +82,41 @@ class CryptoCCXT(BaseAdapter):
         self._markets = None
         self.cache_ttl = cache_ttl
         self._cache: Dict[str, Tuple[float, pd.DataFrame]] = {}
+
+    def _top_traded(self, top:int, metric:str="24h") -> List[str]:
+        ex = self._exh()
+        self._load_markets()
+
+        # simple in-memory TTL cache
+        key = f"toptraded:{self.exchange_id}:{self.quote}:{metric}"
+        ct = int(os.getenv("TOPTRADED_CACHE_TTL", "300"))
+        c = self._cache_get(key)
+        if c is not None:
+            syms = c["syms"]; ts = c["ts"]
+            if (time.time() - ts) < max(60, ct):
+                return syms[:top]
+
+        try:
+            tickers = ex.fetch_tickers()
+        except Exception:
+            tickers = {}
+
+        scored = []
+        for sym, info in (ex.markets or {}).items():
+            if not info.get("active"): continue
+            if info.get("quote") != self.quote: continue
+            tk = tickers.get(sym, {}) or {}
+            # prefer quoteVolume; fallback to baseVolume if absent
+            vol = _safe_float(tk.get("quoteVolume"))
+            if vol is None: vol = _safe_float(tk.get("baseVolume"))
+            if vol is None: continue
+            scored.append((sym, vol))
+
+        scored.sort(key=lambda x: (x[1] or 0.0), reverse=True)
+        syms = [s for s, _ in scored[:max(0, top)]]
+        # cache
+        self._cache_set(key, {"syms": syms, "ts": time.time()})
+        return syms[:top]
 
     def _exh(self):
         if self._ex is None:
@@ -99,8 +138,13 @@ class CryptoCCXT(BaseAdapter):
             limit = top
         limit = int(limit or 20)
 
-        # Optional hard cap from env (keeps scans snappy)
-        hard_cap = int(os.getenv("CRYPTO_UNIVERSE_CAP", "18"))
+        raw_cap = int(os.getenv("CRYPTO_UNIVERSE_CAP", "30"))
+        hard_cap = None if raw_cap <= 0 else raw_cap
+
+        if hard_cap is not None:
+            avail = avail[:min(limit, hard_cap)]
+        else:
+            avail = avail[:limit]
 
         m = self._load_markets()
         avail: List[str] = []
@@ -110,6 +154,22 @@ class CryptoCCXT(BaseAdapter):
             sym = f"{base}/{self.quote}"
             if sym in m and m[sym].get("active"):
                 avail.append(sym)
+                
+        # AFTER curated handling, before final slicing/cap
+        if len(avail) < limit:
+            metric = os.getenv("TOPTRADED_METRIC", "24h")
+            try:
+                top_syms = self._top_traded(limit, metric=metric)
+                # append any not-already-in avail
+                seen = set(avail)
+                for s in top_syms:
+                    if s not in seen:
+                        avail.append(s)
+                        seen.add(s)
+                    if len(avail) >= limit:
+                        break
+            except Exception:
+                pass
 
         # by default DO NOT fill remainder for CCXT (too slow in bulk)
         # flip on with CCXT_FILL_REMAINDER=1 if you really want a bigger list
@@ -119,8 +179,7 @@ class CryptoCCXT(BaseAdapter):
                     avail.append(sym)
                     if len(avail) >= limit:
                         break
-
-        avail = avail[:min(limit, hard_cap)]
+                        
         return [{"symbol": s, "name": s.split('/')[0], "market": self.name,
                  "tf_supported": ["5m","15m","1h","1d"]} for s in avail]
 
