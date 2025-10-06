@@ -39,7 +39,8 @@ class UniverseItem:
     market: str
     tf_supported: List[str]
 
-class AdapterError(Exception): ...
+class AdapterError(Exception):
+    pass
 
 class BaseAdapter:
     """Minimal interface your app uses."""
@@ -65,6 +66,13 @@ class BaseAdapter:
     def price_to_precision(self, symbol:str, price:float) -> float: return float(round(price, 2))
     def amount_to_precision(self, symbol:str, qty:float) -> float:  return float(qty)
 
+    @staticmethod
+    def _safe_float(v):
+        try:
+            return float(v)
+        except Exception:
+            return None
+
 # ---------- Crypto (CCXT / Kraken default) ----------
 class CryptoCCXT(BaseAdapter):
     def __init__(self, exchange_id:str="kraken", quote:str="USD",
@@ -79,12 +87,18 @@ class CryptoCCXT(BaseAdapter):
         self.cache_ttl = cache_ttl
         self._cache: Dict[str, Tuple[float, pd.DataFrame]] = {}
         
-    @staticmethod
-    def _safe_float(v):
-        try:
-            return float(v)
-        except Exception:
+    def _tcache_get(self, key: str, ttl: Optional[int] = None):
+        ttl = int(ttl or self.cache_ttl)
+        ent = getattr(self, "_tcache", {}).get(key)
+        if not ent:
             return None
+        ts, val = ent
+        return val if (time.time() - ts) < ttl else None
+
+    def _tcache_set(self, key: str, val: dict):
+        if not hasattr(self, "_tcache"):
+            self._tcache = {}
+        self._tcache[key] = (time.time(), val)
 
     def _top_traded(self, n: int, avail: Optional[List[str]] = None) -> List[str]:
         key = f"top:{self.exchange_id}:{self.quote}"
@@ -93,7 +107,8 @@ class CryptoCCXT(BaseAdapter):
             return cached["syms"][:max(1, int(n or 0))]
 
         try:
-            tickers = self.ex.fetch_tickers()
+            ex = self._exh()
+            tickers = ex.fetch_tickers()
         except Exception:
             tickers = {}
 
@@ -132,45 +147,53 @@ class CryptoCCXT(BaseAdapter):
             self._markets = self._exh().load_markets()
         return self._markets
 
-def list_universe(self, limit: int = None, top: int = None) -> List[Dict[str, Any]]:
-    # hard cap from env (0/neg => unlimited)
-    raw_cap = int(os.getenv("TOP_N", "0"))
-    hard_cap = None if raw_cap <= 0 else raw_cap
+    def list_universe(self, limit: int | None = None, top: int | None = None) -> List[Dict[str, Any]]:
+        # hard cap from env (0/neg => unlimited)
+        raw_cap = int(os.getenv("TOP_N", "0"))
+        hard_cap = None if raw_cap <= 0 else raw_cap
 
-    try:
-        m = self._load_markets()
-    except Exception as e:
-        raise AdapterError(f"load_markets failed: {e}")
+        try:
+            m = self._load_markets()
+        except Exception as e:
+            raise AdapterError(f"load_markets failed: {e}")
 
-    avail: List[str] = []
-    for sym, info in (m or {}).items():
-        if ("/" not in sym) or (not sym.endswith(f"/{self.quote}")):
-            continue
-        if (info or {}).get("active") is False:
-            continue
-        if info.get("type") and info["type"] != "spot":
-            continue
-        avail.append(sym)
+        avail: List[str] = []
+        for sym, info in (m or {}).items():
+            if ("/" not in sym) or (not sym.endswith(f"/{self.quote}")):
+                continue
+            if (info or {}).get("active") is False:
+                continue
+            if info.get("type") and info["type"] != "spot":
+                continue
+            avail.append(sym)
 
-    # curated to the front (keep order, no dupes)
-    if self.curated:
-        cur = [s for s in self.curated if s in avail]
-        rest = [s for s in avail if s not in self.curated]
-        avail = cur + rest
+        # curated to the front (keep order, no dupes)
+        if self.curated:
+            cur = [s for s in self.curated if s in avail]
+            rest = [s for s in avail if s not in self.curated]
+            avail = cur + rest
 
-    # enforce request limit first, then hard cap from env
-    if limit is not None:
-        avail = avail[:limit]
-    if hard_cap is not None:
-        avail = avail[:hard_cap]
+        # enforce request limit first, then hard cap from env
+        if limit is not None:
+            avail = avail[:limit]
+        if hard_cap is not None:
+            avail = avail[:hard_cap]
 
-    # optional: top traded by 24h quote volume
-    if top:
-        syms = self._top_traded(top, avail)
-    else:
-        syms = avail
+        # optional: top traded by 24h quote volume
+        if top:
+            syms = self._top_traded(top, avail=avail)
+        else:
+            syms = avail
 
-    return [{"symbol": s, "name": s, "market": self.name, "tf_supported": ["1h","1d","4h","15m","5m"]} for s in syms]
+        out = []
+        for s in syms:
+            out.append({
+                "symbol": s,
+                "name": s.split('/')[0],
+                "market": self.name,
+                "tf_supported": ["5m","15m","1h","1d"],
+            })
+        return out
 
     def _cache_get(self, key:str) -> Optional[pd.DataFrame]:
         v = self._cache.get(key)
@@ -180,19 +203,6 @@ def list_universe(self, limit: int = None, top: int = None) -> List[Dict[str, An
 
     def _cache_set(self, key:str, df:pd.DataFrame):
         self._cache[key] = (time.time(), df.copy())
-        
-    def _tcache_get(self, key: str, ttl: Optional[int] = None):
-        ttl = int(ttl or self.cache_ttl)
-        ent = getattr(self, "_tcache", {}).get(key)
-        if not ent:
-            return None
-        ts, val = ent
-        return val if (time.time() - ts) < ttl else None
-
-    def _tcache_set(self, key: str, val: dict):
-        if not hasattr(self, "_tcache"):
-            self._tcache = {}
-        self._tcache[key] = (time.time(), val)
 
     def fetch_ohlcv(self, symbol:str, tf:str, bars:int) -> pd.DataFrame:
         ex = self._exh()
