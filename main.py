@@ -96,23 +96,20 @@ except Exception:
     pass
 
 def _db():
-    
     timeout_sec = float(os.getenv("DB_BUSY_TIMEOUT_SEC", "5.0"))
     conn = sqlite3.connect(
         DB_PATH,
         check_same_thread=False,
-        isolation_level=None,        # autocommit; explicitly control transactions if needed
-        timeout=timeout_sec
+        isolation_level=None,   # autocommit-style; control transactions explicitly
+        timeout=timeout_sec,
     )
-    
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
-    conn.execute("PRAGMA wal_autocheckpoint=1000;")   # checkpoint every ~1000 pages
+    conn.execute("PRAGMA wal_autocheckpoint=1000;")
     conn.execute("PRAGMA foreign_keys=ON;")
     conn.execute("PRAGMA temp_store=MEMORY;")
-    conn.execute("PRAGMA mmap_size=300000000;")   # ~300MB if available (no-op if not)
-    conn.execute("PRAGMA cache_size=-20000;")     # ~20MB page cache
+    conn.execute("PRAGMA mmap_size=300000000;")
+    conn.execute("PRAGMA cache_size=-20000;")
     return conn
 
 def init_feedback_db():

@@ -65,10 +65,6 @@ class BaseAdapter:
     def price_to_precision(self, symbol:str, price:float) -> float: return float(round(price, 2))
     def amount_to_precision(self, symbol:str, qty:float) -> float:  return float(qty)
 
-    def _safe_float(v):
-        try: return float(v)
-        except: return None
-
 # ---------- Crypto (CCXT / Kraken default) ----------
 class CryptoCCXT(BaseAdapter):
     def __init__(self, exchange_id:str="kraken", quote:str="USD",
@@ -82,41 +78,44 @@ class CryptoCCXT(BaseAdapter):
         self._markets = None
         self.cache_ttl = cache_ttl
         self._cache: Dict[str, Tuple[float, pd.DataFrame]] = {}
+        
+    @staticmethod
+    def _safe_float(v):
+        try:
+            return float(v)
+        except Exception:
+            return None
 
-    def _top_traded(self, top:int, metric:str="24h") -> List[str]:
-        ex = self._exh()
-        self._load_markets()
-
-        # simple in-memory TTL cache
-        key = f"toptraded:{self.exchange_id}:{self.quote}:{metric}"
-        ct = int(os.getenv("TOPTRADED_CACHE_TTL", "300"))
-        c = self._cache_get(key)
-        if c is not None:
-            syms = c["syms"]; ts = c["ts"]
-            if (time.time() - ts) < max(60, ct):
-                return syms[:top]
+    def _top_traded(self, n: int, avail: Optional[List[str]] = None) -> List[str]:
+        key = f"top:{self.exchange_id}:{self.quote}"
+        cached = self._tcache_get(key)
+        if cached and cached.get("syms"):
+            return cached["syms"][:max(1, int(n or 0))]
 
         try:
-            tickers = ex.fetch_tickers()
+            tickers = self.ex.fetch_tickers()
         except Exception:
             tickers = {}
 
-        scored = []
-        for sym, info in (ex.markets or {}).items():
-            if not info.get("active"): continue
-            if info.get("quote") != self.quote: continue
-            tk = tickers.get(sym, {}) or {}
-            # prefer quoteVolume; fallback to baseVolume if absent
-            vol = _safe_float(tk.get("quoteVolume"))
-            if vol is None: vol = _safe_float(tk.get("baseVolume"))
-            if vol is None: continue
-            scored.append((sym, vol))
+        rows = []
+        for sym, tk in (tickers or {}).items():
+            if avail and sym not in avail:
+                continue
+            if ("/" not in sym) or (not sym.endswith(f"/{self.quote}")):
+                continue
 
-        scored.sort(key=lambda x: (x[1] or 0.0), reverse=True)
-        syms = [s for s, _ in scored[:max(0, top)]]
-        # cache
-        self._cache_set(key, {"syms": syms, "ts": time.time()})
-        return syms[:top]
+            qv = tk.get("quoteVolume")
+            if qv is None:
+                last = BaseAdapter._safe_float(tk.get("last")) or 0.0
+                vol  = BaseAdapter._safe_float(tk.get("baseVolume")) or BaseAdapter._safe_float(tk.get("volume")) or 0.0
+                qv = (last or 0.0) * (vol or 0.0)
+            qv = BaseAdapter._safe_float(qv) or 0.0
+            rows.append((sym, qv))
+
+        rows.sort(key=lambda t: t[1], reverse=True)
+        syms = [s for (s, _) in rows[:max(1, int(n or 0))]]
+        self._tcache_set(key, {"syms": syms})
+        return syms
 
     def _exh(self):
         if self._ex is None:
@@ -133,55 +132,45 @@ class CryptoCCXT(BaseAdapter):
             self._markets = self._exh().load_markets()
         return self._markets
 
-    def list_universe(self, limit: int = None, top: int = None) -> List[Dict[str, Any]]:
-        if top is not None and limit is None:
-            limit = top
-        limit = int(limit or 20)
+def list_universe(self, limit: int = None, top: int = None) -> List[Dict[str, Any]]:
+    # hard cap from env (0/neg => unlimited)
+    raw_cap = int(os.getenv("TOP_N", "0"))
+    hard_cap = None if raw_cap <= 0 else raw_cap
 
-        raw_cap = int(os.getenv("CRYPTO_UNIVERSE_CAP", "30"))
-        hard_cap = None if raw_cap <= 0 else raw_cap
-
-        if hard_cap is not None:
-            avail = avail[:min(limit, hard_cap)]
-        else:
-            avail = avail[:limit]
-
+    try:
         m = self._load_markets()
-        avail: List[str] = []
+    except Exception as e:
+        raise AdapterError(f"load_markets failed: {e}")
 
-        # curated first (preferred)
-        for base in (self.curated or []):
-            sym = f"{base}/{self.quote}"
-            if sym in m and m[sym].get("active"):
-                avail.append(sym)
-                
-        # AFTER curated handling, before final slicing/cap
-        if len(avail) < limit:
-            metric = os.getenv("TOPTRADED_METRIC", "24h")
-            try:
-                top_syms = self._top_traded(limit, metric=metric)
-                # append any not-already-in avail
-                seen = set(avail)
-                for s in top_syms:
-                    if s not in seen:
-                        avail.append(s)
-                        seen.add(s)
-                    if len(avail) >= limit:
-                        break
-            except Exception:
-                pass
+    avail: List[str] = []
+    for sym, info in (m or {}).items():
+        if ("/" not in sym) or (not sym.endswith(f"/{self.quote}")):
+            continue
+        if (info or {}).get("active") is False:
+            continue
+        if info.get("type") and info["type"] != "spot":
+            continue
+        avail.append(sym)
 
-        # by default DO NOT fill remainder for CCXT (too slow in bulk)
-        # flip on with CCXT_FILL_REMAINDER=1 if you really want a bigger list
-        if not avail and bool(int(os.getenv("CCXT_FILL_REMAINDER", "0"))):
-            for sym, info in m.items():
-                if info.get("quote") == self.quote and info.get("active"):
-                    avail.append(sym)
-                    if len(avail) >= limit:
-                        break
-                        
-        return [{"symbol": s, "name": s.split('/')[0], "market": self.name,
-                 "tf_supported": ["5m","15m","1h","1d"]} for s in avail]
+    # curated to the front (keep order, no dupes)
+    if self.curated:
+        cur = [s for s in self.curated if s in avail]
+        rest = [s for s in avail if s not in self.curated]
+        avail = cur + rest
+
+    # enforce request limit first, then hard cap from env
+    if limit is not None:
+        avail = avail[:limit]
+    if hard_cap is not None:
+        avail = avail[:hard_cap]
+
+    # optional: top traded by 24h quote volume
+    if top:
+        syms = self._top_traded(top, avail)
+    else:
+        syms = avail
+
+    return [{"symbol": s, "name": s, "market": self.name, "tf_supported": ["1h","1d","4h","15m","5m"]} for s in syms]
 
     def _cache_get(self, key:str) -> Optional[pd.DataFrame]:
         v = self._cache.get(key)
@@ -191,6 +180,19 @@ class CryptoCCXT(BaseAdapter):
 
     def _cache_set(self, key:str, df:pd.DataFrame):
         self._cache[key] = (time.time(), df.copy())
+        
+    def _tcache_get(self, key: str, ttl: Optional[int] = None):
+        ttl = int(ttl or self.cache_ttl)
+        ent = getattr(self, "_tcache", {}).get(key)
+        if not ent:
+            return None
+        ts, val = ent
+        return val if (time.time() - ts) < ttl else None
+
+    def _tcache_set(self, key: str, val: dict):
+        if not hasattr(self, "_tcache"):
+            self._tcache = {}
+        self._tcache[key] = (time.time(), val)
 
     def fetch_ohlcv(self, symbol:str, tf:str, bars:int) -> pd.DataFrame:
         ex = self._exh()
