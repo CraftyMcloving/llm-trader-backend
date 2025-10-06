@@ -90,10 +90,10 @@ def load_markets():
 DB_PATH = os.getenv("FEEDBACK_DB", "/var/data/ai_trade_feedback.db")
 _db_lock = threading.RLock()
 
-    try:
-        os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
-    except Exception:
-        pass
+try:
+    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+except Exception:
+    pass
 
 def _db():
     
