@@ -56,7 +56,7 @@ class BaseAdapter:
         ts_col = df["ts"]
         if np.issubdtype(ts_col.dtype, np.datetime64):
             ts_col = pd.to_datetime(ts_col, utc=True)
-            ms = (ts_col.view("int64") // 10**6)
+            ms = (ts_col.astype("int64") // 10**6)  # robust for tz-aware + tz-naive
         else:
             ms = pd.to_numeric(ts_col, errors="coerce").astype("int64")
         keep = (ms >= (start_ms - per)) & (ms <= (end_ms + per))
@@ -86,6 +86,7 @@ class CryptoCCXT(BaseAdapter):
         self._markets = None
         self.cache_ttl = cache_ttl
         self._cache: Dict[str, Tuple[float, pd.DataFrame]] = {}
+        self._tcache: Dict[str, Tuple[float, dict]] = {}
         
     def _tcache_get(self, key: str, ttl: Optional[int] = None):
         ttl = int(ttl or self.cache_ttl)
@@ -104,7 +105,8 @@ class CryptoCCXT(BaseAdapter):
         key = f"top:{self.exchange_id}:{self.quote}"
         cached = self._tcache_get(key)
         if cached and cached.get("syms"):
-            return cached["syms"][:max(1, int(n or 0))]
+            base = cached["syms"]
+            return [s for s in base if (not avail or s in avail)][:max(1, int(n or 0))]
 
         try:
             ex = self._exh()
@@ -203,6 +205,10 @@ class CryptoCCXT(BaseAdapter):
 
     def _cache_set(self, key:str, df:pd.DataFrame):
         self._cache[key] = (time.time(), df.copy())
+        
+    def clear_cache(self):
+        self._cache.clear()
+        self._tcache.clear()
 
     def fetch_ohlcv(self, symbol:str, tf:str, bars:int) -> pd.DataFrame:
         ex = self._exh()
