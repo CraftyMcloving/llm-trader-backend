@@ -210,15 +210,18 @@ class CryptoCCXT(BaseAdapter):
         self._cache.clear()
         self._tcache.clear()
 
-    def fetch_ohlcv(self, symbol:str, tf:str, bars:int) -> pd.DataFrame:
+    def fetch_ohlcv(self, symbol:str, tf:str, bars:int, nocache:bool=False) -> pd.DataFrame:
         ex = self._exh()
         tf_ex = TF_MAP.get(tf)
         if tf_ex is None:
             raise AdapterError(f"Unsupported tf: {tf}")
         key = f"ohlcv:{self.name}:{symbol}:{tf_ex}:{bars}"
-        c = self._cache_get(key)
-        if c is not None:
-            return c
+
+        if not nocache:
+            c = self._cache_get(key)
+            if c is not None:
+                return c
+
         try:
             data = ex.fetch_ohlcv(symbol, timeframe=tf_ex, limit=min(bars + 40, 2000))
         except Exception as e:
@@ -227,7 +230,16 @@ class CryptoCCXT(BaseAdapter):
             raise AdapterError("no candles")
         df = pd.DataFrame(data, columns=["ts","open","high","low","close","volume"])
         df["ts"] = pd.to_datetime(df["ts"], unit="ms")
-        self._cache_set(key, df)
+
+        if not nocache:
+            # cap cache size to keep RAM bounded
+            self._cache_set(key, df)
+            max_items = int(os.getenv("ADAPTER_CACHE_MAX", "80"))
+            if max_items <= 0:
+                self._cache.clear()
+            elif len(self._cache) > max_items:
+                items = sorted(self._cache.items(), key=lambda it: it[1][0], reverse=True)
+                self._cache = dict(items[:max_items])
         return df
 
     def fetch_window(self, symbol:str, tf:str, start_ms:int, end_ms:int) -> pd.DataFrame:
@@ -282,11 +294,12 @@ class BinancePerpsUSDT(BaseAdapter):
                             "tf_supported": ["5m","15m","1h","1d"]})
         return out
 
-    def fetch_ohlcv(self, symbol:str, tf:str, bars:int) -> pd.DataFrame:
+    def fetch_ohlcv(self, symbol:str, tf:str, bars:int, nocache:bool=False) -> pd.DataFrame:
         ex = self._exh()
         tf_ex = TF_MAP.get(tf)
         if tf_ex is None:
             raise AdapterError(f"Unsupported tf: {tf}")
+        # futures path is fast; we don't keep a local DF cache here
         try:
             data = ex.fetch_ohlcv(symbol, timeframe=tf_ex, limit=min(bars+40, 1500))
         except Exception as e:
@@ -326,7 +339,7 @@ class YFAdapter(BaseAdapter):
         self.name = name
         self.tickers = tickers
         self.price_decimals = price_decimals
-        self.cache_ttl = cache_ttl
+        self.cache_ttl = int(os.getenv("YF_CACHE_TTL", str(cache_ttl)))
         self._cache: Dict[str, Tuple[float, pd.DataFrame]] = {}
 
     def _cache_get(self, key:str) -> Optional[pd.DataFrame]:
@@ -347,12 +360,14 @@ class YFAdapter(BaseAdapter):
     def _interval(self, tf:str) -> str:
         return {"5m":"5m", "15m":"15m", "1h":"60m", "1d":"1d"}.get(tf, "60m")
 
-    def fetch_ohlcv(self, symbol:str, tf:str, bars:int) -> pd.DataFrame:
+    def fetch_ohlcv(self, symbol:str, tf:str, bars:int, nocache:bool=False) -> pd.DataFrame:
         key = f"yf:{self.name}:{symbol}:{tf}"
-        cached = self._cache_get(key)
-        if cached is not None:
-            df = cached
-        else:
+        df = None
+        if not nocache:
+            cached = self._cache_get(key)
+            if cached is not None:
+                df = cached
+        if df is None:
             df_raw = yf.download(
                 symbol,
                 period="60d",
@@ -365,51 +380,40 @@ class YFAdapter(BaseAdapter):
             )
             if df_raw is None or df_raw.empty:
                 raise AdapterError("no candles from yfinance")
-
             # --- flatten possible MultiIndex columns (common with some FX/indices) ---
             if isinstance(df_raw.columns, pd.MultiIndex):
-                # if only one symbol level, drop it; else try to slice by our symbol
                 try:
                     if df_raw.columns.nlevels >= 2:
                         lvl1 = df_raw.columns.get_level_values(-1)
                         if getattr(lvl1, "nunique", lambda: 1)() == 1:
                             df_raw.columns = df_raw.columns.droplevel(-1)
                         else:
-                            # slice by symbol if present
                             try:
                                 df_raw = df_raw.xs(symbol, axis=1, level=-1, drop_level=True)
                             except Exception:
                                 df_raw.columns = [c[0] for c in df_raw.columns]
                 except Exception:
-                    # last resort: flatten by taking top-level name
                     df_raw.columns = [c[0] if isinstance(c, tuple) else c for c in df_raw.columns]
-
-            # standardize columns
-            df_raw = df_raw.rename(columns={
-                "Open": "open",
-                "High": "high",
-                "Low": "low",
-                "Close": "close",
-                "Volume": "volume",
-            }).reset_index(names="ts")
-
-            # keep just the fields we use
-            cols = ["ts", "open", "high", "low", "close", "volume"]
+            df_raw = df_raw.rename(columns={"Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"}).reset_index(names="ts")
+            cols = ["ts","open","high","low","close","volume"]
             df = df_raw[[c for c in cols if c in df_raw.columns]].copy()
-
-            # ensure scalar Series (never DataFrames)
             for c in ("open","high","low","close","volume"):
                 if c in df.columns and isinstance(df[c], pd.DataFrame):
                     df[c] = df[c].iloc[:, 0]
-
-            self._cache_set(key, df)
-
+            if not nocache:
+                self._cache_set(key, df)
+                max_items = int(os.getenv("ADAPTER_CACHE_MAX", "80"))
+                if max_items <= 0:
+                    self._cache.clear()
+                elif len(self._cache) > max_items:
+                    items = sorted(self._cache.items(), key=lambda it: it[1][0], reverse=True)
+                    self._cache = dict(items[:max_items])
         return df.tail(bars).reset_index(drop=True)
     
     def price_to_precision(self, symbol:str, price:float) -> float:
         return float(round(price, self.price_decimals))
 
-# “Add-on pack” factories (top-20 defaults)
+    # “Add-on pack” factories (top-20 defaults)
 def ForexAdapter() -> BaseAdapter:
     return YFAdapter("forex", ["EURUSD=X","GBPUSD=X","USDJPY=X","AUDUSD=X","USDCAD=X","USDCHF=X","NZDUSD=X","EURGBP=X","EURJPY=X","GBPJPY=X","AUDJPY=X","EURAUD=X","EURCAD=X","EURCHF=X","GBPCHF=X","AUDCAD=X","CHFJPY=X","AUDNZD=X","CADJPY=X","NZDJPY=X"], price_decimals=5)
 
@@ -478,7 +482,7 @@ class MixedTopTradedAdapter(BaseAdapter):
     def _notional_24h(self, adapter: BaseAdapter, symbol: str) -> float:
         """Sum over last ~24×1h of close*volume (skips if volume missing)."""
         try:
-            df = adapter.fetch_ohlcv(symbol, "1h", bars=30)
+            df = adapter.fetch_ohlcv(symbol, "1h", bars=30, nocache=True)
             close = pd.to_numeric(df["close"], errors="coerce")
             vol   = pd.to_numeric(df.get("volume"), errors="coerce").fillna(0.0)
             # Take last ~24 bars (use 26 to be safe for gaps)
@@ -489,7 +493,7 @@ class MixedTopTradedAdapter(BaseAdapter):
     def _notional_1d(self, adapter: BaseAdapter, symbol: str) -> float:
         """Use last daily bar close*volume (works well for stocks/commodities)."""
         try:
-            df = adapter.fetch_ohlcv(symbol, "1d", bars=2)
+            df = adapter.fetch_ohlcv(symbol, "1d", bars=2, nocache=True)
             close = float(pd.to_numeric(df["close"], errors="coerce").iloc[-1])
             vol   = float(pd.to_numeric(df.get("volume"), errors="coerce").fillna(0.0).iloc[-1])
             return close * vol
@@ -502,7 +506,7 @@ class MixedTopTradedAdapter(BaseAdapter):
         Scale by standard FX lot notional so majors rank sensibly.
         """
         try:
-            df = adapter.fetch_ohlcv(symbol, "1h", bars=30)
+            df = adapter.fetch_ohlcv(symbol, "1h", bars=30, nocache=True)
             hi  = pd.to_numeric(df["high"], errors="coerce")
             lo  = pd.to_numeric(df["low"], errors="coerce")
             cl  = pd.to_numeric(df["close"], errors="coerce")
